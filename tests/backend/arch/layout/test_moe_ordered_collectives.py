@@ -91,3 +91,29 @@ def test_a_product_row_cut_gathers_over_expert_tensor_parallelism():
     assert gather.group_size == 4
     assert len(gather.flow_in_shape) == 3
     assert len(gather.flow_out_shape) == 3
+
+
+def test_two_world_token_cut_exchanges_like_one_world():
+    """A token cut made of TWO worlds (`cp` and `dp_attention`, which
+    together tile `ep_moe` without either equalling it) crosses the MoE seam
+    as the same all_to_all pair a one-world cut does, each routed row moved
+    once. The oracle is arithmetic off the config, not the layout algebra: a
+    rank holds `B * s / cp` tokens (B per request rank), each routed to
+    `num_experts_per_tok` experts as a `hidden_size` row of BF16. Red when
+    the dispatch reads the two-world cut as replicated (a free split) and
+    the return all_gathers the expert shard instead."""
+    config = json.loads(SNAP.read_text())["config"]
+    row_bytes = config["num_experts_per_tok"] * config["hidden_size"] * 2
+    batch, seq, ep = 2, 128, 4
+    for parallel in (dict(cp=2, dp_attention=2, ep_moe=ep),
+                     dict(dp_attention=ep, ep_moe=ep),
+                     dict(cp=ep, ep_moe=ep)):
+        seam = [event for event in _events(**parallel)
+                if event.world == "ep_moe"]
+        tokens = batch * seq // parallel.get("cp", 1)
+        assert sorted(event.op for event in seam) == ["all_to_all"] * 2, (
+            parallel, [(event.op, event.world) for event in seam])
+        for event in seam:
+            assert event.group_size == ep
+            assert event.payload_bytes == tokens * row_bytes, (
+                parallel, event.payload_bytes, tokens * row_bytes)
