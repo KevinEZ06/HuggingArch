@@ -380,52 +380,75 @@ function ContextLimitNote({ limit, past }: { limit: number | null; past: number[
   );
 }
 
-/** One line per context length (X = decode batch; prefill stays at one
- * request). SOL is always present; measured is an optional same-colour dashed
- * twin that reuses the SOL legend name. */
+/** Decode: one line per context length, X = the per-GPU decode batch, in
+ *  batch order. The grid's `max` point lands on its ceiling batch (once, if
+ *  that is also a ladder batch), and a ladder batch past the ceiling is not
+ *  a point — its requests' cache does not fit (`capacity.point_served`).
+ *  Prefill runs one request at every grid point, so it does not move with
+ *  the decode batch: one line, X = context length. SOL is always present;
+ *  measured is an optional same-colour dashed twin. */
 function batchSeries(
   by: Record<string, SweepEst[]>,
   showMeasured: boolean,
 ): { pre: LineSeries[]; dec: LineSeries[] } {
-  const pre: LineSeries[] = [];
   const dec: LineSeries[] = [];
-  SWEEP_SEQ_LENS.forEach((seqLen, si) => {
-    const color = VIRIDIS[si % VIRIDIS.length];
-    const symbol = SYMBOLS[si % SYMBOLS.length];
-    const label = fmtSeqLabel(seqLen);
-    const applyKey = String(seqLen);
-    const push = (phase: "prefill" | "decode", into: LineSeries[]) => {
-      const solPts: LineSeries["points"] = [];
-      const measPts: LineSeries["points"] = [];
-      for (const bp of SWEEP_BATCH_GRID) {
-        const est = by[bp.key]?.[si];
-        const B = bp.key === "max"
-          ? (est?.max_batch_per_gpu || 0)
-          : (bp.decode_batch_size || bp.prefill_batch_size || 1);
-        if (B <= 0) continue;
-        const sv = throughputValue(est, phase, "sol");
-        if (!Number.isFinite(sv)) continue;
-        // Beside every SOL point; NaN where not every op was measured (a
-        // gap), and the SOL point's hover says the coverage instead.
-        const mv = showMeasured ? throughputValue(est, phase, "measured") : NaN;
-        solPts.push({
-          x: B, v: sv,
-          ...(showMeasured && !Number.isFinite(mv) ? { cov: coverageNote(phaseCoverage(est?.phases?.[phase])) } : {}),
-        });
-        if (showMeasured) measPts.push({ x: B, v: mv });
-      }
-      into.push({
-        key: applyKey, applyKey, label, color, symbol, points: solPts,
-      });
-      if (showMeasured && measPts.some((p) => Number.isFinite(p.v))) {
-        into.push({
-          key: `${applyKey}:meas`, applyKey, label, color, symbol, dashed: true, points: measPts,
-        });
-      }
+  const twin = (base: LineSeries, meas: LineSeries["points"], into: LineSeries[]) => {
+    into.push(base);
+    if (showMeasured && meas.some((p) => Number.isFinite(p.v))) {
+      into.push({ ...base, key: `${base.key}:meas`, dashed: true, points: meas });
+    }
+  };
+  const point = (est: SweepEst | undefined, phase: "prefill" | "decode", x: number) => {
+    const sv = throughputValue(est, phase, "sol");
+    if (!Number.isFinite(sv)) return null;
+    // Beside every SOL point; NaN where not every op was measured (a gap),
+    // and the SOL point's hover says the coverage instead.
+    const mv = showMeasured ? throughputValue(est, phase, "measured") : NaN;
+    return {
+      sol: {
+        x, v: sv,
+        ...(showMeasured && !Number.isFinite(mv) ? { cov: coverageNote(phaseCoverage(est?.phases?.[phase])) } : {}),
+      },
+      meas: { x, v: mv },
     };
-    push("prefill", pre);
-    push("decode", dec);
+  };
+  SWEEP_SEQ_LENS.forEach((seqLen, si) => {
+    const solPts: LineSeries["points"] = [];
+    const measPts: LineSeries["points"] = [];
+    for (const bp of SWEEP_BATCH_GRID) {
+      const est = by[bp.key]?.[si];
+      const ceiling = est?.max_batch_per_gpu || 0;
+      const B = bp.key === "max" ? ceiling : (bp.decode_batch_size || 1);
+      if (B <= 0 || B > ceiling || solPts.some((p) => p.x === B)) continue;
+      const pt = point(est, "decode", B);
+      if (!pt) continue;
+      solPts.push(pt.sol);
+      measPts.push(pt.meas);
+    }
+    const order = (a: { x: number }, b: { x: number }) => a.x - b.x;
+    solPts.sort(order);
+    measPts.sort(order);
+    twin({
+      key: String(seqLen), applyKey: String(seqLen), label: fmtSeqLabel(seqLen),
+      color: VIRIDIS[si % VIRIDIS.length], symbol: SYMBOLS[si % SYMBOLS.length],
+      points: solPts,
+    }, measPts, dec);
   });
+  const preSol: LineSeries["points"] = [];
+  const preMeas: LineSeries["points"] = [];
+  SWEEP_SEQ_LENS.forEach((seqLen, si) => {
+    // One request's cache must fit for the request to exist at all.
+    const est = by[SWEEP_BATCH_GRID[0].key]?.[si];
+    const pt = (est?.max_batch_per_gpu || 0) >= 1 ? point(est, "prefill", seqLen) : null;
+    if (!pt) return;
+    preSol.push(pt.sol);
+    preMeas.push(pt.meas);
+  });
+  const pre: LineSeries[] = [];
+  twin({
+    key: "prefill", applyKey: "prefill", label: "prefill",
+    color: VIRIDIS[0], symbol: SYMBOLS[0], points: preSol,
+  }, preMeas, pre);
   return { pre, dec };
 }
 
@@ -434,6 +457,7 @@ function SweepChart({
   series,
   xTitle,
   xUnit,
+  xLabel = String,
   yTitle,
   valueUnit,
   onPoint,
@@ -445,6 +469,8 @@ function SweepChart({
   xTitle: string;
   /** Tooltip X heading, e.g. "batch" or "EP" → "batch = 64". */
   xUnit?: string;
+  /** How an X value reads on the axis and in the hover (a context: "32K"). */
+  xLabel?: (x: number) => string;
   yTitle?: string;
   /** Appended to tooltip values, e.g. " tok/s". */
   valueUnit?: string;
@@ -570,7 +596,7 @@ function SweepChart({
         }>;
         if (!items.length) return "";
         const xv = items[0].value?.[0];
-        const head = `<div style="font-weight:600;margin-bottom:4px">${xUnit ? `${xUnit} = ` : ""}${xv ?? ""}</div>`;
+        const head = `<div style="font-weight:600;margin-bottom:4px">${xUnit ? `${xUnit} = ` : ""}${xv == null ? "" : xLabel(Number(xv))}</div>`;
         const rows = items
           .filter((it) => it.value?.[1] != null)
           .map((it) => {
@@ -599,7 +625,7 @@ function SweepChart({
       nameLocation: "middle",
       nameGap: 22,
       ...AXIS,
-      axisLabel: { ...AXIS.axisLabel, interval: 0 },
+      axisLabel: { ...AXIS.axisLabel, interval: 0, formatter: (v: string) => xLabel(Number(v)) },
     },
     yAxis: {
       type: "value",
@@ -1791,21 +1817,20 @@ export function ScalingPanel(props: {
             <SweepChart
               title="Prefill (B=1)"
               series={pre}
-              xTitle="decode batch"
-              xUnit="batch"
+              xTitle="context"
+              xUnit="ctx"
+              xLabel={fmtSeqLabel}
               yTitle="tok/s"
               valueUnit=" tok/s"
-              onPoint={props.onApply ? (s, p) => {
-                setAppliedNote(`Applied: ctx ${fmtSeqLabel(Number(s.applyKey))} · batch ${p.x}`);
+              onPoint={props.onApply ? (_s, p) => {
+                setAppliedNote(`Applied: ctx ${fmtSeqLabel(p.x)} · batch 1`);
                 props.onApply?.({
                   gpu: ovGpu || undefined,
-                  seq: Number(s.applyKey) || undefined,
-                  batch: p.x,
+                  seq: p.x,
+                  batch: 1,
                   par: batchPar,
                 });
               } : undefined}
-              legendSel={batchLegend}
-              onLegendSel={setBatchLegend}
             />
             <SweepChart
               title="Decode"
