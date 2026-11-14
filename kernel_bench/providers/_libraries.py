@@ -87,6 +87,19 @@ for _lib in (
     # from rows measured at the release. `v0.5.2` reports 0.5.2 and IS 0.5.2.
     Library("fla", pip=("flash-linear-attention @ git+https://github.com/"
                         "fla-org/flash-linear-attention.git@v0.5.2",)),
+    # The vLLM plugin for Huawei Ascend NPUs. `torch_npu` is the import
+    # gate rather than `vllm_ascend` itself: every kernel registered under
+    # this library calls a `torch_npu.npu_*` entry point, and that package
+    # is what the plugin's own wheels depend on. Neither is installable from
+    # PyPI against a CANN toolchain the way a CUDA wheel is, so the box
+    # brings its own (the `quay.io/ascend/vllm-ascend` image), which is the
+    # same arrangement `fa3` has: declared as a source build so a fresh env
+    # does not pretend it can resolve one.
+    Library("vllm_ascend", source_build=True,
+            build_hint="run inside the vllm-ascend image for the release the "
+                       "binding is audited at (quay.io/ascend/vllm-ascend"
+                       ":v0.30.0-a3); needs CANN + torch_npu, which do not "
+                       "resolve from PyPI"),
     Library("fa2", pip=("flash-attn>=2.6,<3",), no_build_isolation=True),
     Library("fa3", source_build=True,
             build_hint="build hopper/ from github.com/Dao-AILab/flash-attention "

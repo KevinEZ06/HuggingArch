@@ -1584,6 +1584,7 @@ def discover() -> None:
     from . import quantise     # noqa: F401  (the activation cast, both ways)
     from . import compress_store  # noqa: F401  (the KV compressors' spans)
     from . import deepinfer  # noqa: F401  (DeepSeek's V4.1 runtime stack)
+    from . import ascend       # noqa: F401  (vLLM-Ascend on an Ascend NPU)
     _DISCOVERED = True
 
 
