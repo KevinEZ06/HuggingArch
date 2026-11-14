@@ -186,6 +186,18 @@ for _phase in ("per_op_timing", "per_op_timing_decode"):
 for _phase in ("prefill", "decode"):
     REMOVED[f"phases.{_phase}.binding.causal_factor"] = _PAIRS
 
+# The scale-up link is not always NVLink: an Ascend node's is HCCS, a
+# CloudMatrix384 supernode's is UB. The sheet states the bandwidth under a
+# vendor-neutral name and names the link beside it, so a label is read, not
+# assumed from the column's name.
+_SCALEUP = ("the scale-up link's bandwidth, renamed from `nvlink_gbps` "
+            "because NVLink is one vendor's link (Ascend: HCCS, UB)")
+REMOVED["gpu.nvlink_gbps"] = _SCALEUP
+ADDED["gpu.scaleup_gbps"] = _SCALEUP
+ADDED["gpu.scaleup_fabric"] = (
+    "the name of that link (`NVLink`, `HCCS`, `UB`), which the intra-node "
+    "bandwidth label reads (`gpu_specs.intra_bw_label`)")
+
 # The batch's routing skew is a workload input the walk reads as `rho`
 # (`Workload.ep_load_factor`): a point names its value, and a routed row's
 # per-rank shapes are the busiest rank's, so no row publishes a load factor

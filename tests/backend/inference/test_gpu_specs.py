@@ -155,7 +155,7 @@ class TestGPUSpecsBandwidthLanes(unittest.TestCase):
             sku="x", arch="x", device="cuda", form_factor="x",
             fp32_tflops=None, tf32_tflops=None, bf16_tflops=None,
             fp16_tflops=None, int8_tops=None, fp8_tflops=None,
-            fp4_tflops=None, nvlink_gbps=None, nvls="no", pcie_gbps=None,
+            fp4_tflops=None, scaleup_gbps=None, scaleup_fabric="", nvls="no", pcie_gbps=None,
             rdma_gbps=None, mem_gib=None, mem_type="", mem_bw_gbps=None,
             tdp_w=None, gpus_per_node=None,
         )
@@ -179,7 +179,7 @@ class TestPeakFlopsByName(unittest.TestCase):
             fp32_tflops=None, tf32_tflops=None,
             bf16_tflops=None, fp16_tflops=None,
             int8_tops=None, fp8_tflops=None, fp4_tflops=None,
-            nvlink_gbps=None, nvls="no", pcie_gbps=None, rdma_gbps=None,
+            scaleup_gbps=None, scaleup_fabric="", nvls="no", pcie_gbps=None, rdma_gbps=None,
             mem_gib=None, mem_type="", mem_bw_gbps=None, tdp_w=None,
         )
         kwargs.update(peaks)

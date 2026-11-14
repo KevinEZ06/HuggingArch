@@ -91,7 +91,7 @@ class Fabric(NamedTuple):
     size, each fabric's per-direction bandwidth (bytes/s) and label, one
     link traversal's latency (s, the request's `comm_latency_us`), and
     what its topology admits of a framework's own all-reduces
-    (`gpu_specs.has_nvlink_domain`, `has_nvls`) beside the compute
+    (`gpu_specs.has_scaleup_domain`, `has_nvls`) beside the compute
     capability a dispatch tests. A fabric built from bandwidths alone
     admits none of them: NCCL's schedule prices every collective."""
     gpus_per_node: Optional[int]
@@ -124,7 +124,7 @@ def topology(gpu: Optional["gpu_specs.GPUSpec"]) -> Dict[str, Any]:
     fields: none of it without a card."""
     if gpu is None:
         return {}
-    return {"nvlink": gpu_specs.has_nvlink_domain(gpu),
+    return {"nvlink": gpu_specs.has_scaleup_domain(gpu),
             "nvls": gpu_specs.has_nvls(gpu),
             "compute_capability": gpu.compute_capability or None}
 

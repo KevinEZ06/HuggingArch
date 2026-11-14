@@ -95,7 +95,7 @@ measures empty and small collectives and launches.
   coefficients are `comm_volume.ALGORITHMS`; which payload takes which is the
   framework's binding (`collectives:` in `framework_bindings/*.yaml`, one
   representative threshold per algorithm, source-anchored); whether the card
-  admits one is `gpu_specs.csv` (`nvlink_gbps`: an NVLink domain of
+  admits one is `gpu_specs.csv` (`scaleup_gbps`: a scale-up domain — NVLink, HCCS, UB — of
   `gpus_per_node` GPUs, an HGX node or an NVL72 rack; `nvls`: the switch
   reduces). `comm_cost.collective_ladder` puts them together, and a row's law
   is cases over its payload, so a sweep's other batch lands in its own
