@@ -34,3 +34,43 @@ kv_block_size: 128
 # pairs with).
 ssm_chunk_size:
   from_config: [mamba_chunk_size, chunk_size]
+
+# The launches the plugin selects for a quantised matmul, first viable wins
+# (a candidate whose `mma_dtypes` all have peak columns on the card).
+precision_launches:
+  # msModelSlim W8A8_DYNAMIC: the activation is quantised to INT8 per token
+  # and one INT8 x INT8 matmul runs, linear and MoE alike.
+  modelslim_w8a8_dynamic_int8:
+    schemes: [modelslim-w8a8-dynamic]
+    requested_activation_formats: [int8_per_token]
+    launch:
+      activation: int8_per_token
+      compute_dtype: I8
+      mma_dtypes: [I8]
+    source_anchor: "W8A8_DYNAMIC linear quantises x with npu_dynamic_quant(dst_type=int8) and runs npu_quant_matmul on the INT8 weight with its per-channel scale and the per-token scale (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:60-131); the MoE method holds INT8 expert weights and quantises the grouped-matmul input the same way (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:146-200, vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:528-529)"
+  # A native block-FP8 checkpoint (`quant_method: fp8`) off Ascend 950: the
+  # FP8 tiles are expanded once after loading into the model dtype and the
+  # ordinary unquantised GEMM serves them, linear and MoE alike — no
+  # activation is quantised. Ascend 950 re-quantises to MXFP8 instead; that
+  # candidate belongs FIRST here, priced on an FP8 column, once a 950 row
+  # exists on the sheet.
+  #
+  # NOT modelled, stated: the resident weight. The plugin holds the expanded
+  # BF16 matrix (two bytes an element), while the walk bills the stored FP8
+  # (one byte), so an FP8 checkpoint's weight memory reads HALF of what the
+  # card holds. That is the loaded-width gap of docs/inference_cost_model.md
+  # ("The width a framework LOADS a resident tensor at: still unmodelled"):
+  # a resident width cannot be declared by a binding today. Until it can,
+  # serve such a model on this card under an explicit BF16 weight profile to
+  # see its true footprint.
+  fp8_block_dequantised_bf16:
+    schemes: [fp8]
+    requested_activation_formats:
+      - fp8_token_group128
+      - fp8_token_group128_ue8m0
+      - fp8_token_group32_ue8m0
+    launch:
+      activation: none
+      compute_dtype: BF16
+      mma_dtypes: [BF16]
+    source_anchor: "The plugin's `fp8` quant method serves block-FP8 linears and MoE through the block scheme (vllm_ascend/quantization/configs/fp8_config.py:93-108); off Ascend 950 no MXFP8 method is built (vllm_ascend/quantization/methods/w8a8/fp8_block.py:181, vllm_ascend/quantization/methods/w8a8/fp8_block.py:280), so the tiles are resolved into the model dtype after loading (vllm_ascend/quantization/methods/w8a8/fp8_block.py:17-31, vllm_ascend/quantization/methods/w8a8/fp8_block.py:199-226, vllm_ascend/quantization/methods/w8a8/fp8_block.py:357-366) and the unquantised GEMM / BF16 MoE method runs (vllm_ascend/quantization/methods/w8a8/fp8_block.py:250-259, vllm_ascend/quantization/methods/w8a8/fp8_block.py:399-416)"

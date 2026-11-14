@@ -41,3 +41,10 @@ presets:
       cache:
         - select: { slots: [kv, latent, rope_key, index_key, compressed_kv] }
           format: fp8_per_tensor
+  w_int8_w8a8:
+    label: Weights INT8 W8A8 (Ascend)
+    description: Attention, dense and MoE matrices in msModelSlim W8A8_DYNAMIC (INT8 per channel) with INT8 per-token activations (INT8 MMA; needs a card with an INT8 peak).
+    profile:
+      weights:
+        - select: { roles: weight_class }
+          format: { scheme: modelslim-w8a8-dynamic, activation: w8a8 }
