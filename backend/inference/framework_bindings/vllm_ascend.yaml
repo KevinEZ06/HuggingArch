@@ -1,13 +1,15 @@
 # vLLM-Ascend framework binding — the vLLM hardware plugin for Huawei Ascend
-# NPUs. Minimal on purpose: the serving facts every binding declares and the
-# device it runs on. No fusion entry, collective ladder or precision launch
-# yet: each of those is added only after it is read at `audited_at` in the
-# plugin's own source (prefill and decode checked separately), never copied
-# from vllm.yaml, whose kernels are CUDA's.
+# NPUs. Every entry is read at `audited_at` in the plugin's own source
+# (prefill and decode checked separately), never copied from vllm.yaml,
+# whose kernels are CUDA's. The audit is for Ascend 910C (the A3 hardware
+# profile; A2 identical): vllm_ascend/device/hardware_profile.py:246-309.
+# Ascend 950 (A5) lacks the custom ops and worker patches these entries rest
+# on (vllm_ascend/device/hardware_profile.py:333-360) and is not covered.
 #
-# With no `op_implementations` the walk is priced unfused (every op its own
-# launch) and every all-reduce on NCCL's (here HCCL's) schedule — a bound
-# that is conservative on launches, not a claim about what the plugin fuses.
+# Only entries whose one-launch claim was confirmed are bound. An op left
+# unbound is priced unfused (its own launch and HBM round trip), which can
+# only over-state time. No collective ladder: every all-reduce is priced on
+# NCCL's (here HCCL's) schedule.
 
 framework: vllm_ascend
 audited_at:
@@ -74,3 +76,68 @@ precision_launches:
       compute_dtype: BF16
       mma_dtypes: [BF16]
     source_anchor: "The plugin's `fp8` quant method serves block-FP8 linears and MoE through the block scheme (vllm_ascend/quantization/configs/fp8_config.py:93-108); off Ascend 950 no MXFP8 method is built (vllm_ascend/quantization/methods/w8a8/fp8_block.py:181, vllm_ascend/quantization/methods/w8a8/fp8_block.py:280), so the tiles are resolved into the model dtype after loading (vllm_ascend/quantization/methods/w8a8/fp8_block.py:17-31, vllm_ascend/quantization/methods/w8a8/fp8_block.py:199-226, vllm_ascend/quantization/methods/w8a8/fp8_block.py:357-366) and the unquantised GEMM / BF16 MoE method runs (vllm_ascend/quantization/methods/w8a8/fp8_block.py:250-259, vllm_ascend/quantization/methods/w8a8/fp8_block.py:399-416)"
+
+# Every entry: custom ops are on for every standard profile
+# (`custom_ops = ["all"]`, vllm_ascend/platform.py:1375-1377), so vLLM's
+# layers dispatch to the plugin's `forward_oot` overrides registered at
+# vllm_ascend/utils.py:866-897. None of the entries below branches on phase.
+#
+# Deliberately NOT bound yet (each priced unfused):
+#   * fused_qk_rope / fused_qk_rope_partial — the plugin rotates q and k in
+#     one Triton launch, but on MLA graphs it rotates q_pe alone and k_pe
+#     inside the KV norm+rope+cache op (vllm_ascend/attention/mla_v1.py:
+#     1865-1877, :2787-2801); the plan would merge MLA's two rotations, and
+#     no graph fact separates the two cases yet.
+#   * fused_qk_norm_rope / fused_qk_norm_partial_rope — a default-on graph
+#     pass, compiled mode only; matching is pattern-dependent.
+#   * fused_qk_mrope, moe_topk_softmax_bias, rmsnorm_gated, causal_conv1d —
+#     medium confidence (section boundaries, kernel internals, the external
+#     fla_npu package).
+#   * allreduce_fused_rmsnorm — no such fusion exists in the plugin.
+#
+# W8A8_DYNAMIC caveat: `fused_add_rmsnorm` and `silu_and_mul` take an
+# optional `quantise_activation` member (the consumer-follows rule), but the
+# plugin quantises inside the next linear (w8a8_dynamic.py:101, :117), a
+# launch of its own: under `w_int8_w8a8` this binding under-counts about one
+# launch per norm and per dense activation. Its MoE gate_up GMM + SwiGLU +
+# quant kernel (default on, vllm_ascend/ascend_config.py:181) has no plan.
+op_implementations:
+  # Residual add + RMSNorm: AscendRMSNorm.forward_oot with a residual makes
+  # one npu_add_rms_norm_bias call (one aclnnAddRmsNormBias), prefill and
+  # decode alike.
+  fused_add_rmsnorm:
+    source_anchor: "AscendRMSNorm.forward_oot residual branch -> torch.ops._C_ascend.npu_add_rms_norm_bias (vllm_ascend/ops/layernorm.py:88-95); registered over vLLM RMSNorm/GemmaRMSNorm (vllm_ascend/utils.py:884-885)"
+
+  # SiLU-and-mul: one torch_npu.npu_swiglu, prefill and decode alike; the
+  # unquantised routed experts run the same call.
+  silu_and_mul:
+    source_anchor: "AscendSiluAndMul.forward_oot -> torch_npu.npu_swiglu (vllm_ascend/ops/activation.py:35-38), registered as SiluAndMul (vllm_ascend/utils.py:869); routed experts vllm_ascend/ops/fused_moe/moe_mlp.py:90-95"
+
+  # Attention: one npu_fused_infer_attention_score launch per phase (or one
+  # _npu_paged_attention in the opt-in FULL_DECODE_ONLY decode graph; one
+  # launch either way). The prefill/decode split into two launches is
+  # A5-only. The KV-cache write is its own launch, outside this plan.
+  flash_attention:
+    source_anchor: "AscendAttentionBackendImpl.forward_impl (vllm_ascend/attention/attention_v1.py:1248-1269) -> forward_fused_infer_attention (vllm_ascend/attention/attention_v1.py:875-1019, vllm_ascend/device/device_op.py:216-224) / forward_paged_attention (vllm_ascend/attention/attention_v1.py:1102-1121); MLA vllm_ascend/attention/mla_v1.py:1749-1751 (prefill), vllm_ascend/attention/mla_v1.py:3051 (decode)"
+
+  # Packed projections: the plugin's linear classes keep vLLM's concatenated
+  # weight and run one GEMM (unquantised F.linear), both phases.
+  merged_column_parallel_linear:
+    source_anchor: "AscendMergedColumnParallelLinear (vllm_ascend/ops/linear.py:251-302) -> AscendUnquantizedLinearMethod.apply (vllm_ascend/ops/linear.py:133-139) -> unquantized_gemm (vllm_ascend/ops/linear.py:49-54); registered vllm_ascend/utils.py:877"
+  qkv_parallel_linear:
+    source_anchor: "AscendQKVParallelLinear (vllm_ascend/ops/linear.py:175-248) -> AscendUnquantizedLinearMethod.apply (vllm_ascend/ops/linear.py:133-139); registered vllm_ascend/utils.py:878"
+
+  # MoE routers: one moe_gating_top_k (aclnnMoeGatingTopK) does the norm,
+  # the (grouped) top-k, the gather and the renormalisation, both phases.
+  moe_topk_softmax:
+    source_anchor: "AscendFusedTopKRouter._compute_routing, norm_type 0 (vllm_ascend/ops/fused_moe/router/fused_topk_router.py:140-241) -> DeviceOperator.moe_gating_top_k (vllm_ascend/device/device_op.py:257-284)"
+  moe_topk_sigmoid:
+    source_anchor: "AscendFusedTopKRouter._compute_routing, norm_type 1, group_count 1 (vllm_ascend/ops/fused_moe/router/fused_topk_router.py:156-158, vllm_ascend/ops/fused_moe/router/fused_topk_router.py:224-239) -> one aclnnMoeGatingTopK (csrc/moe/moe_gating_top_k/op_host/moe_gating_top_k_tiling.cpp:559-560)"
+  moe_fused_gate:
+    source_anchor: "AscendFusedTopKRouter._compute_routing with group_select_mode=1 (vllm_ascend/ops/fused_moe/router/fused_topk_router.py:227-239) -> one aclnnMoeGatingTopK, grouped top2-sum selection (csrc/moe/moe_gating_top_k/op_kernel/moe_gating_top_k_generalized.h:285)"
+
+  # Gated DeltaNet gates: one Triton launch for g and beta over the whole
+  # batch, both phases. beta is written at the input dtype while the plan
+  # bills fp32 — an over-statement of bytes, left as is.
+  fused_gdn_gating:
+    source_anchor: "fused_gdn_gating_patch (vllm_ascend/ops/triton/fused_gdn_gating.py:59-99, kernel vllm_ascend/ops/triton/fused_gdn_gating.py:14-56) via DeviceOperator.fused_gdn_gating (vllm_ascend/device/device_op.py:940-942), from AscendGatedDeltaNetAttention._forward_core (vllm_ascend/ops/gdn.py:680)"

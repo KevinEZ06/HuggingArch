@@ -126,14 +126,20 @@ class TestEstimateOnNpuCard(unittest.TestCase):
         with self.assertRaises(FrameworkNotOnDevice):
             self._estimate("vllm")
 
-    def test_npu_framework_prices_no_cuda_fusion(self):
+    def test_npu_framework_prices_only_its_own_fusions(self):
+        # Every fused row on the NPU card is a fusion vLLM-Ascend declares;
+        # none of vLLM's CUDA-only kernels reaches it.
         from backend.inference.fusion_plans import FUSION_SCHEMES
+        own = set(get_binding("vllm_ascend").fused_ops())
+        cuda_only = set(get_binding("vllm").fused_ops()) - own
         res = self._estimate("vllm_ascend")
         for phase in ("per_op_timing", "per_op_timing_decode"):
             rows = res[phase]
             self.assertTrue(rows, phase)
             fused = {r["op"] for r in rows if r["op"] in FUSION_SCHEMES}
-            self.assertEqual(fused, set(), phase)
+            self.assertTrue(fused, phase)
+            self.assertLessEqual(fused, own, phase)
+            self.assertFalse(fused & cuda_only, phase)
 
 
 if __name__ == "__main__":
