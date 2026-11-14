@@ -57,14 +57,23 @@ precision_launches:
   # candidate belongs FIRST here, priced on an FP8 column, once a 950 row
   # exists on the sheet.
   #
-  # NOT modelled, stated: the resident weight. The plugin holds the expanded
-  # BF16 matrix (two bytes an element), while the walk bills the stored FP8
-  # (one byte), so an FP8 checkpoint's weight memory reads HALF of what the
-  # card holds. That is the loaded-width gap of docs/inference_cost_model.md
-  # ("The width a framework LOADS a resident tensor at: still unmodelled"):
-  # a resident width cannot be declared by a binding today. Until it can,
-  # serve such a model on this card under an explicit BF16 weight profile to
-  # see its true footprint.
+  # Weight memory for a native FP8 checkpoint on this card is billed at ONE
+  # BYTE per weight, which is the production figure: a 910C deployment does
+  # not serve the FP8 tiles as they ship. It converts them to the equivalent
+  # W8A8 INT8 (msModelSlim, offline or at load) and serves that, and both
+  # formats are one byte per weight, so the resident footprint the walk
+  # reports is the one the card holds.
+  #
+  # The path this entry prices is the OTHER one: a checkpoint served without
+  # that conversion, where the plugin expands each tile into the model dtype
+  # after loading and the unquantised GEMM runs. Its COMPUTE is what this
+  # launch states (BF16, no activation quantised); its resident weight is
+  # then two bytes, which the walk does not bill, because a binding cannot
+  # declare a resident width today (docs/inference_cost_model.md, "The width
+  # a framework LOADS a resident tensor at: still unmodelled"). Deliberately
+  # left: the modelled byte figure matches the deployment anyone runs, and
+  # the unconverted path is a transitional one. To see that path's true
+  # footprint, serve the model under an explicit BF16 weight profile.
   fp8_block_dequantised_bf16:
     schemes: [fp8]
     requested_activation_formats:
@@ -83,11 +92,6 @@ precision_launches:
 # vllm_ascend/utils.py:866-897. None of the entries below branches on phase.
 #
 # Deliberately NOT bound yet (each priced unfused):
-#   * fused_qk_rope / fused_qk_rope_partial — the plugin rotates q and k in
-#     one Triton launch, but on MLA graphs it rotates q_pe alone and k_pe
-#     inside the KV norm+rope+cache op (vllm_ascend/attention/mla_v1.py:
-#     1865-1877, :2787-2801); the plan would merge MLA's two rotations, and
-#     no graph fact separates the two cases yet.
 #   * fused_qk_norm_rope / fused_qk_norm_partial_rope — a default-on graph
 #     pass, compiled mode only; matching is pattern-dependent.
 #   * fused_qk_mrope, moe_topk_softmax_bias, rmsnorm_gated, causal_conv1d —
@@ -105,6 +109,29 @@ op_implementations:
   # Residual add + RMSNorm: AscendRMSNorm.forward_oot with a residual makes
   # one npu_add_rms_norm_bias call (one aclnnAddRmsNormBias), prefill and
   # decode alike.
+  # Q and K rotated in one Triton launch, both phases: AscendRotaryEmbedding
+  # -> vllm::npu_rotary_embedding -> one _triton_rope over q and k. The
+  # partial form is the same kernel with rope_dim passed, rotating the
+  # leading lanes of every head.
+  #
+  # KNOWN OVERMATCH, accepted: on an MLA graph (DeepSeek-V3, Kimi-K2) the
+  # plugin does NOT rotate the pair — it rotates q_pe alone
+  # (npu_interleave_rope, vllm_ascend/attention/mla_v1.py:2787-2801) and
+  # folds k_pe into the KV norm+rope+cache op
+  # (vllm_ascend/attention/mla_v1.py:1865-1877) — yet this entry still binds
+  # there, because the pattern matches a q/k rope pair and the dispatch
+  # vocabulary has no fact that separates MLA from GQA: the role is
+  # `attention` on both, and `dims` can only include explicit values, which
+  # would be a per-model proxy. Excluding MLA would mean listing model
+  # classes. The error is bounded and smaller than the alternative: on MLA
+  # it merges two rotations of the 64-lane rope slice, while leaving the
+  # entry unbound would cost every GQA model a full Q and K HBM round trip.
+  # Revisit if the vocabulary gains an attention-family fact.
+  fused_qk_rope:
+    source_anchor: "AscendRotaryEmbedding.forward_oot (vllm_ascend/ops/rotary_embedding.py:274-322) -> rope_forward_oot (vllm_ascend/ops/rotary_embedding.py:198-254, registered vllm_ascend/ops/register_custom_ops.py:262-268) -> rope_forward_triton, one _triton_rope launch over q and k (vllm_ascend/ops/triton/rope.py:541-660, launch vllm_ascend/ops/triton/rope.py:599-620)"
+  fused_qk_rope_partial:
+    source_anchor: "rope_forward_oot with rope_dim (vllm_ascend/ops/rotary_embedding.py:216-236) -> rope_forward_triton(rope_dim=rotary_dim) (vllm_ascend/ops/triton/rope.py:580-620), from AscendRotaryEmbedding.forward_oot (vllm_ascend/ops/rotary_embedding.py:311-322)"
+
   fused_add_rmsnorm:
     source_anchor: "AscendRMSNorm.forward_oot residual branch -> torch.ops._C_ascend.npu_add_rms_norm_bias (vllm_ascend/ops/layernorm.py:88-95); registered over vLLM RMSNorm/GemmaRMSNorm (vllm_ascend/utils.py:884-885)"
 
