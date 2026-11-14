@@ -87,11 +87,17 @@ class TestGPUSpecsBandwidthLanes(unittest.TestCase):
             self.assertGreaterEqual(gpus_per_node(gpu), 1, gpu.sku)
 
     def test_every_sku_declares_its_device(self):
-        """A framework's dispatch can be platform-gated (sglang's `_is_cuda`);
-        the SKU sheet says which platform each GPU is, not its arch name."""
+        """A framework's dispatch can be platform-gated (sglang's `_is_cuda`),
+        and a framework runs on the devices its binding declares; the SKU
+        sheet says which platform each card is, not its arch name, and every
+        card is a device some shipped framework runs on."""
+        from backend.inference.framework_bindings import FRAMEWORK_BINDINGS
         from backend.inference.gpu_specs import load_gpu_specs
+        served = {d for b in FRAMEWORK_BINDINGS.values() for d in b.devices}
         for gpu in load_gpu_specs():
-            self.assertEqual(gpu.device, "cuda", gpu.sku)
+            self.assertIn(gpu.device, served, gpu.sku)
+        self.assertEqual(get_gpu("H100-SXM").device, "cuda")
+        self.assertEqual(get_gpu("Ascend-910C-A3").device, "npu")
 
     def test_every_cuda_sku_states_its_compute_capability(self):
         """A framework selects some kernels by compute capability (vLLM's
@@ -100,6 +106,9 @@ class TestGPUSpecsBandwidthLanes(unittest.TestCase):
         states one, as `major.minor`."""
         from backend.inference.gpu_specs import load_gpu_specs
         for gpu in load_gpu_specs():
+            if gpu.device != "cuda":
+                self.assertEqual(gpu.compute_capability, "", gpu.sku)
+                continue
             major, _, minor = gpu.compute_capability.partition(".")
             self.assertTrue(major.isdigit() and minor.isdigit(), gpu.sku)
         self.assertEqual(get_gpu("H100-SXM").compute_capability, "9.0")

@@ -31,6 +31,11 @@ audited_at:
   tag: v0.5.22
   commit: baa9befa381511cd4d56f83980951e5a45fffc6d
 
+# The devices sglang runs on (`gpu_specs.csv` `device`). A deployment on any
+# other device is refused (`FrameworkBinding.deployed`); per-entry
+# `when: device` only narrows inside this list.
+devices: [cuda]
+
 # Each entry: a fused-op concept (`fusion_plans/`) sglang runs as one launch,
 # where its source says so, and `when:` it does (absent: whenever the pattern
 # matches).

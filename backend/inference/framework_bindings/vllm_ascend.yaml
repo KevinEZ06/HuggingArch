@@ -1,0 +1,36 @@
+# vLLM-Ascend framework binding — the vLLM hardware plugin for Huawei Ascend
+# NPUs. Minimal on purpose: the serving facts every binding declares and the
+# device it runs on. No fusion entry, collective ladder or precision launch
+# yet: each of those is added only after it is read at `audited_at` in the
+# plugin's own source (prefill and decode checked separately), never copied
+# from vllm.yaml, whose kernels are CUDA's.
+#
+# With no `op_implementations` the walk is priced unfused (every op its own
+# launch) and every all-reduce on NCCL's (here HCCL's) schedule — a bound
+# that is conservative on launches, not a claim about what the plugin fuses.
+
+framework: vllm_ascend
+audited_at:
+  repo: vllm-project/vllm-ascend
+  tag: v0.30.0
+  commit: c09d3e20b9c45c80b34ae3781440d90904a44023
+
+# The plugin runs on Ascend NPUs only (`gpu_specs.csv` `device: npu`).
+devices: [npu]
+
+# The paged-KV page the plugin allocates in on its default serving path:
+# `refresh_block_size` (vllm_ascend/utils.py:1482-1505, called from
+# vllm_ascend/platform.py:1373) sets an unset block size to 128, and forces
+# 128 under prefix caching or chunked prefill (vllm_ascend/utils.py:1536-1540).
+# Billed at 128 for every model; not modelled: a deepseek_v4 checkpoint
+# defaults to 32 (vllm_ascend/utils.py:1520-1528), a hybrid attention+mamba
+# model sizes its own page (vllm_ascend/utils.py:1531-1534), and C8 MXFP KV
+# rounds to its kernel block (vllm_ascend/utils.py:1509-1515).
+kv_block_size: 128
+
+# The plugin runs vLLM's model config: `ModelConfig.get_mamba_chunk_size`
+# reads `mamba_chunk_size`, then `chunk_size` (vllm v0.30.0
+# vllm/config/model.py:1664-1672, the vLLM release vLLM-Ascend v0.30.0
+# pairs with).
+ssm_chunk_size:
+  from_config: [mamba_chunk_size, chunk_size]

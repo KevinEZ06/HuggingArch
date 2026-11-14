@@ -1203,6 +1203,22 @@ class EdgeDtype:
     KEYS = frozenset({"roles", "dtype", "when", "source_anchor"})
 
 
+class FrameworkNotOnDevice(ValueError):
+    """A request named a framework on a card whose device the framework
+    does not run on (`FrameworkBinding.devices`) — vLLM on an Ascend NPU,
+    vLLM-Ascend on an NVIDIA GPU. Refused rather than answered: the rows
+    would price the other platform's kernels. A ValueError, so the API
+    answers it 400 with this message."""
+
+    def __init__(self, framework: str, devices: Tuple[str, ...],
+                 device: str):
+        self.framework, self.devices, self.device = framework, devices, device
+        super().__init__(
+            f"{framework} runs on {', '.join(devices)}, not on a {device} "
+            f"card: pick a framework whose binding lists `{device}` in its "
+            f"`devices`, or a card it runs on.")
+
+
 @dataclass(frozen=True)
 class FrameworkBinding:
     """One framework's binding — a frozen, ordered list of fused_op entries
@@ -1277,9 +1293,22 @@ class FrameworkBinding:
     #: order. Conditions here select AFTER precision/key derivation; they never
     #: restate weight dtype, quant scheme, activation format, or MMA dtype.
     kernel_dispatches: Tuple[KernelDispatch, ...] = ()
+    #: The devices this framework runs on at all (`gpu_specs.csv`
+    #: `device`): `cuda` for vLLM, sglang and DeepInfer, `npu` for
+    #: vLLM-Ascend. It is the framework's fact, so the framework's file
+    #: declares it, once, and a deployment on any other device is refused
+    #: where a binding meets a card (`deployed`). Without it a request for
+    #: a framework on a device it does not run on was answered: every entry
+    #: whose `when:` leaves the device unstated fired there, and the rows
+    #: priced a CUDA kernel set on a card that cannot launch one. A per-entry
+    #: `when: device` still narrows one kernel inside these devices; it may
+    #: not name a device outside them (checked at load). Empty only on a
+    #: binding built in code without one; a file must declare it.
+    devices: Tuple[str, ...] = ()
 
     #: The fields of a binding file.
-    KEYS = frozenset({"framework", "audited_at", "op_implementations",
+    KEYS = frozenset({"framework", "audited_at", "devices",
+                      "op_implementations",
                       "kv_block_size", "ssm_chunk_size", "collectives",
                       "precision_launches", "edge_dtypes",
                       "kernel_dispatches"})
@@ -1424,9 +1453,16 @@ class FrameworkBinding:
 
     def deployed(self, deployment: ServingDeployment) -> "FrameworkBinding":
         """This binding, answering its conditions against `deployment`. A
-        server flag no condition of it reads is refused: the framework has
-        no such switch here, and a flag nothing reads would be a deployment
-        that differs from another in name only."""
+        deployment on a device the framework does not run on is refused
+        (`devices`, `FrameworkNotOnDevice`): this is the one place a
+        framework meets a card, so the refusal is here rather than at each
+        caller. A server flag no condition of it reads is refused: the
+        framework has no such switch here, and a flag nothing reads would be
+        a deployment that differs from another in name only."""
+        if (self.devices and deployment.device is not None
+                and deployment.device not in self.devices):
+            raise FrameworkNotOnDevice(self.framework, self.devices,
+                                       deployment.device)
         known = self.server_flag_names()
         unknown = sorted({name for name, _value in deployment.server_flags}
                          - known)
@@ -2009,6 +2045,7 @@ def _load_framework_bindings_dir(
                 f"{framework!r} is `{framework}.yaml` — one binding per "
                 f"framework.")
         audited_at = _audited_at(data.get("audited_at"), fname)
+        devices = _devices(data.get("devices"), fname)
         if "kv_block_size" not in data:
             raise ValueError(
                 f"framework_bindings/{fname}: no `kv_block_size`. It is the "
@@ -2102,8 +2139,48 @@ def _load_framework_bindings_dir(
             precision_launches=precision_launches,
             edge_dtypes=edge_dtypes,
             kernel_dispatches=kernel_dispatches,
+            devices=devices,
         )
+        _check_entry_devices(out[framework], fname)
     return out
+
+
+def _devices(raw: Any, fname: str) -> Tuple[str, ...]:
+    """A file's `devices:`: the non-empty list of `gpu_specs.csv` devices the
+    framework runs on. Declared, not defaulted — a framework that left it out
+    would run everywhere — and each must be a device some card has, or the
+    binding could never deploy."""
+    if (not isinstance(raw, list) or not raw
+            or not all(isinstance(d, str) and d for d in raw)
+            or len(set(raw)) != len(raw)):
+        raise ValueError(
+            f"framework_bindings/{fname}: `devices` is the non-empty list of "
+            f"devices (`gpu_specs.csv` `device`) this framework runs on, "
+            f"declared once per file; got {raw!r}.")
+    known = {g.device for g in gpu_specs.load_gpu_specs()}
+    unknown = sorted(set(d.lower() for d in raw) - known)
+    if unknown:
+        raise ValueError(
+            f"framework_bindings/{fname}: `devices` names {unknown}, which no "
+            f"row of gpu_specs.csv has (devices there: {sorted(known)}).")
+    return tuple(d.lower() for d in raw)
+
+
+def _check_entry_devices(binding: FrameworkBinding, fname: str) -> None:
+    """An entry's `when: device` narrows a kernel inside the framework's
+    `devices`; naming a device outside them states a kernel the framework
+    can never be deployed to run, so it is refused at load."""
+    whens = [w for _op, impl in binding.op_implementations for w in impl.whens]
+    whens += [w for launch in binding.precision_launches for w in launch.whens]
+    whens += [w for d in binding.kernel_dispatches for w in d.whens]
+    whens += [w for e in binding.edge_dtypes for w in e.whens]
+    outside = sorted({d for w in whens for d in w.device}
+                     - set(binding.devices))
+    if outside:
+        raise ValueError(
+            f"framework_bindings/{fname}: an entry's `when: device` names "
+            f"{outside}, outside the framework's `devices` "
+            f"{list(binding.devices)}.")
 
 
 def _append_op_implementation(impls: list, op_name: str, impl_data: Any,
