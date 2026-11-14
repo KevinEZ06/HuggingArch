@@ -1144,7 +1144,12 @@ def _cmd_report(argv: List[str]) -> int:
                        unplaced_by_reason, unplaced_path)
     from .providers import all_providers
 
-    env = Env(None, False, None, args.gpu, None)
+    # `report` reads a plan and counts it; it touches no device. The device
+    # is still the card's own (`gpu_specs.csv`), not "none", because the
+    # providers it judges are gated on it (`Provider.available`).
+    from backend.inference.gpu_specs import get_gpu
+    _card = get_gpu(args.gpu) if args.gpu else None
+    env = Env(None, _card.device if _card else None, None, args.gpu, None)
     jobs = read_jobs_jsonl(args.jobs)
     # The plan's cells no env of its box would measure (`plan.write_plan`):
     # still cells, counted below as `no provider` with the reason they gave.

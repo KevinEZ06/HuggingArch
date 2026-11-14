@@ -21,7 +21,7 @@ from kernel_bench.invocation import Invocation
 from kernel_bench.providers import TORCH_FLOAT, all_providers
 from tests.kernel_bench._inputs import build_inputs
 
-TORCH_ENV = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+TORCH_ENV = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
 
 
 def _providers(signature):
@@ -460,7 +460,7 @@ class TestIndexerQRopeQuant:
         narrow = self._cell("fused_indexer_q_rope_quant_split",
                             d_head=64)
         assert not [p for p in split if p.accepts(narrow, TORCH_ENV)]
-        h100 = Env("2.11", False, None, None, None, sm="sm_90",
+        h100 = Env("2.11", None, None, None, None, sm="sm_90",
                    libs={"sglang.kernels.ops.attention.dsv4."
                          "fp4_indexer_rope": "0.5.22"})
         assert not next(p for p in split if p.library == "sglang").available(h100)
@@ -3532,8 +3532,8 @@ class TestHyperConnectionGatesAndExitReduce:
         arm = next(p for p in _providers("hc_combine_norm")
                    if p.library == "sglang")
         lib = {"sglang.kernels.ops.elementwise.hc_combine_decode": "0.5.22"}
-        h100 = Env("2.11", True, None, None, None, sm="sm_90", libs=lib)
-        b200 = Env("2.11", True, None, None, None, sm="sm_100", libs=lib)
+        h100 = Env("2.11", "cuda", None, None, None, sm="sm_90", libs=lib)
+        b200 = Env("2.11", "cuda", None, None, None, sm="sm_100", libs=lib)
         assert not arm.available(h100)
         assert arm.available(b200)
 
@@ -4958,7 +4958,7 @@ class TestSparseAttentionRoutes:
         inv = _inv("mla_sparse_sink_attention", self.SINK_DIMS, phase="decode")
         inputs = build_inputs(get_ref("mla_sparse_sink_attention"), inv, "cpu")
         att._vllm_sparse_sink_bf16_build(
-            inv, Env("2.11", False, "90", None, None,
+            inv, Env("2.11", None, "90", None, None,
                      libs={"torch": "2.11"}), inputs).run()
         assert seen["q"].shape == (10, 64, 576)
         assert seen["kv"].shape == (74, 1, 576)
@@ -4986,7 +4986,7 @@ class TestSparseAttentionRoutes:
             monkeypatch, "sgl_kernel.flash_mla",
             flash_mla_sparse_fwd=sgl_flash)
         att._sgl_sparse_sink_build(
-            inv, Env("2.11", False, "90", None, None,
+            inv, Env("2.11", None, "90", None, None,
                      libs={"torch": "2.11"}), inputs).run()
         assert sgl_seen["q"].shape == (10, 64, 576)
         assert torch.equal(sgl_seen["attn_sink"][:5], inputs["sinks"])

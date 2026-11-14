@@ -133,11 +133,14 @@ def _reference_will_not_fit(inv, inputs, env) -> Optional[str]:
     and every remaining job for that model died with the run timeout. A cell the
     kernel can serve must not be lost to the cost of checking it.
     """
-    if not env.cuda_available:
+    if not env.accelerated:
         return None
     try:
-        import torch
-        free, _total = torch.cuda.mem_get_info()
+        from .device import backend_named
+        free_total = backend_named(env.device).mem_get_info()
+        if free_total is None:
+            return None
+        free, _total = free_total
     except Exception:
         return None
     try:
@@ -256,11 +259,11 @@ class CudaContextLost(RuntimeError):
 def _context_lost(env: Env) -> bool:
     """Whether the CUDA context has latched an error (a synchronize raises).
     Asked after a provider raised, before anything else touches the device."""
-    if not env.cuda_available:
+    if not env.accelerated:
         return False
     try:
-        import torch
-        torch.cuda.synchronize()
+        from .device import backend_named
+        backend_named(env.device).synchronize()
     except Exception:
         return True
     return False
@@ -457,7 +460,11 @@ def run_jobs(
         # whole sweep — as the module docstring promises.
         from .cell_check import complaints as cell_complaints
         from .refs import get_ref, input_generator
-        device = "cuda" if env.cuda_available else "cpu"
+        # The device the env actually has, not "cuda or give up". Asking
+        # `cuda_available` here put every Ascend tensor on the CPU and the
+        # run still produced rows — the exact shape of defect this harness
+        # exists to refuse (ARCHITECTURE.md, "the failure this prevents").
+        device = env.device or "cpu"
         def refuse_inputs(detail: str) -> None:
             # The card cannot hold this cell's INPUTS, so no provider of it
             # can run — one recorded refusal per implementation that was

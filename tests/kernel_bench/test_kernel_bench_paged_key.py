@@ -120,7 +120,7 @@ class TestThePageIsInTheCell(unittest.TestCase):
             "actual_computes_at": lambda self, inv: {},
             "version": lambda self, env: "1.0",
             "impl_id": lambda self, inv: "k"})()
-        env = Env("2.11", False, "H100", "H100-SXM", 3350.0, sm="sm_90")
+        env = Env("2.11", None, "H100", "H100-SXM", 3350.0, sm="sm_90")
         for job in paged:
             inv = Invocation.from_job(job)
             row = build_row(inv, provider, LatencyStats(5.0, 5.0, 6.0, 100, "l2_drain"),

@@ -324,7 +324,7 @@ class TestAResultTheTraceCannotHandBack:
             raise driver.TooSlowToMeasure("gate passed")
         monkeypatch.setattr(driver, "time_callable", stop_before_timing)
         result = driver.run_jobs(
-            [job], env=Env("2.11", False, None, None, None,
+            [job], env=Env("2.11", None, None, None, None,
                            libs={"torch": "2.11"}),
             date="2026-10-26", contributor="test")
         assert len(result.failures) == 1, result.failures

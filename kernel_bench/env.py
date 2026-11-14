@@ -21,7 +21,13 @@ from backend.inference import benchmarks as _benchmarks
 @dataclass
 class Env:
     torch_version: Optional[str]
-    cuda_available: bool
+    #: Which accelerator this env computes on, in the sheet's vocabulary
+    #: (`gpu_specs.csv` `device`: `cuda`, `npu`), or None for a box with
+    #: none. The ONE stored device fact: `cuda_available` reads it rather
+    #: than being stored beside it, because two fields answering "which
+    #: device" is two facts free to disagree — and the disagreement is
+    #: silent, since a CPU fallback still produces a number.
+    device: Optional[str]
     device_name: Optional[str]
     gpu_sku: Optional[str]           # our canonical SKU (gpu_specs), if resolvable
     peak_bw_gbps: Optional[float]
@@ -64,6 +70,36 @@ class Env:
     #: `dependency_manifest` groups an env's `# Providers:` line by) and no
     #: others.
     library: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """A device outside the sheet's vocabulary is refused here.
+
+        The field used to be a boolean, so a caller that passes one still
+        reads as "some device" — `device=True` is not None, and every
+        `accelerated` check would admit it while no backend could serve it.
+        Refused loudly rather than carried: a wrong device silently moves a
+        measurement onto the CPU, which is the one failure this field was
+        introduced to end.
+        """
+        from .device import DEVICES
+
+        if self.device is not None and self.device not in DEVICES:
+            raise ValueError(
+                f"Env.device is one of {list(DEVICES)} or None (the "
+                f"`gpu_specs.csv` `device` vocabulary); got {self.device!r}")
+
+    @property
+    def cuda_available(self) -> bool:
+        """Whether this env computes on CUDA. Derived from `device`, so a
+        caller that means "an accelerator is present" and one that means
+        "CUDA specifically" cannot drift apart."""
+        return self.device == "cuda"
+
+    @property
+    def accelerated(self) -> bool:
+        """Whether this env has any accelerator — what a caller asking
+        "can I put a tensor on the device" means."""
+        return self.device is not None
 
     def peak_tflops(self, dtype: str) -> Optional[float]:
         """The card's peak (TFLOPs) at the MMA family `dtype` runs on —
@@ -201,25 +237,43 @@ def _read_text(path: str) -> str:
 
 
 def detect_env() -> Env:
+    """What this process can reach, asked of the device rather than assumed.
+
+    The accelerator is probed through `device.detect_backend()`, which tries
+    each device this harness measures on. Asking `torch.cuda.is_available()`
+    directly — as this did — answered "no GPU" on an Ascend box, and every
+    consumer then took the CPU branch: tensors landed on the CPU, the clock
+    became `perf_counter`, and the card stamped on the row was whatever the
+    box profile said. Nothing failed.
+
+    `sm` stays CUDA's: it is the compute-capability tag a CUDA kernel's
+    floor is written against (`Provider.min_sm`). A device without the
+    notion leaves it None, and a provider that states a floor is refused
+    there (`providers._sm_ok`) rather than admitted by the gap.
+    """
+    from .device import detect_backend
+
     torch_version = None
-    cuda_available = False
+    device = None
     device_name = None
     peak_bw_gbps = None
     sm = None
+    gpu_sku = None
     try:
         import torch
         torch_version = torch.__version__
-        cuda_available = bool(torch.cuda.is_available())
-        if cuda_available:
-            device_name = torch.cuda.get_device_name(0)
-            gpu_sku, peak_bw_gbps = _resolve_peaks(device_name)
-            try:
-                major, minor = torch.cuda.get_device_capability(0)
-                sm = f"sm_{major}{minor}"        # (8,9) → "sm_89"
-            except Exception:
-                sm = None
-        else:
-            gpu_sku = None
+        backend = detect_backend()
+        if backend is not None:
+            device = backend.name
+            device_name = backend.device_name(0)
+            if device_name:
+                gpu_sku, peak_bw_gbps = _resolve_peaks(device_name)
+            if device == "cuda":
+                try:
+                    major, minor = torch.cuda.get_device_capability(0)
+                    sm = f"sm_{major}{minor}"    # (8,9) → "sm_89"
+                except Exception:
+                    sm = None
     except Exception:
         gpu_sku = None
 
@@ -242,11 +296,11 @@ def detect_env() -> Env:
     # while the call does not (that box profile's "FALSE GREEN" note).
     return Env(
         torch_version=torch_version,
-        cuda_available=cuda_available,
+        device=device,
         device_name=device_name,
-        gpu_sku=gpu_sku if cuda_available else None,
+        gpu_sku=gpu_sku if device else None,
         peak_bw_gbps=peak_bw_gbps,
-        sm=sm if cuda_available else None,
+        sm=sm,
         kmd_version=kernel_mode_driver(_read_text(_NVRM_PROC)),
         umd_version=loaded_user_mode_driver(_read_text(_SELF_MAPS)),
         libs=libs,

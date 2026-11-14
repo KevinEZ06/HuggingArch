@@ -86,7 +86,7 @@ def _invocation(point, phase: str, extra_dims=None) -> Invocation:
 
 
 def _provider_env() -> Env:
-    return Env("2.11", False, "sm_90", None, None,
+    return Env("2.11", None, "sm_90", None, None,
                libs={"torch": "2.11", "vllm": "0.32.0"})
 
 

@@ -1180,7 +1180,18 @@ class Provider:
         harness declines what it can prove it cannot run, and does not invent
         a reason to skip otherwise.
         """
-        if self.min_sm is None or not env.sm:
+        if self.min_sm is None:
+            return True
+        # A kernel that states a compute-capability floor is a CUDA kernel:
+        # `sm` is CUDA's notion and only a CUDA env carries one. Off CUDA the
+        # floor cannot be met, so the provider is refused rather than let
+        # through by the gap — which is the direction that matters, since an
+        # unmet floor used to ADMIT (an Ascend box has no `sm` at all, so
+        # every CUDA-only kernel passed this gate and only the import gate
+        # stood between it and a measurement).
+        if env.device not in (None, "cuda"):
+            return False
+        if not env.sm:
             return True
         digits = "".join(c for c in str(env.sm) if c.isdigit())
         if not digits:
