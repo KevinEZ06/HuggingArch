@@ -157,7 +157,8 @@ def frontier_parallel_configs(resolved: Any, gpu: str) -> List[Tuple[str, Any]]:
 
 def _ceilings_for_deployment(
     *, config: dict, gpu: str, parallel: Any, seq_lens: List[int],
-    avg_output_tokens: int, precision: Any, resolved: Any = None,
+    avg_output_tokens: int, precision: Any, framework: str,
+    resolved: Any = None,
 ) -> Dict[int, Any]:
     """L1 for one deployment across every seq — `{seq: CapacityCeilings}`.
 
@@ -182,6 +183,14 @@ def _ceilings_for_deployment(
                 config=config, gpu_sku=gpu, parallel=parallel,
                 num_gpus=getattr(parallel, "cluster_size", 1) or 1,
                 seq_lens=seq_lens, avg_output_tokens=avg_output_tokens,
+                # The framework the sweep plans under, not the default: a
+                # binding and a card must agree on the device before either
+                # can price anything (`FrameworkBinding.deployed`). Left
+                # unstated, this gate asked the DEFAULT framework about an
+                # Ascend card and every cell of every non-CUDA box came back
+                # a gate error — the plan then wrote zero jobs, for a card
+                # whose own framework fits it fine.
+                framework=framework,
                 # The spec the sweep matched once — capacity uses it directly
                 # instead of re-matching (its single-entry-point path).
                 resolved=resolved,
@@ -414,7 +423,7 @@ def _plan_deployment(label: str, par: Any, *, model_id: str, gpu: str,
     try:
         ceilings = _ceilings_for_deployment(
             config=config, gpu=gpu, parallel=par, seq_lens=list(seq_lens),
-            avg_output_tokens=avg_output_tokens,
+            avg_output_tokens=avg_output_tokens, framework=framework,
             precision=precision, resolved=resolved)
     except Exception as e:
         # A gate crash is NOT a fit verdict — surface it, don't let the

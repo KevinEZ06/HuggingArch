@@ -125,10 +125,27 @@ def _grouped_quant_matmul_build(inv: Invocation, env: Env,
     groups = torch.tensor(cumulative, dtype=torch.int64, device=x.device)
     # The grouped kernel takes the tokens of every expert in one flat run,
     # not the [E, S, K] block the cell carries.
-    flat = x.reshape(-1, x.shape[-1])[:running].contiguous()
+    # The cell's row block is [E, s_expert_rows, K] and its counts say how
+    # many of each expert's rows are real. The kernel reads ONE flat run of
+    # `running` tokens, so the padding between a count and its block's end
+    # is dropped here rather than handed over: passed whole, the last
+    # cumulative entry falls short of the tensor's length and the kernel
+    # refuses the pair.
+    rows = x.reshape(-1, x.shape[-1])
+    per_block = rows.shape[0] // max(len(counts), 1)
+    kept = [rows[i * per_block:i * per_block + int(c)]
+            for i, c in enumerate(counts)]
+    flat = (torch.cat(kept, dim=0).contiguous() if kept
+            else rows[:running].contiguous())
+    # The cell carries each expert's weight as (N, K) — the layout a single
+    # expert's linear states (`refs._grouped_gemm_inputs`) — while the
+    # kernel contracts over the LAST axis and wants (K, N). Transposed once
+    # here, outside the timed closure; the plugin transposes at load too
+    # (`w8a8_dynamic.py:135-139`), so it is not per-step work either way.
+    wt = w.transpose(-1, -2).contiguous()
     return BenchCase(
         run=lambda: torch_npu.npu_grouped_matmul(
-            [flat], [w], group_list=groups, split_item=2, group_type=0),
+            [flat], [wt], group_list=groups, split_item=2, group_type=0),
         to_canonical=None,   # flat-vs-blocked layout; measured, not verified
     )
 
@@ -154,10 +171,27 @@ def _grouped_matmul_build(inv: Invocation, env: Env,
         running += int(count)
         cumulative.append(running)
     groups = torch.tensor(cumulative, dtype=torch.int64, device=x.device)
-    flat = x.reshape(-1, x.shape[-1])[:running].contiguous()
+    # The cell's row block is [E, s_expert_rows, K] and its counts say how
+    # many of each expert's rows are real. The kernel reads ONE flat run of
+    # `running` tokens, so the padding between a count and its block's end
+    # is dropped here rather than handed over: passed whole, the last
+    # cumulative entry falls short of the tensor's length and the kernel
+    # refuses the pair.
+    rows = x.reshape(-1, x.shape[-1])
+    per_block = rows.shape[0] // max(len(counts), 1)
+    kept = [rows[i * per_block:i * per_block + int(c)]
+            for i, c in enumerate(counts)]
+    flat = (torch.cat(kept, dim=0).contiguous() if kept
+            else rows[:running].contiguous())
+    # The cell carries each expert's weight as (N, K) — the layout a single
+    # expert's linear states (`refs._grouped_gemm_inputs`) — while the
+    # kernel contracts over the LAST axis and wants (K, N). Transposed once
+    # here, outside the timed closure; the plugin transposes at load too
+    # (`w8a8_dynamic.py:135-139`), so it is not per-step work either way.
+    wt = w.transpose(-1, -2).contiguous()
     return BenchCase(
         run=lambda: torch_npu.npu_grouped_matmul(
-            [flat], [w], group_list=groups, split_item=2, group_type=0),
+            [flat], [wt], group_list=groups, split_item=2, group_type=0),
         to_canonical=None,
     )
 
@@ -284,6 +318,7 @@ register(Provider(
 
 def _fia_prefill_build(inv: Invocation, env: Env,
                        inputs: Dict[str, Any]) -> BenchCase:
+    import torch
     import torch_npu
 
     q, k, v = inputs["q"], inputs["k"], inputs["v"]
@@ -291,17 +326,42 @@ def _fia_prefill_build(inv: Invocation, env: Env,
     kv_heads = int(inv.dims.get("n_kv_heads", heads))
     scale = float(q.shape[-1]) ** -0.5
     causal = bool(inputs.get("causal", True))
-    # `pre_tokens` is how far back a query may attend: the whole past for a
-    # causal prefill, and `next_tokens=0` forbids attending forward. A
-    # non-causal cell asks for the full rectangle.
-    pre = 65535 if causal else 65535
-    nxt = 0 if causal else 65535
+
+    # CAUSAL PREFILL IS DECLINED, and the reason is the kernel's interface
+    # rather than this build's shape handling.
+    #
+    # FIA applies a causal mask only when handed a FULL [s_query, s_kv] bool
+    # tensor. Measured: `pre_tokens`/`next_tokens` read like a causal window
+    # and change nothing at all (with them, without them and at
+    # `sparse_mode=0` the output was identical, and all three matched the
+    # NON-causal reference at cosine 1.0 while missing the causal one at
+    # 0.41); every `sparse_mode` without a mask tensor raises; a mask
+    # smaller than the cell raises. So the only correct call carries a
+    # bool[s_query, s_kv].
+    #
+    # That tensor is larger than the cell's own operands from s_query 2048
+    # up — 4M bool against 1M bf16 of q — and the harness refuses a launch
+    # whose widest buffer is not the cell's precision
+    # (`launch_trace`, "its latency is another precision's"). The refusal is
+    # right: those mask bytes are real traffic this cell does not declare,
+    # so a row measured here would price a mask the model never stores.
+    #
+    # Declined rather than measured wrong, and declined rather than
+    # silently measured non-causal, which is the dangerous third option: it
+    # returns a number for twice the work the cell asks for. Fixing it means
+    # the cell declaring the mask operand — a signature change, not a build
+    # one.
+    if causal:
+        raise NotImplementedError(
+            "FIA takes a causal prefill only with a full bool[s_query, s_kv] "
+            "mask, which outweighs the cell's own operands and makes the "
+            "launch another precision's; the cell would have to declare that "
+            "operand")
 
     def run():
         out = torch_npu.npu_fused_infer_attention_score(
             q, k, v, num_heads=heads, num_key_value_heads=kv_heads,
-            input_layout="BSND", scale=scale,
-            pre_tokens=pre, next_tokens=nxt)
+            input_layout="BSND", scale=scale)
         return out[0] if isinstance(out, (list, tuple)) else out
 
     return BenchCase(run=run, to_canonical=lambda o: o)

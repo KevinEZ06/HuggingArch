@@ -419,9 +419,15 @@ def _build_jobs_over_points(
             "a deployed binding is card-aware, so its plan names that card "
             "(`gpu=`); an undeployed, card-free plan is shape inspection "
             "only and every job it emits says `plan_scope=cardless-shapes`")
+    # A card states "no compute capability" as an empty cell and a
+    # deployment states it as None (`ServingDeployment.at` maps one to the
+    # other), so the two spellings are compared through the deployment's.
+    # Compared raw, every non-CUDA card failed its own binding's identity
+    # check: `None != ''`, and the plan refused the pairing it was given.
+    card_capability = (card.compute_capability or None) if card else None
     if (card is not None and described.device is not None
             and (described.device != card.device
-                 or described.compute_capability != card.compute_capability)):
+                 or described.compute_capability != card_capability)):
         raise ValueError(
             f"the deployed binding describes {described.device or 'its card'} "
             f"at capability {described.compute_capability or '?'}, not "

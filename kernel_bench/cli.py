@@ -264,8 +264,36 @@ def _cmd_run(argv: List[str]) -> int:
             print(f"error: --library: {e.args[0]}", file=sys.stderr)
             return 2
     env = dataclasses.replace(detect_env(), library=args.library)
+    # The box profile NAMES the card; detection only ever guessed it, by
+    # matching the driver's device name against the sheet. That works on an
+    # NVIDIA part ("NVIDIA H100 80GB HBM3" carries "h100") and cannot work
+    # on an Ascend one — `Ascend910_9362` against a SKU whose family token
+    # is the digitless `ascend`, which the matcher rejects by design. With
+    # no SKU the row has no card peak, and every row this run measured was
+    # dropped at schema validation for an empty `peak_tflops_at_test`.
+    #
+    # Declared beats detected wherever both speak: a profile that names a
+    # card is the operator saying which card this box is.
+    from .box import find_box_profile, gpu_of
+    try:
+        _box = find_box_profile(args.box, getattr(args, "envs_dir", None)
+                                or "kernel_bench/envs")
+    except Exception:
+        _box = None
+    _declared = gpu_of(_box) if _box is not None else None
+    if _declared and _declared != env.gpu_sku:
+        # The card's own bandwidth travels with its name. Both columns a row
+        # is judged against come off the sheet (`peak_tflops_at_test` from
+        # the dtype's peak, `peak_bw_at_test` from this), so naming the card
+        # without its bandwidth trades one empty column for the other.
+        from backend.inference.gpu_specs import get_gpu
+        _card = get_gpu(_declared)
+        env = dataclasses.replace(
+            env, gpu_sku=_declared,
+            peak_bw_gbps=(_card.mem_bw_gbps if _card else None))
     print(f"env: library={env.library or 'any'} torch={env.torch_version} "
-          f"cuda={env.cuda_available} gpu={env.device_name} libs={env.libs}")
+          f"device={env.device} gpu={env.device_name} sku={env.gpu_sku} "
+          f"libs={env.libs}")
     jobs = read_jobs_jsonl(args.jobs)
 
     # Persist each row as it is measured. A sweep is hours of GPU time, and
