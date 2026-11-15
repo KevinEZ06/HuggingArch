@@ -141,9 +141,10 @@ def spans(degrees: Mapping[str, int]) -> dict:
     route seam's `LayoutPropagation._axis_group_invariant`), never of the
     stride arithmetic here. Membership is what prices a token cut made of
     TWO worlds at two strides (`cp` and `dp_attention` both above 1 under
-    `ep_moe`): the dispatch asks each cut on its own whether every route
-    group sits inside one of its shards (`route_preserved_cuts`); a cut that
-    splits a route group is absorbed, which is the all_to_all exchange. A
+    `ep_moe`): the dispatch joins the token owner cells with the route
+    groups (`LayoutPropagation.routed_rows_layout`) — what varies inside a
+    route group is absorbed, which is the all_to_all exchange, and what
+    varies across route groups survives as a row cut. A
     stride/size equivalence over spans could only compare one span with one,
     and read the two-world cut as replicated."""
     out: dict = {}

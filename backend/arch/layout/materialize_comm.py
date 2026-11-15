@@ -74,10 +74,13 @@ def refs_reading(root: Any, source_uid: Optional[int], source_port: str,
 
 
 def rewrite_refs(node_of: Any, targets: Sequence[RewriteTarget],
-                 source: FlowRef, graft: SpecIRNode, what: str) -> None:
+                 source: FlowRef, graft: SpecIRNode, what: str,
+                 chained: Optional[FlowRef] = None) -> None:
     """Repoint each target input at `graft`, the node grafted on the edge
-    from `source`; each must still read `source` (`node_of` resolves a
-    target's uid; `what` names the graft in a refusal)."""
+    from `source`; each must still read `source` — or, for a graft that
+    continues an earlier one (`chained`, that graft's output), what the
+    earlier one already took over (`node_of` resolves a target's uid;
+    `what` names the graft in a refusal)."""
     for target in targets:
         consumer = node_of(target.node_uid)
         if consumer is None:
@@ -89,7 +92,7 @@ def rewrite_refs(node_of: Any, targets: Sequence[RewriteTarget],
                 f"{what} rewrite {target!r} is outside "
                 f"{consumer.display_path}'s {len(refs)} inputs")
         actual = FlowRef.read_by(refs[target.input_index])
-        if actual != source:
+        if actual != source and (chained is None or actual != chained):
             raise ValueError(
                 f"{what} rewrite {target!r} reads {actual!r}, not semantic "
                 f"source {source!r}")
@@ -347,7 +350,9 @@ class _CommGraft:
             provenance="comm",
         )
         self._insert(event, comm_node, placement, structural_anchor)
-        self._apply_rewrites(event, comm_node, semantic_source)
+        self._apply_rewrites(
+            event, comm_node, semantic_source,
+            None if event.source is not None else FlowRef(source.uid, "out"))
         self.nodes_by_event[event.event_id] = comm_node
         self.semantic_sources[event.event_id] = semantic_source
         return comm_node
@@ -438,11 +443,13 @@ class _CommGraft:
             _insert_after(self.tree, tail, comm_node)
             self.after_tail[event.placement_uid] = comm_node
 
-    def _apply_rewrites(self, event, comm_node, semantic_source) -> None:
+    def _apply_rewrites(self, event, comm_node, semantic_source,
+                        chained: Optional[FlowRef]) -> None:
         """Repoint every declared consumer input at the comm node; the
-        current ref must still read the semantic source."""
+        current ref must still read the semantic source, or the earlier
+        event this one continues (`chained`) where that one took it over."""
         rewrite_refs(self.copied.get, event.rewrites, semantic_source,
-                     comm_node, f"event {event.event_id}")
+                     comm_node, f"event {event.event_id}", chained)
 
     # -- final integrity -----------------------------------------------------
 

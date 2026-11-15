@@ -56,8 +56,10 @@ _NOT_ROWS = {
     "load_assumption_id": "a label naming the routing assumption",
     "expert_load_factor": "rho, the measured expert skew, an input",
     "row_replication": "how many copies of a row a gather makes, a layout",
+    "dispatched_rows": "the rows axis as dispatched, a layout",
     "is_measure_preserving": "a conservation check, no number",
     "replicate_rows": "builds a new record, reads nothing",
+    "as_dispatched": "builds a new record (a row gather undone), reads nothing",
 }
 
 

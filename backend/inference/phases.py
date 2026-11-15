@@ -1302,9 +1302,9 @@ def compute_per_op_timing(
     #: The nodes of a MoE block on this program (`Program.dispatch_members`,
     #: fused kernels included where what they absorbed was).
     moe_block_members: FrozenSet[int] = frozenset(),
-    #: Each leaf on a MoE dispatch's routed buffer, with that dispatch's
-    #: boundary on the rank, at this point (`ServingLayers.routed` read
-    #: there; `access.routed_launches`).
+    #: Each leaf on a MoE dispatch's routed buffer, with the launch it runs
+    #: on the rank — the routed rows that leaf is handed — at this point
+    #: (`ServingLayers.routed` read there; `access.routed_launches`).
     routed: Any = None,
     #: The matrices a kernel multiplies, partition by partition, beside one
     #: rank's extents of them (`Analysis.weight_shards`, asked of the row's

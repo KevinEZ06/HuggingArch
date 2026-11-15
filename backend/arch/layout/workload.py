@@ -45,6 +45,11 @@ class ExpectedRoutedLoad:
     #: expert tensor parallelism. The route measure stays unchanged; this is
     #: the number of physical copies each expert kernel consumes.
     row_replication: int = 1
+    #: The rows axis as the dispatch left it (`routed_rows_layout`): what a
+    #: gather inside the zone stacks copies of, and what the inverse
+    #: dispatch takes the rows back to. None only for evidence built outside
+    #: a dispatch (a unit probe); a combine refuses it.
+    dispatched_rows: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if (self.group is None) != (self.expert_shard_axis is None):
@@ -156,3 +161,7 @@ class ExpectedRoutedLoad:
         if not isinstance(factor, int) or factor < 1:
             raise ValueError("row replication factor must be positive")
         return replace(self, row_replication=self.row_replication * factor)
+
+    def as_dispatched(self) -> "ExpectedRoutedLoad":
+        """The rows as the dispatch left them: a row gather undone."""
+        return replace(self, row_replication=1)

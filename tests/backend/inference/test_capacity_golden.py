@@ -165,10 +165,10 @@ _CASES = [
     # The MoE seam is the all_to_all pair — dispatch and combine over the
     # `ep_moe` world of 4, each routed row moved once. The token cut here is
     # two worlds, `cp` {0,2} and `dp_attention` {0,4}, which together tile
-    # the expert world `ep_moe` {0,2,4,6} without either equalling it; the dispatch
-    # asks each cut by membership whether a route group sits inside one of
-    # its shards (`route_preserved_cuts`), neither does, and both are
-    # absorbed into the exchange. Per token the pair moves exactly what the
+    # the expert world `ep_moe` {0,2,4,6} without either equalling it; the
+    # dispatch joins the token owner cells with the route groups by
+    # membership (`routed_rows_layout`), the join is every rank, and both
+    # cuts are absorbed into the exchange. Per token the pair moves exactly what the
     # dp_ep and cp_ep deployments at the same `ep_moe` move
     # (`test_moe_ordered_collectives::
     # test_two_world_token_cut_exchanges_like_one_world`).

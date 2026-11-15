@@ -257,6 +257,27 @@ checks it on DeepSeek-V3, V3.2 and V4-Pro at `cp = 8`.
   `all_to_all` dispatches tokens to their experts and another gathers the
   results; the router weights are never sharded.
 
+  The exchange moves rows only inside a route (`ep_moe`) group, so after it
+  a rank holds the tokens its route group held: the token owner cells
+  joined with the route groups (`LayoutPropagation.routed_rows_layout`).
+  What of the token cut varies inside a route group is absorbed; what varies
+  across route groups survives as a row cut. Under expert tensor
+  parallelism (`tp_moe_expert > 1`) with attention TP below it, that cut is
+  gathered over `tp_moe_expert` before the expert GEMMs, and the partial
+  sums go back by reduce_scatter before the inverse `all_to_all` — one rule
+  with or without `ep_moe`.
+
+  **Known gap (pessimistic).** With `tp_attention > 1` under a larger
+  `tp_moe_expert`, the surviving row cut is replicated over the
+  attention-TP ranks, so the gather runs over the cross-replica group and
+  the partial sums return by an `all_reduce` over all of `tp_moe_expert`
+  plus a local slice. The cheaper form — reduce_scatter over the
+  cross-replica group, then `all_reduce` over the attention-TP pair — is two
+  chained collectives on one edge, which the lowering does not build yet.
+  Pinned as today's form by
+  `tests/backend/arch/layout/test_moe_ordered_collectives.py::
+  test_attention_tensor_parallelism_gathers_over_the_ranks_with_other_rows`.
+
 ## Where this lives in the code
 
 | Concern | Location |

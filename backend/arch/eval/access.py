@@ -522,10 +522,12 @@ def _routed_terms(graph: Any, node: Any, t: Any
 def routed_launches(program: Any, access: Layer["LeafAccess"],
                     launches: Mapping[int, Any]) -> Layer[Any]:
     """Each leaf of `program` that reads or writes a routed buffer
-    (`LeafAccess.routed_inputs` / `routed_output`), mapped to its dispatch's
-    boundary on the rank (`Analysis.routed`, `launches`): the one record a
-    launch's padded geometry is read off. The dispatch is the graph's
-    (`Program.dispatch_of`); a fused launch's is what it absorbed."""
+    (`LeafAccess.routed_inputs` / `routed_output`), mapped to the launch it
+    runs on the rank (`Analysis.routed`, `launches`, by leaf uid): the one
+    record a launch's padded geometry is read off. A fused launch runs what
+    its members run — they are one kernel on one buffer, so they must agree.
+    A node grafted after the walk is in `launches` only if its grafter
+    named the leaf whose tensor it carries."""
     out: Dict[int, Any] = {}
     for uid, ab in access.values.items():
         if not (ab.routed_inputs or ab.routed_output):
@@ -537,14 +539,16 @@ def routed_launches(program: Any, access: Layer["LeafAccess"],
             # collective keyed by its payload, not a grouped launch padded
             # per expert.
             continue
-        members = ([program.by_uid(origin) for origin in node.origins]
-                   if isinstance(node, FusedNode) else [node])
-        found = {program.dispatch_of(member) for member in members} - {None}
-        if len(found) != 1 or next(iter(found)) not in launches:
+        members = (node.origins if isinstance(node, FusedNode)
+                   else (node.uid,))
+        found = [launches[member] for member in members
+                 if member in launches]
+        if not found or any(other != found[0] for other in found[1:]):
             raise ValueError(
-                f"{node.display_path}: it moves a routed buffer, and "
-                f"{len(found)} dispatches the walk evaluated enclose it")
-        out[uid] = launches[found.pop()]
+                f"{node.display_path}: it moves a routed buffer, and its "
+                f"members run {len(found)} routed launches that are not "
+                f"one ({found!r})")
+        out[uid] = found[0]
     return Layer(program, out)
 
 
