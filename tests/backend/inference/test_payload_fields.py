@@ -191,7 +191,7 @@ for _phase in ("prefill", "decode"):
 # vendor-neutral name and names the link beside it, so a label is read, not
 # assumed from the column's name.
 _SCALEUP = ("the scale-up link's bandwidth, renamed from `nvlink_gbps` "
-            "because NVLink is one vendor's link (Ascend: HCCS, UB)")
+            "because NVLink is one vendor's link (Ascend: HCCS)")
 REMOVED["gpu.nvlink_gbps"] = _SCALEUP
 ADDED["gpu.scaleup_gbps"] = _SCALEUP
 ADDED["gpu.scaleup_fabric"] = (

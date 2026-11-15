@@ -46,14 +46,14 @@ class GPUSpec:
     fp8_tflops: Optional[float]
     fp4_tflops: Optional[float]
     #: The per-direction bandwidth of the card's scale-up link — NVLink on
-    #: NVIDIA parts, HCCS or UB on Ascend (`scaleup_fabric` names which). A
+    #: NVIDIA parts, HCCS on Ascend (`scaleup_fabric` names which). A
     #: value also declares the topology: every device of the card's
     #: scale-up domain (`gpus_per_node` of them — an HGX baseboard, a whole
-    #: NVL72 rack, an Atlas A3 node, a CloudMatrix384 supernode) reaches
-    #: every other over that link, which is what a framework's peer-to-peer
-    #: all-reduce kernels require. Empty: the devices talk over PCIe.
+    #: NVL72 rack, an Atlas A3 node) reaches every other over that link,
+    #: which is what a framework's peer-to-peer all-reduce kernels require.
+    #: Empty: the devices talk over PCIe.
     scaleup_gbps: Optional[float]
-    #: The name of that link (`NVLink`, `HCCS`, `UB`), the label a row's
+    #: The name of that link (`NVLink`, `HCCS`), the label a row's
     #: intra-node bandwidth is shown under. Set exactly when `scaleup_gbps`
     #: is (`check_scaleup`): the bandwidth is the fact, the name says which
     #: wire carries it, and neither is guessed from the vendor.
@@ -432,8 +432,7 @@ def gpus_per_node(gpu: GPUSpec) -> int:
 
 def intra_bw_label(gpu: GPUSpec) -> str:
     """Display label for intra-node BW: the scale-up link's name
-    (`scaleup_fabric`: `"NVLink"`, `"HCCS"`, `"UB"`), else `"PCIe"`, else
-    `""`."""
+    (`scaleup_fabric`: `"NVLink"`, `"HCCS"`), else `"PCIe"`, else `""`."""
     if gpu is None:
         return ""
     if gpu.scaleup_gbps:

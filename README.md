@@ -71,7 +71,7 @@ HuggingArch is an analytical planner, not a profiler or a runtime.
 | **Models** | 51 architecture families; **58 verified model ids** across 18 orgs — DeepSeek, Kimi, Qwen, Llama, Mistral, Gemma, GLM, MiMo, gpt-oss, Step, LongCat, Nemotron, … An unlisted id gets an agent-drafted spec that must pass validation before it is served. |
 | **Attention** | MHA, GQA, MLA, sparse (DSA), sliding window, linear attention and SSM hybrids — 186 reusable component DAGs. |
 | **Quantization** | FP8, FP4 / MXFP4 / NVFP4, AWQ, GPTQ, ModelOpt, compressed-tensors. |
-| **Accelerators** | 17 SKUs: NVIDIA A100 through GB300, and Ascend 910C (one row per die). |
+| **Accelerators** | 16 SKUs: NVIDIA A100 through GB300, and Ascend 910C (one row per die, an Atlas A3 node). |
 | **Frameworks** | vLLM, sglang, DeepInfer and vLLM-Ascend fusion bindings (91 fusion plans). |
 
 ## Learn more

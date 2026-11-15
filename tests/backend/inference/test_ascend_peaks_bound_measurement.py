@@ -61,6 +61,13 @@ REACHED = {"bf16_tflops": 248.4, "fp16_tflops": 248.4, "int8_tops": 392.5,
 REACHED_SCALEUP_GBPS = 186.4
 DIE_HBM_GIB = 64.0
 
+#: The one Ascend row the sheet carries. A CloudMatrix384 row stood beside
+#: it and was removed: every figure on it was this A3 node's, carried over
+#: to a 768-die UB supernode nobody here has measured. A sheet row is
+#: priced and walked like any other, so carrying one on borrowed numbers
+#: publishes an estimate for hardware no measurement stands behind.
+SKU = "Ascend-910C-A3"
+
 #: The per-die physics CANN's platform config (`Ascend910_9362.ini`,
 #: `[SoCInfo] cube_core_cnt`, `[AICoreSpec] cube_freq` and the 16x16x16
 #: cube) and `torch.npu.get_device_properties` (`cube_core_num`) both state.
@@ -71,13 +78,12 @@ NOMINAL_HZ, SUSTAINED_HZ = 1.500e9, 1.516e9
 class TestAscendCellsBoundTheProbe(unittest.TestCase):
 
     def test_every_compute_and_bandwidth_cell_is_at_least_what_ran(self):
-        for sku in ("Ascend-910C-A3", "Ascend-910C-CM384"):
-            card = get_gpu(sku)
-            self.assertIsNotNone(card, sku)
-            for column, reached in REACHED.items():
-                cell = getattr(card, column)
-                self.assertIsNotNone(cell, f"{sku}.{column}")
-                self.assertGreaterEqual(cell, reached, f"{sku}.{column}")
+        card = get_gpu(SKU)
+        self.assertIsNotNone(card, SKU)
+        for column, reached in REACHED.items():
+            cell = getattr(card, column)
+            self.assertIsNotNone(cell, f"{SKU}.{column}")
+            self.assertGreaterEqual(cell, reached, f"{SKU}.{column}")
 
     def test_the_compute_cell_is_the_chips_physics_at_the_clock_it_holds(self):
         """cores x FLOP/cycle x clock, not a figure from a note.
@@ -88,18 +94,16 @@ class TestAscendCellsBoundTheProbe(unittest.TestCase):
         nominal = CUBE_CORES * FLOPS_PER_CYCLE * NOMINAL_HZ / 1e12
         sustained = CUBE_CORES * FLOPS_PER_CYCLE * SUSTAINED_HZ / 1e12
         self.assertLess(nominal, REACHED["bf16_tflops"])
-        for sku in ("Ascend-910C-A3", "Ascend-910C-CM384"):
-            card = get_gpu(sku)
-            self.assertAlmostEqual(card.bf16_tflops, sustained, places=1, msg=sku)
-            self.assertAlmostEqual(card.fp16_tflops, sustained, places=1, msg=sku)
-            # The cube's int8 rate is twice its bf16 one; it must exceed 1x,
-            # since the int8 measurement exceeds the bf16 cell.
-            self.assertAlmostEqual(card.int8_tops, 2 * sustained, places=1, msg=sku)
-            self.assertGreater(REACHED["int8_tops"], card.bf16_tflops, sku)
+        card = get_gpu(SKU)
+        self.assertAlmostEqual(card.bf16_tflops, sustained, places=1)
+        self.assertAlmostEqual(card.fp16_tflops, sustained, places=1)
+        # The cube's int8 rate is twice its bf16 one; it must exceed 1x,
+        # since the int8 measurement exceeds the bf16 cell.
+        self.assertAlmostEqual(card.int8_tops, 2 * sustained, places=1)
+        self.assertGreater(REACHED["int8_tops"], card.bf16_tflops)
 
     def test_the_die_states_the_capacity_npu_smi_reports(self):
-        for sku in ("Ascend-910C-A3", "Ascend-910C-CM384"):
-            self.assertEqual(get_gpu(sku).mem_gib, DIE_HBM_GIB, sku)
+        self.assertEqual(get_gpu(SKU).mem_gib, DIE_HBM_GIB)
 
     def test_the_scaleup_cell_bounds_what_a_collective_reached(self):
         """An HCCL collective's bus bandwidth stays under the link rate.
@@ -109,19 +113,16 @@ class TestAscendCellsBoundTheProbe(unittest.TestCase):
         same defect the compute cells have. Measured on 16 dies, which is
         the shape a TP16 deployment runs.
         """
-        for sku in ("Ascend-910C-A3", "Ascend-910C-CM384"):
-            card = get_gpu(sku)
-            self.assertIsNotNone(card.scaleup_gbps, sku)
-            self.assertGreaterEqual(card.scaleup_gbps, REACHED_SCALEUP_GBPS,
-                                    sku)
+        card = get_gpu(SKU)
+        self.assertIsNotNone(card.scaleup_gbps)
+        self.assertGreaterEqual(card.scaleup_gbps, REACHED_SCALEUP_GBPS)
 
     def test_no_fp8_or_fp4_peak_is_claimed(self):
         # The probe ran no FP8 or FP4 matmul because the hardware has no
         # such MMA; a cell here would price a launch nothing runs.
-        for sku in ("Ascend-910C-A3", "Ascend-910C-CM384"):
-            card = get_gpu(sku)
-            self.assertIsNone(card.fp8_tflops, sku)
-            self.assertIsNone(card.fp4_tflops, sku)
+        card = get_gpu(SKU)
+        self.assertIsNone(card.fp8_tflops)
+        self.assertIsNone(card.fp4_tflops)
 
 
 if __name__ == "__main__":
