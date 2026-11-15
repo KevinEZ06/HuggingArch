@@ -40,6 +40,25 @@ from backend.inference.gpu_specs import get_gpu  # noqa: E402
 #: bound; a cell below one is a sheet the hardware has already beaten.
 REACHED = {"bf16_tflops": 248.4, "fp16_tflops": 248.4, "int8_tops": 392.5,
            "mem_bw_gbps": 1262.0}
+
+#: The best BUS bandwidth an HCCL collective reached per die, over the links
+#: the `scaleup_gbps` cell prices. Bus, not algorithm, bandwidth: the cell is
+#: a link rate, and what crosses the link is the ring's share of the payload
+#: (`comm_volume.ring_factor`: 2(N-1)/N for an all-reduce, (N-1)/N for the
+#: others), so the two are only comparable after that coefficient. Measured
+#: 2026-11-15, 128 MiB payloads, torchrun one process per die:
+#:
+#:   16 dies, every package  186.4 GB/s  (all-gather; all-reduce 176.7)
+#:    8 dies, one per package 132.8 GB/s (pure HCCS, no package-internal link)
+#:
+#: The 8-die figure is the lower one BECAUSE it is pure: a group that takes
+#: both dies of a package also rides the package-internal SIO link, which is
+#: faster than HCCS and lifts the average (a 0-7 group, four SIO pairs among
+#: eight dies, reached 213.2 — above the cell, and not a counter-example to
+#: it, because that traffic did not all cross HCCS). `npu-smi info -t topo`
+#: is the evidence: dies pair 0-1, 2-3, ... over SIO and reach every other
+#: die over HCCS_SW.
+REACHED_SCALEUP_GBPS = 186.4
 DIE_HBM_GIB = 64.0
 
 #: The per-die physics CANN's platform config (`Ascend910_9362.ini`,
@@ -81,6 +100,20 @@ class TestAscendCellsBoundTheProbe(unittest.TestCase):
     def test_the_die_states_the_capacity_npu_smi_reports(self):
         for sku in ("Ascend-910C-A3", "Ascend-910C-CM384"):
             self.assertEqual(get_gpu(sku).mem_gib, DIE_HBM_GIB, sku)
+
+    def test_the_scaleup_cell_bounds_what_a_collective_reached(self):
+        """An HCCL collective's bus bandwidth stays under the link rate.
+
+        The direction that matters: a cell BELOW what the fabric reached
+        would make every collective row read as faster than its link, the
+        same defect the compute cells have. Measured on 16 dies, which is
+        the shape a TP16 deployment runs.
+        """
+        for sku in ("Ascend-910C-A3", "Ascend-910C-CM384"):
+            card = get_gpu(sku)
+            self.assertIsNotNone(card.scaleup_gbps, sku)
+            self.assertGreaterEqual(card.scaleup_gbps, REACHED_SCALEUP_GBPS,
+                                    sku)
 
     def test_no_fp8_or_fp4_peak_is_claimed(self):
         # The probe ran no FP8 or FP4 matmul because the hardware has no

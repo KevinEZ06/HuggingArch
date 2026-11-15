@@ -392,3 +392,91 @@ register(Provider(
                            # pages gathers a quarter as many pages per query.
                            kv_block_sizes=(ASCEND_PAGE,)),
 ))
+
+
+# ---------------------------------------------------------------------------
+# HCCL collectives.
+#
+# The four signatures have existed since multi-GPU totals were wanted
+# (`op_signatures_catalog.py:1367-1420`: "without these, a multi-GPU
+# deployment could never have a measured total") and have never had a
+# provider. These are the first.
+#
+# REGISTERED AND DISABLED, which is a declaration rather than a gap. The
+# harness runs ONE process (`driver.py` has no rank, no world size), and in
+# one process every one of these collectives is the identity: the call
+# returns, the clock reads a local copy, and the row says an N-rank
+# all-reduce costs what a memcpy costs. That is exactly how the one
+# collective anyone had measured — `allreduce_fused_rmsnorm` — came to be
+# disabled with the same reason, and its note is the precedent followed
+# here.
+#
+# What it would take, so the next reader does not re-derive it: a runner
+# that starts `n_comm_ranks` processes, each on its own die, with the group
+# initialised on HCCL — `torchrun --nproc_per_node=N`, `backend="hccl"`,
+# `torch.npu.set_device(local_rank)`. The measurement itself is settled;
+# what is missing is the harness's process model, not the kernel.
+#
+# MEASURED ANYWAY, out of band, because the sheet's link rate needed a
+# bound (2026-11-15, one process per die, 128 MiB payloads, bus bandwidth
+# through `comm_volume.ring_factor`):
+#
+#     16 dies   all-gather 186.4 GB/s, all-reduce 176.7
+#      8 dies   132.8 GB/s pure HCCS (one die per package)
+#
+# against the 196 GB/s the sheet states. Recorded as a floor under the cell
+# in `tests/backend/inference/test_ascend_peaks_bound_measurement.py`.
+# ---------------------------------------------------------------------------
+
+_SINGLE_PROCESS = (
+    "one process: every collective is the identity, so this would time a "
+    "local buffer and record it as an N-rank collective — a group of "
+    "n_comm_ranks needs that many processes, each on its own die, with the "
+    "group on HCCL")
+
+
+def _hccl_build(op: str):
+    """The build for one collective. `torch.distributed` is the entry point
+    the plugin's own ranks use; the group is the process group HCCL
+    initialised, which a single-process harness does not have — hence the
+    disabled_reason above."""
+
+    def build(inv: Invocation, env: Env, inputs: Dict[str, Any]) -> BenchCase:
+        import torch.distributed as dist
+
+        payload = inputs["payload"]
+        if op == "all_reduce":
+            run = lambda: dist.all_reduce(payload)
+        elif op == "all_gather":
+            import torch
+            ranks = int(inputs["n_comm_ranks"])
+            out = torch.empty(payload.numel() * ranks, dtype=payload.dtype,
+                              device=payload.device)
+            run = lambda: dist.all_gather_into_tensor(out, payload)
+        elif op == "reduce_scatter":
+            import torch
+            ranks = int(inputs["n_comm_ranks"])
+            out = torch.empty(payload.numel() // ranks, dtype=payload.dtype,
+                              device=payload.device)
+            run = lambda: dist.reduce_scatter_tensor(out, payload)
+        elif op == "all_to_all":
+            import torch
+            out = torch.empty_like(payload)
+            run = lambda: dist.all_to_all_single(out, payload)
+        else:
+            raise ValueError(op)
+        # No oracle: on one process there is nothing to compare against, and
+        # with a real group each rank holds a different answer.
+        return BenchCase(run=run, to_canonical=None)
+
+    return build
+
+
+for _op in ("all_reduce", "all_gather", "reduce_scatter", "all_to_all"):
+    register(Provider(
+        library="vllm_ascend", signature=_op,
+        kernel_impl=f"hccl_{_op}", import_name="torch_npu",
+        build=_hccl_build(_op),
+        serves=KernelSignature(signature=_op, activation=_ASCEND_FLOAT),
+        disabled_reason=_SINGLE_PROCESS,
+    ))
