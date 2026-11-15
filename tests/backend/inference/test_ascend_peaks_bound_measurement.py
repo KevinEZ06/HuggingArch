@@ -18,6 +18,7 @@ Measured 2026-11-14 on an Atlas A3 node, one die, inside the
 `quay.io/ascend/vllm-ascend:v0.30.0-a3` container (torch_npu 2.10.0.post7):
 
     torch.matmul bf16        248.4 TFLOPs   (4096^3, best and median)
+    torch.matmul fp32         63.3 TFLOPs   (4096^3; the cube's quarter rate)
     npu_quant_matmul int8    392.5 TOPs     (8192^3)
     copy_ bytes/s           1262 GB/s       (1 GiB)
     HBM capacity              64 GiB        (npu-smi -t memory: 65536 MiB)
@@ -39,7 +40,7 @@ from backend.inference.gpu_specs import get_gpu  # noqa: E402
 #: The best each probe reached on one die. A cell at or above these is a
 #: bound; a cell below one is a sheet the hardware has already beaten.
 REACHED = {"bf16_tflops": 248.4, "fp16_tflops": 248.4, "int8_tops": 392.5,
-           "mem_bw_gbps": 1262.0}
+           "mem_bw_gbps": 1262.0, "fp32_tflops": 63.3}
 
 #: The best BUS bandwidth an HCCL collective reached per die, over the links
 #: the `scaleup_gbps` cell prices. Bus, not algorithm, bandwidth: the cell is

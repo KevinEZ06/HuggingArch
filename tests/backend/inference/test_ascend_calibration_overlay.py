@@ -9,8 +9,8 @@ round trip end to end, on rows measured on a real 910C die:
     sweep -> jobs -> run on the device -> CSV -> overlay -> a row's measured
     column
 
-The corpus is `tests/golden/ascend_vllm_ascend.csv`, 203 rows measured
-2026-11-15 on one die of an Atlas A3 node inside the
+The corpus is `tests/golden/ascend_vllm_ascend.csv`, 281 rows measured on
+one die of an Atlas A3 node inside the
 `quay.io/ascend/vllm-ascend:v0.30.0-a3` container (the release the binding
 is audited at), through the harness's own `kernel_bench run`.
 """
@@ -90,6 +90,34 @@ class TestTheCorpusIsWhatTheDeviceMeasured(unittest.TestCase):
             peak = float(r.get("peak_tflops_at_test") or 0)
             if peak:
                 self.assertLessEqual(peak, CEILINGS["int8"], r["op"])
+
+
+class TestTheCorpusSpansMoreThanOneShape(unittest.TestCase):
+    """What the corpus covers, asserted rather than assumed.
+
+    A corpus of one model at one phase proves the lookup works for that
+    cell and says nothing about the rest. These pin the span the rows
+    actually have, so a future run that silently narrows it goes red.
+    """
+
+    def test_it_holds_more_than_one_model(self):
+        models = {r["model"] for r in _rows()}
+        self.assertIn("zai-org/GLM-5.3-Flash", models)
+        self.assertGreaterEqual(len(models), 3, sorted(models))
+
+    def test_it_holds_both_phases(self):
+        phases = {r["phase"] for r in _rows()}
+        self.assertEqual(phases, {"prefill", "decode"}, sorted(phases))
+
+    def test_the_decode_rows_read_the_plugins_page(self):
+        # vLLM-Ascend allocates at 128 (`vllm_ascend.yaml kv_block_size`),
+        # and a paged kernel's time depends on the page, so a decode
+        # attention row keyed at another page would be a different cell.
+        import json
+        pages = {json.loads(r["shape_json"]).get("kv_block_size")
+                 for r in _rows()
+                 if r["phase"] == "decode" and "attention" in r["op"]}
+        self.assertTrue(pages <= {128, None}, sorted(p for p in pages if p))
 
 
 class TestTheOverlayFindsThem(unittest.TestCase):

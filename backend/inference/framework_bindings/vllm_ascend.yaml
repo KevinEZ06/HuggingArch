@@ -141,6 +141,17 @@ kernel_dispatches:
     impl_id: npu_grouped_matmul_w8a8
     when: {device: [npu], activation_dtype: [int8]}
     source_anchor: "The W8A8_DYNAMIC MoE method holds INT8 expert weights and runs the same grouped matmul on them (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:146-200, vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:203-239)"
+  # An unquantised linear runs torch's own `F.linear`, which the plugin
+  # calls directly (`vllm_ascend/ops/linear.py:49-54` unquantized_gemm).
+  # On an NPU that dispatches to `aclnnMatmul_MatMulV3Common_MatMulV3` —
+  # read off the Ascend profiler, not assumed — so the kernel measured is
+  # the Ascend one and the provider that measures it is torch's, which is
+  # why `library` here is `torch` rather than `vllm_ascend`.
+  - op: linear
+    library: torch
+    impl_id: torch_cublas_linear
+    when: {device: [npu], unquantized_bf16_launch: true}
+    source_anchor: "AscendUnquantizedLinearMethod.apply -> torch.ops.vllm.unquantized_gemm -> torch.nn.functional.linear (vllm_ascend/ops/linear.py:133-139, vllm_ascend/ops/linear.py:49-54)"
   - op: linear
     library: vllm_ascend
     impl_id: npu_quant_matmul_w8a8
