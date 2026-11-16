@@ -138,6 +138,14 @@ def _cmd_sweep(argv: List[str]) -> int:
                          "Scaling; frontier = gallery decode Pareto)")
     ap.add_argument("--output-tokens", type=int, default=None,
                     help="the served output length (default: the surface's own)")
+    ap.add_argument("--precision", default=None, metavar="PRESET",
+                    help="precision preset the cells are shaped under "
+                         "(default: as shipped). A deployment's precision "
+                         "decides every cell's dtypes and so its measurement "
+                         "key, so a checkpoint shipping BF16/FP8 can only "
+                         "plan BF16/FP8 cells unless this names otherwise — "
+                         "measure a W8A8 deployment with "
+                         "--precision w_int8_w8a8_ffn")
     ap.add_argument("--box", default=None, metavar="PROFILE",
                     help="box profile the plan is for (default: "
                          "$KERNEL_BENCH_BOX, then envs/boxes/<hostname>.toml). "
@@ -151,6 +159,19 @@ def _cmd_sweep(argv: List[str]) -> int:
     from .plan import (gaps_by_signature, gaps_path, unplaced_by_reason,
                        unplaced_path, write_plan)
     from .sweep import plan_surface
+
+    # One entry point for "which precision is this", shared with the
+    # estimate route: `{"preset": id}` through `PrecisionProfile.
+    # from_request`, which is also what refuses an unknown name. A second
+    # lookup here could drift from the one the estimate reads, and the
+    # measured row would then be keyed under dtypes no estimate asks for.
+    from backend.arch.precision_profile import PrecisionError, PrecisionProfile
+    try:
+        precision = (PrecisionProfile.from_request({"preset": args.precision})
+                     if args.precision else None)
+    except PrecisionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     # The box first: its card is the one the cells are gated and the
     # kernels judged on.
@@ -172,6 +193,7 @@ def _cmd_sweep(argv: List[str]) -> int:
     jobs, stats = plan_surface(
         args.model_id, args.gpu, args.tracks, framework=args.framework,
         max_seq=args.max_seq, output_tokens=args.output_tokens,
+        precision=precision,
         log=lambda m: print(" ", m), workers=args.workers)
     output_tokens = stats["output_tokens"]
 
@@ -183,7 +205,8 @@ def _cmd_sweep(argv: List[str]) -> int:
     print(f"wrote {len(jobs)} jobs → {args.output} "
           f"({stats['cells']} cells, {stats['parallel_configs']} parallel configs, "
           f"{stats['seqs']} seqs, tracks={args.tracks}, "
-          f"output={output_tokens}, gpu={args.gpu})")
+          f"output={output_tokens}, gpu={args.gpu}, "
+          f"precision={args.precision or 'as shipped'})")
     if gaps:
         print(f"no provider on {profile.name} — {len(gaps)} job(s) → "
               f"{gaps_path(args.output)}:")

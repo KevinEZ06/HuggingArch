@@ -39,7 +39,6 @@ const MODE_LABEL: Record<ParSweepMode, string> = {
  *  GPU / parallel / degree. */
 const BATCH_PAR_DEGREE = 8;
 
-const DEFAULT_SWEEP_GPU = "B200";
 
 /** The panel's context dropdown and GPU-count ladder, as the backend declares
  *  them (`sweep_grid.SCALING_CONTEXTS` / `SCALING_DEGREES` via
@@ -1303,7 +1302,12 @@ export function ScalingPanel(props: {
   onSessionLapsed?: () => void;
   onApply?: (p: ScalingApply) => void;
 }) {
-  const [ovGpu, setOvGpu] = useState(DEFAULT_SWEEP_GPU);
+  // The card this panel sweeps is the page's card, inherited for the same
+  // reason `kvBlock` is: a second control can only make the two disagree,
+  // and the number on screen would then price a card the deployment above
+  // it is not on. It was a module constant ("B200") until 2026-11-16, so a
+  // page on any other card — every non-CUDA one — silently swept B200.
+  const [ovGpu, setOvGpu] = useState(props.gpuSku);
   const [ovPar, setOvPar] = useState<ParSweepMode>("dp_ep");
   const [ovDegree, setOvDegree] = useState(BATCH_PAR_DEGREE);
   const [ctx, setCtx] = useState(4096);
@@ -1433,12 +1437,16 @@ export function ScalingPanel(props: {
     if (hideEp && ovPar !== "tp_tp") setOvPar("tp_tp");
   }, [hideEp, ovPar]);
 
+  // Follow the page's card. The fallback is only for a card this panel's
+  // own dropdown does not offer; it is not a default to sit on.
   useEffect(() => {
     if (!skuOpts.length) return;
-    if (!skuOpts.includes(ovGpu)) {
-      setOvGpu(skuOpts.includes(DEFAULT_SWEEP_GPU) ? DEFAULT_SWEEP_GPU : skuOpts[0]);
+    if (skuOpts.includes(props.gpuSku)) {
+      setOvGpu(props.gpuSku);
+    } else if (!skuOpts.includes(ovGpu)) {
+      setOvGpu(skuOpts[0]);
     }
-  }, [skuOpts, ovGpu]);
+  }, [skuOpts, ovGpu, props.gpuSku]);
 
   useEffect(() => {
     // A measured answer still being read belongs to the body this run

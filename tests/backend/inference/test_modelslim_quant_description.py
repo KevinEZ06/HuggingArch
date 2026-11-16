@@ -118,22 +118,44 @@ class TestItIsNeitherNeighbour(unittest.TestCase):
             _estimate(_as_the_export_quantised_it(_resolved())))
         self.assertEqual(set(export["ffn_moe"]), {"INT8"})
 
-    def test_the_preset_quantises_attention_the_export_did_not(self):
-        """The preset answers "what would full W8A8 cost", which is a
-        different question and a different answer: it turns the attention
-        linears INT8 and grafts a cast in front of each, where this export
-        runs them BF16 with none."""
-        preset = _estimate(preset="w_int8_w8a8")
-        export = _estimate(_as_the_export_quantised_it(_resolved()))
-        self.assertIn("INT8", _weight_widths(preset)["attention_linear"])
-        self.assertNotIn("INT8", _weight_widths(export)["attention_linear"])
+    def test_the_preset_reaches_the_same_roles_the_export_did(self):
+        """`w_int8_w8a8_ffn` states the two rules this export states.
 
-    def test_the_preset_grafts_casts_the_export_does_not_need(self):
-        # The count is the visible cost of the difference: a cast per
-        # quantised input, and the export quantises far fewer inputs.
-        preset = _casts(_estimate(preset="w_int8_w8a8"))
-        export = _casts(_estimate(_as_the_export_quantised_it(_resolved())))
-        self.assertGreater(preset, export + 10, f"{preset} vs {export}")
+        The preset it replaced selected `weight_class`, which turned the
+        attention linears INT8 too — a width no msModelSlim export writes.
+        This asserts the stored topology and the selectable one now agree
+        role by role, so a reader who picks the preset is reading this
+        checkpoint and not a hypothetical full-W8A8 one.
+        """
+        preset = _weight_widths(_estimate(preset="w_int8_w8a8_ffn"))
+        export = _weight_widths(_estimate(_as_the_export_quantised_it(_resolved())))
+        for role in sorted(set(preset) | set(export)):
+            self.assertEqual(set(preset[role]), set(export[role]), role)
+
+    def test_the_preset_also_states_the_activation_the_injection_cannot(self):
+        """Where the two legitimately differ, and why the preset is the
+        truer one.
+
+        `quant_context.per_role` names a weight `method` and has nowhere to
+        say what the matmul then eats, so injecting it leaves BF16
+        activations — a BF16 MMA with INT8 weights. W8A8_DYNAMIC is not
+        that: `npu_quant_matmul_w8a8`, the kernel this binding dispatches
+        to, takes INT8 activations (`kernel_bench/providers/ascend.py`
+        serves `activation=("int8",)`), and the dynamic quantise in front
+        of it is a launch of its own. The preset says both, so it grafts
+        those casts and prices the matmul on the INT8 peak.
+        """
+        preset = _estimate(preset="w_int8_w8a8_ffn")
+        export = _estimate(_as_the_export_quantised_it(_resolved()))
+        self.assertGreater(_casts(preset), _casts(export))
+        # The INT8 peak is twice the BF16 one, so the same INT8-weight
+        # matmuls price strictly faster when the activations are INT8 too.
+        def _ffn_matmul_ms(result):
+            return sum(float(r.get("t_sol_s") or 0) * 1000
+                       for r in (result.get("per_op_timing") or [])
+                       if r.get("weight_dtype") == "INT8")
+        self.assertLess(_ffn_matmul_ms(preset), _ffn_matmul_ms(export),
+                        "INT8 activations must price below BF16 ones")
 
 
 if __name__ == "__main__":

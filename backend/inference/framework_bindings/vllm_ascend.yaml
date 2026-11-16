@@ -102,7 +102,7 @@ precision_launches:
 # W8A8_DYNAMIC caveat: `fused_add_rmsnorm` and `silu_and_mul` take an
 # optional `quantise_activation` member (the consumer-follows rule), but the
 # plugin quantises inside the next linear (w8a8_dynamic.py:101, :117), a
-# launch of its own: under `w_int8_w8a8` this binding under-counts about one
+# launch of its own: under `w_int8_w8a8_ffn` this binding under-counts about one
 # launch per norm and per dense activation. Its MoE gate_up GMM + SwiGLU +
 # quant kernel (default on, vllm_ascend/ascend_config.py:181) has no plan.
 # Which provider implementation the plugin dispatches to, per op. The

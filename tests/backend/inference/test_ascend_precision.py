@@ -1,7 +1,7 @@
 """What vLLM-Ascend runs a quantised matmul at on an Ascend NPU, as its
 binding's `precision_launches` declares it.
 
-* msModelSlim W8A8_DYNAMIC (`w_int8_w8a8`): INT8 activations per token, one
+* msModelSlim W8A8_DYNAMIC (`w_int8_w8a8_ffn`): INT8 activations per token, one
   INT8 x INT8 matmul at the card's INT8 peak.
 * A native block-FP8 checkpoint: no Ascend matmul eats it; off Ascend 950 the
   tiles are expanded to the model dtype and the unquantised GEMM runs, so the
@@ -66,7 +66,7 @@ class TestW8A8OnAscend(unittest.TestCase):
     def setUpClass(cls):
         cls.shipped, _ = _rows("Qwen/Qwen3-30B-A3B")
         cls.res, cls.rows = _rows("Qwen/Qwen3-30B-A3B",
-                                  precision={"preset": "w_int8_w8a8"})
+                                  precision={"preset": "w_int8_w8a8_ffn"})
 
     def test_matrices_run_int8_at_the_int8_peak(self):
         int8 = peak_flops_for_dtype(get_gpu(NPU), "I8")
