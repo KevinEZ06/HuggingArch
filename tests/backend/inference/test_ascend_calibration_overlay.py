@@ -9,7 +9,7 @@ round trip end to end, on rows measured on a real 910C die:
     sweep -> jobs -> run on the device -> CSV -> overlay -> a row's measured
     column
 
-The corpus is `tests/golden/ascend_vllm_ascend.csv`, 281 rows measured on
+The corpus is `tests/golden/ascend_vllm_ascend.csv`, 313 rows measured on
 one die of an Atlas A3 node inside the
 `quay.io/ascend/vllm-ascend:v0.30.0-a3` container (the release the binding
 is audited at), through the harness's own `kernel_bench run`.
@@ -104,6 +104,11 @@ class TestTheCorpusSpansMoreThanOneShape(unittest.TestCase):
         models = {r["model"] for r in _rows()}
         self.assertIn("zai-org/GLM-5.3-Flash", models)
         self.assertGreaterEqual(len(models), 3, sorted(models))
+
+    def test_it_has_not_shrunk(self):
+        # A row count is the one thing a re-measurement can quietly lose:
+        # a run that measures fewer cells still writes a valid CSV.
+        self.assertGreaterEqual(len(_rows()), 313)
 
     def test_it_holds_both_phases(self):
         phases = {r["phase"] for r in _rows()}
