@@ -111,8 +111,15 @@ def torch_dtype(name: str):
     """The one `str → torch.dtype` table for kernel_bench.
 
     Activation-width names only (`bf16` / `fp16` / `fp32` / the two
-    fp8s). Packed weight formats are not torch dtypes and must not
-    silently become bf16.
+    fp8s / `int8`). Packed weight formats are not torch dtypes and must
+    not silently become bf16.
+
+    `int8` is here on that same test and passes it: one element per byte
+    with `torch.int8` holding it exactly, like the fp8s and unlike int4 or
+    fp4, which pack two to a byte and have no torch dtype to be. Without
+    it an Ascend W8A8 cell could not even be given its operands — the
+    kernel ran, the provider served it, and the input generator refused
+    the dtype.
     """
     import torch
     table = {
@@ -121,6 +128,7 @@ def torch_dtype(name: str):
         "fp32": torch.float32,
         "fp8_e4m3": torch.float8_e4m3fn,
         "fp8_e5m2": torch.float8_e5m2,
+        "int8": torch.int8,
     }
     try:
         return table[str(name).lower()]
@@ -147,7 +155,13 @@ def _store_dtype(name: str):
     """
     import torch
     dt = _dtype(name)
-    return torch.bfloat16 if dt.is_floating_point and dt.itemsize < 2 else dt
+    # Too narrow to hold a reference value is a matter of WIDTH, not of
+    # float-ness: `torch.randn` into int8 truncates to the handful of
+    # integers near zero (-2..3, two thirds of them 0 — measured on a die),
+    # which is a degenerate operand that still produces a number. The test
+    # read `is_floating_point` only because fp8 was the one narrow format in
+    # the table; int8 joining it made the omission reachable.
+    return torch.bfloat16 if dt.itemsize < 2 else dt
 
 
 def _operand_dtype(inv: Invocation, name: str):
@@ -3567,8 +3581,9 @@ register_ref("moe_topk_hash_sqrtsoftplus",
 
 def _indexer_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
     import torch
-    dt = _dtype(inv.dtype)
-    store_dt = torch.bfloat16 if dt.is_floating_point and dt.itemsize < 2 else dt
+    # `_store_dtype` states this rule once; restating it here is how the two
+    # drifted when the rule changed from float-ness to width.
+    store_dt = _store_dtype(inv.dtype)
     return {
         "q": torch.randn(*_shape(inv, "q"), dtype=store_dt, device=device, generator=gen),
         "k": torch.randn(*_shape(inv, "k"), dtype=_operand_dtype(inv, "k"),
@@ -3630,8 +3645,9 @@ def causal_block_max(scores: Any, block: int) -> Any:
 
 def _block_score_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
     import torch
-    dt = _dtype(inv.dtype)
-    store_dt = torch.bfloat16 if dt.is_floating_point and dt.itemsize < 2 else dt
+    # `_store_dtype` states this rule once; restating it here is how the two
+    # drifted when the rule changed from float-ness to width.
+    store_dt = _store_dtype(inv.dtype)
     return {
         "q": torch.randn(*_shape(inv, "q"), dtype=store_dt, device=device, generator=gen),
         "k": torch.randn(*_shape(inv, "k"), dtype=_operand_dtype(inv, "k"),

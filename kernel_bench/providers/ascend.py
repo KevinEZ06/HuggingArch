@@ -75,27 +75,66 @@ def _torch_dtype(name: str):
 # format declares (`arch/activation_formats/int8_per_token.yaml`).
 # ---------------------------------------------------------------------------
 
+def _int8_per_channel(w):
+    """`w` → `(int8 elements, one scale per output channel)`.
+
+    The harness's own grid (`quant.quantise_groups`, the single
+    implementation every quantised cell is placed on), asked for one group
+    per row — which is what per-channel means for a `[N, K]` weight. The
+    levels come back in the working precision because `int8` declares no
+    torch cast, so they are narrowed here; they are already integers, so
+    that narrowing is exact.
+
+    Quantising in the BUILD, not in the timed closure: the checkpoint ships
+    the weight quantised and the plugin only transposes it at load
+    (`w8a8_dynamic.py:136-139`), so this is setup, the same place the fp8
+    providers quantise theirs.
+    """
+    import torch
+    from ..quant import FORMATS, quantise_groups
+    q, scale = quantise_groups(w, FORMATS["int8"], w.shape[-1], "exact",
+                               torch.float32)
+    return q.reshape(w.shape).to(torch.int8), scale.reshape(-1)
+
+
 def _quant_matmul_build(inv: Invocation, env: Env,
                         inputs: Dict[str, Any]) -> BenchCase:
     import torch
     import torch_npu
 
+    # Both operands arrive WIDE — int8 is too narrow to hold a reference
+    # value (`refs._store_dtype`), so the cell carries bf16 and each
+    # provider quantises, the convention the fp8 providers set.
     x, w = inputs["x"], inputs["w"]
+    # The activation is quantised by the very kernel the plugin uses for it
+    # (`w8a8_dynamic.py:117`), so its elements and per-token scale are that
+    # kernel's, not a second opinion about what it writes.
+    xq, per_token = torch_npu.npu_dynamic_quant(x, dst_type=torch.int8)
+    wq, w_scale = _int8_per_channel(w)
     # The kernel takes the weight as (K, N): the plugin transposes once at
     # load (`w8a8_dynamic.py:135-139` process_weights_after_loading), which
     # is not per-step work and so is not inside the timed window.
-    wt = w.t().contiguous() if w.shape[0] != x.shape[-1] else w
-    scale = torch.ones(wt.shape[-1], dtype=torch.float32,
-                       device=x.device)
-    per_token = torch.ones(x.shape[0], dtype=torch.float32, device=x.device)
+    #
+    # ALWAYS, not when the extents happen to differ. The cell states the
+    # layout — `gemm` carries `w` as [N, K] and its oracle computes
+    # `x @ w.T` — so sniffing the shapes answers a question the declaration
+    # already answered, and answers it wrong whenever N == K: a square
+    # weight went through untransposed and the kernel computed `x @ w`.
+    # Nothing caught it because int8 had no cross-check band, so these cells
+    # were measured with no oracle at all; with one, they read cosine
+    # 0.00004 — orthogonal, not imprecise.
+    wt = wq.t().contiguous()
+    # The weight scale's width is the checkpoint's, which the cell carries
+    # as `metadata` (BF16 for W8A8_DYNAMIC); the activation scale's is the
+    # quantise kernel's own F32. Two facts, two widths.
+    scale = w_scale.to(_torch_dtype(inv.dtype_env.get("metadata") or "bf16"))
     out_dtype = _torch_dtype(inv.dtype if inv.dtype in _ASCEND_FLOAT
                              else "bf16")
     return BenchCase(
         run=lambda: torch_npu.npu_quant_matmul(
-            x, wt, scale, pertoken_scale=per_token, output_dtype=out_dtype),
-        # The cell's oracle multiplies in fp32 and compares dequantised; the
-        # kernel folds both scales into its epilogue, so its output is
-        # already the canonical layout.
+            xq, wt, scale, pertoken_scale=per_token, output_dtype=out_dtype),
+        # The kernel folds both scales into its epilogue, so its output is
+        # already the wide product the oracle computes.
         to_canonical=lambda o: o,
     )
 
@@ -105,7 +144,18 @@ register(Provider(
     kernel_impl="npu_quant_matmul_w8a8", import_name="torch_npu",
     build=_quant_matmul_build,
     serves=KernelSignature(signature="gemm", weight=("int8",),
-                           activation=("int8",), output=_ASCEND_FLOAT),
+                           activation=("int8",), output=_ASCEND_FLOAT,
+                           # W8A8_DYNAMIC is per-channel weights and
+                           # per-token activations, and the build above
+                           # passes exactly those two scales — the same pair
+                           # the plugin passes
+                           # (`w8a8_dynamic.py:124-131`). Declared because a
+                           # scale layout is part of what a kernel serves:
+                           # undeclared, this provider served the plain cell
+                           # only, so every W8A8 cell — the one deployment
+                           # this binding exists for — found no provider.
+                           weight_granularity=("per-channel",),
+                           activation_granularity=("per-token",)),
 ))
 
 
@@ -137,15 +187,44 @@ def _grouped_quant_matmul_build(inv: Invocation, env: Env,
             for i, c in enumerate(counts)]
     flat = (torch.cat(kept, dim=0).contiguous() if kept
             else rows[:running].contiguous())
+    # As the dense provider: the operands arrive wide and this build
+    # quantises them, the activation through the plugin's own quantise
+    # kernel and the weight on the harness's grid, one scale per output
+    # channel of each expert.
+    flat, per_token = torch_npu.npu_dynamic_quant(flat, dst_type=torch.int8)
+    wq, w_scale = _int8_per_channel(w.reshape(-1, w.shape[-1]))
+    wq = wq.reshape(w.shape)
+    w_scale = w_scale.reshape(w.shape[0], w.shape[1])
     # The cell carries each expert's weight as (N, K) — the layout a single
     # expert's linear states (`refs._grouped_gemm_inputs`) — while the
     # kernel contracts over the LAST axis and wants (K, N). Transposed once
     # here, outside the timed closure; the plugin transposes at load too
     # (`w8a8_dynamic.py:135-139`), so it is not per-step work either way.
-    wt = w.transpose(-1, -2).contiguous()
+    wt = wq.transpose(-1, -2).contiguous()
+    # The two scales W8A8_DYNAMIC dequantises with, in the layout the plugin
+    # hands the kernel (`device/device_op.py:418-426`): the weight's one per
+    # output channel of each expert, the activation's one per token of the
+    # flat run. Without them `npu_grouped_matmul` takes its NON-quantised
+    # path (the op's own formula 1) — which is what this build did until
+    # 2026-11-16, so a provider named `_w8a8` was timing the plain kernel on
+    # int8 operands, and `to_canonical=None` meant nothing compared the
+    # result against anything.
+    # The WEIGHT scale is the checkpoint's, so its width is the cell's
+    # `metadata` — BF16 for W8A8_DYNAMIC, which stores the sidecar at the
+    # model dtype (`quant_schemes/modelslim-w8a8-dynamic.yaml`). Read from
+    # the cell rather than fixed here: the kernel refuses the pair outright
+    # otherwise ("scale[0] dtype FLOAT and y dtype BF16 are not supported
+    # when A8W8 per-token quant", aclnnGroupedMatmulV5 161002), so a
+    # hardcoded width would be a second opinion about a fact the cell
+    # already carries.
+    scale = w_scale.to(_torch_dtype(inv.dtype_env.get("metadata") or "bf16"))
+    out_dtype = _torch_dtype(inv.dtype if inv.dtype in _ASCEND_FLOAT
+                             else "bf16")
     return BenchCase(
         run=lambda: torch_npu.npu_grouped_matmul(
-            [flat], [wt], group_list=groups, split_item=2, group_type=0),
+            [flat], [wt], scale=[scale], per_token_scale=[per_token],
+            group_list=groups, split_item=2, group_type=0,
+            output_dtype=out_dtype),
         to_canonical=None,   # flat-vs-blocked layout; measured, not verified
     )
 
@@ -155,7 +234,12 @@ register(Provider(
     kernel_impl="npu_grouped_matmul_w8a8", import_name="torch_npu",
     build=_grouped_quant_matmul_build,
     serves=KernelSignature(signature="grouped_gemm", weight=("int8",),
-                           activation=("int8",), output=_ASCEND_FLOAT),
+                           activation=("int8",), output=_ASCEND_FLOAT,
+                           # As the dense provider above, and for the same
+                           # reason: the scales are what makes this the W8A8
+                           # kernel rather than the float one.
+                           weight_granularity=("per-channel",),
+                           activation_granularity=("per-token",)),
 ))
 
 
@@ -211,10 +295,31 @@ def _dynamic_quant_build(inv: Invocation, env: Env,
     import torch_npu
 
     x = inputs["x"]
+    cast = inputs["cast"]
+
+    def canonical(pair):
+        """The kernel's `(elements, scale)` multiplied back.
+
+        The oracle is `x` quantised and dequantised again
+        (`ActivationCast.on_grid`), i.e. a WIDE tensor; the kernel writes the
+        narrow pair. Handing the pair over untouched compared int8 element
+        VALUES against dequantised activations — same direction, ~127x the
+        magnitude, which is what the cross-check read as cosine 0.997 with a
+        typical error of 15.5.
+
+        `npu_dynamic_quant` returns one scale per token, shaped like the
+        activation with its last axis dropped; `quantise_groups` states the
+        canonical shape as `[rows, groups]`, and per-token is one group per
+        row. So the scale is reshaped, and the multiply itself is the cast's
+        own `dequantise` — the oracle's too, so the two cannot drift into
+        different scale conventions.
+        """
+        elements, scale = pair[0], pair[1]
+        return cast.dequantise((elements, scale.reshape(-1, 1)))
+
     return BenchCase(
         run=lambda: torch_npu.npu_dynamic_quant(x, dst_type=torch.int8),
-        # Returns `(elements, scales)`; the oracle compares the pair.
-        to_canonical=lambda o: o,
+        to_canonical=canonical,
     )
 
 

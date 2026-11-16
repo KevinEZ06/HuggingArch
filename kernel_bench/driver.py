@@ -1109,6 +1109,15 @@ class Band(NamedTuple):
 #     bf16        0.0031      0.0402        (0.008, 0.10)
 #     fp8_e4m3    0.0446      1.2353        (0.11,  3.1)
 #     fp8_e5m2    0.0646      2.7954        (0.16,  7.0)
+#     int8        0.0090      0.0683        (0.023, 0.17)
+#
+# int8's row was measured later and NARROWER than the others: on the two
+# signatures an Ascend W8A8 deployment reaches (gemm 8 cells, grouped_gemm
+# 4), because those are the only int8 providers registered. Its floors sit
+# between fp16's and bf16's, which is what a per-channel weight and a
+# per-token activation should give — the grid is coarse but each scale
+# covers few elements. A third int8 signature arriving should re-measure
+# rather than assume this row covers it.
 #
 # The RMS floor is a property of the DTYPE (bf16 lands between 0.0010 and
 # 0.0031 whatever the op) while the maximum's distance from it is a property
@@ -1139,6 +1148,7 @@ _XCHECK_BANDS = {
     "bf16": Band(8e-3, 1e-1),
     "fp8_e4m3": Band(1.1e-1, 3.1),
     "fp8_e5m2": Band(1.6e-1, 7.0),
+    "int8": Band(2.3e-2, 1.7e-1),
 }
 
 # Each band is keyed by the dtype token a cell is measured at, and that is
