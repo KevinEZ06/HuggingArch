@@ -12,6 +12,7 @@ from backend.arch.eval.dim import Dim, exact, expr_of, require_equal, value_of
 from backend.arch.eval.transition import OutputStates
 
 from .axis_use import AXIS_USE
+from .comm_volume import RouteFanout
 from .edge import EdgeState
 from .linear import normalize_axis
 from .groups import same
@@ -140,6 +141,12 @@ def permute(rule: LayoutPropagation, node: Any, states: List[Optional[EdgeState]
     is not a static axis layout, so the expected load travels beside the
     state until combine (`ExpectedRoutedLoad`: the mean, and the busiest
     rank's).
+
+    The same node binding says how the dispatch FANS OUT (`RouteFanout`:
+    the picks, the destinations they are drawn from, and the ones that hold
+    weights), which is what the exchange of those rows is priced by — a
+    token crosses the fabric once per distinct destination its picks land
+    on, not once per pick.
     """
     del in_shapes
     token, routing = _pair_rank3(rule, node, states, DISPATCH_OP)
@@ -174,6 +181,12 @@ def permute(rule: LayoutPropagation, node: Any, states: List[Optional[EdgeState]
         # `n_expert_copies`, the bank's own count.
         experts = int(value_of(binding["n_expert_copies"]))
         mean = binding["M"]
+        # The same binding says how the dispatch fans out: how many
+        # destinations the top-k draws from, and how many it picks. Read
+        # here, where the routed rows are born, because the exchange that
+        # moves them cannot ask the router afterwards.
+        picks = int(value_of(binding["n_experts_active"]))
+        targets = int(value_of(binding["n_route_targets"]))
     except KeyError as exc:
         raise ValueError(
             f"{node.display_path}: routed workload dimension "
@@ -195,6 +208,7 @@ def permute(rule: LayoutPropagation, node: Any, states: List[Optional[EdgeState]
         routed_rows_in_cell=routed_rows,
         num_experts=experts,
         load_assumption_id="moe_routing_balance",
+        fanout=RouteFanout(picks=picks, targets=targets, placed=experts),
         expert_load_factor=rule.expert_load,
         dispatched_rows=routed_axis)
     if not workload.is_measure_preserving():

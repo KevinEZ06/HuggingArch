@@ -191,6 +191,17 @@ for _phase in ("per_op_timing", "per_op_timing_decode"):
                   "shape_weight_dims[*].value"):
         ADDED[f"{_phase}[*].{_path}"] = _WEIGHT_DIMS
 
+# A routed MoE exchange's top-k fan-out, which prices its dedup wherever the
+# row is priced — the walk's card, another card a re-read levels the group on
+# (`comm_cost.placement_levels`), and the step's law. None on every row that
+# is not a routed exchange, which is every row of a single-GPU deployment,
+# so the gate's models publish the key with no value.
+_FANOUT = ("a routed exchange sends a token once per distinct destination its "
+           "top-k picks land on; the fan-out is what prices that, and it "
+           "travels with the row so a re-read on another card re-levels it")
+for _rows in ("per_op_timing", "per_op_timing_decode"):
+    ADDED[f"{_rows}[*].comm_route_fanout"] = _FANOUT
+
 REMOVED = {}
 for _phase in ("per_op_timing", "per_op_timing_decode"):
     for _where in ("node_dims", "point_law.dims", "point_law.flops.record"):

@@ -1645,6 +1645,13 @@ def compute_per_op_timing(
             comm_world = int(m.get("comm_world", 1) or 1)
             comm_op = str(m.get("op") or node.op or "") if is_comm else ""
             comm_base_stride = int(m.get("comm_base_stride", 1) or 1) if is_comm else 1
+            # A routed MoE exchange's top-k fan-out, as the walk published
+            # it (`materialize_comm._comm_layers`): what prices its dedup
+            # on this card and on any other one this row is re-read on
+            # (`comm_cost.CollectiveSignature`). None for every collective
+            # that is not a routed exchange.
+            comm_route_fanout = (m.get("comm_route_fanout") or None
+                                 if is_comm else None)
             # The framework's dispatch of this collective
             # (`ServingLayers.collectives`): the rungs it is priced over.
             comm_rungs = ([r.as_dict() for r in laws.collectives.get(comm_op, ())]
@@ -1668,7 +1675,9 @@ def compute_per_op_timing(
                 demand=asked_law,
                 weight_total=weight_total_pr, metadata_total=meta_total_pr,
                 comm_payload=comm_payload_one,
-                comm_factor=comm_factor(comm_op, comm_world) if is_comm else 0.0,
+                comm_factor=(comm_factor(comm_op, comm_world,
+                                         comm_route_fanout)
+                             if is_comm else 0.0),
                 comm_priced=is_comm and comm_world > 1,
                 comm_rungs=len(comm_rungs)), laws.book))
             # This row at the walk's point: its law read there on the card
@@ -1678,6 +1687,7 @@ def compute_per_op_timing(
             facts = {"count_per_step": cnt, "act_dtype": adt_name, "is_comm": is_comm,
                      "comm_op": comm_op, "comm_world": comm_world,
                      "comm_base_stride": comm_base_stride,
+                     "comm_route_fanout": comm_route_fanout,
                      "comm_rungs": comm_rungs}
             card = RowCard(op_peak, peak_hbm_bw_bytes_per_sec, fabric,
                            launch_floor_s)
@@ -2070,6 +2080,11 @@ def compute_per_op_timing(
                 "comm_op": comm_op,
                 "comm_tensor_bytes": point["comm_tensor_bytes"],
                 "comm_base_stride": comm_base_stride,
+                # A routed MoE exchange's top-k fan-out, which prices its
+                # dedup wherever the row is priced; None for every other
+                # collective (a Ulysses CP exchange is flat, and that is a
+                # fact about it rather than a missing one).
+                "comm_route_fanout": comm_route_fanout,
                 # The framework's dispatch rungs the collective is priced
                 # over, so another card reads the same ladder.
                 "comm_rungs": comm_rungs,

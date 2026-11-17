@@ -16,7 +16,7 @@ from backend.arch.eval.program import Program
 from backend.arch.eval.values import Cost, Shape
 from backend.arch.spec_tree import InputRef, SpecIRNode, SpecIRTree
 
-from .comm_volume import collective_per_rank_bytes
+from .comm_volume import RouteFanout, collective_per_rank_bytes
 
 
 def flow_port(port: str) -> str:
@@ -177,36 +177,58 @@ class PhysicalCollective:
     payload_symbolic_shape: Tuple[str, ...] = ()
     post_transform: PostTransform = PostTransform.NONE
     binding_gap: Optional[LogicalBindingGap] = None
+    #: A ROUTED MoE exchange's top-k fan-out (`comm_volume.RouteFanout`),
+    #: which prices its dedup: the dispatch and combine carry one
+    #: (`materialize_rows.exchange_row`), and every other collective — the
+    #: Ulysses CP exchange included — carries None and is priced flat.
+    route_fanout: Optional[RouteFanout] = None
     meta: Tuple[Tuple[str, Any], ...] = field(default=())
     dedup_key: Optional[Tuple[Any, ...]] = field(
         default=None, compare=False, repr=False
     )
+
+    def __post_init__(self) -> None:
+        # Only an exchange has distinct destinations to dedup onto: a
+        # reduction visits every member whatever the routing. One gate, so
+        # a fan-out cannot reach a collective that is not a dispatch.
+        if self.route_fanout is not None and self.op != "all_to_all":
+            raise ValueError(
+                f"event {self.event_id} is a {self.op} carrying a route "
+                "fan-out; only an exchange sends a token once per distinct "
+                "destination")
 
     def at_width(self, width: float) -> "PhysicalCollective":
         """This event moving its payload at `width` bytes per element: the
         same buffer, its bytes restated by the one rule an event is built
         by (`payload_fields`)."""
         return replace(self, **payload_fields(
-            self.op, self.group_size, self.count, self.payload_shape, width))
+            self.op, self.group_size, self.count, self.payload_shape, width,
+            fanout=self.route_fanout))
 
 
 def payload_fields(op: str, group_size: int, count: int,
-                   payload_shape: Sequence[Any], width: float
+                   payload_shape: Sequence[Any], width: float,
+                   fanout: Optional[RouteFanout] = None
                    ) -> Dict[str, Any]:
     """A collective event's bytes from its payload buffer and element
     width: the buffer's bytes as a typed extent and its value, and what
     each rank moves over a step (`collective_per_rank_bytes` x the launches
     a step makes). The one statement of them — when an event is built
     (`materializer._Session._event`) and when a later pass restates its
-    width (`PhysicalCollective.at_width`)."""
+    width (`PhysicalCollective.at_width`).
+
+    `fanout` is the routed exchange's (`RouteFanout`): its rank-level dedup
+    is the layer's own bytes, so what the layer publishes and what the card
+    prices for a single node are the same number."""
     extent = payload_bytes(payload_shape, width)
     payload = value_of(extent)
     return {
         "payload_dtype_bytes": float(width),
         "payload_bytes": payload,
         "payload_extent": extent,
-        "bytes_per_rank": (collective_per_rank_bytes(op, group_size, payload)
-                           * count),
+        "bytes_per_rank": (
+            collective_per_rank_bytes(op, group_size, payload, fanout)
+            * count),
     }
 
 
@@ -506,7 +528,8 @@ def _comm_layers(
             out=shape_out,
         )
         per_instance = collective_per_rank_bytes(
-            event.op, event.group_size, event.payload_bytes
+            event.op, event.group_size, event.payload_bytes,
+            event.route_fanout
         )
         comm_bytes[node.uid] = per_instance
         counts[node.uid] = event.count
@@ -532,6 +555,12 @@ def _comm_layers(
             "depth": depths[node.uid],
             "comm_world": event.group_size,
             "comm_base_stride": event.base_stride,
+            # The routed exchange's top-k fan-out, as the row carries it
+            # (`phases.compute_per_op_timing` → `comm_route_fanout`): what
+            # prices the dedup wherever this collective is priced. None for
+            # every collective that is not a routed exchange.
+            "comm_route_fanout": (event.route_fanout.as_dict()
+                                  if event.route_fanout is not None else None),
             "tensor_bytes": event.payload_bytes,
             # The shapes' whole extents (`materializer._int_shape`), laws
             # where they grow with the workload; read at a point they are

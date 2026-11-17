@@ -415,6 +415,7 @@ class _Session:
         payload_dtype_bytes: Optional[float] = None,
         post_transform: PostTransform = PostTransform.NONE,
         binding_gap: Optional[LogicalBindingGap] = None,
+        route_fanout: Optional[Any] = None,
         meta: Tuple[Tuple[str, Any], ...] = (),
         source: Any = _DEFAULT_SOURCE,
         source_event: Optional[str] = None,
@@ -462,7 +463,7 @@ class _Session:
         # The emitter's typed payload is the one source: the integer shape
         # above and the bytes below are both its value (`payload_fields`).
         payload = payload_fields(op, group_size, count, payload_shape,
-                                 dtype_bytes)
+                                 dtype_bytes, fanout=route_fanout)
         resolved_site = record_site if site is None else site
         if not isinstance(resolved_site, RedistributeSite):
             raise TypeError(f"event {event_id} has invalid site {resolved_site!r}")
@@ -527,6 +528,7 @@ class _Session:
             ),
             post_transform=post_transform,
             binding_gap=binding_gap,
+            route_fanout=route_fanout,
             meta=meta,
             dedup_key=dedup_key,
         )

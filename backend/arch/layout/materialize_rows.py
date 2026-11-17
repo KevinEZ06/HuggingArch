@@ -152,6 +152,13 @@ def exchange_row(
     A route exchange may consume an expert-tensor-parallel reduction of the
     same value. ``source_event`` names that ordered dependency; its expert
     buffer is locally packed into the exchange's row-major rows.
+
+    A ROUTE exchange also carries the dispatch's top-k fan-out
+    (`RouteFanout`, off the routed-load evidence this leg already reads):
+    it sends a token once per distinct destination, not once per pick, and
+    this is the one place that fact reaches an event. Every other exchange
+    — the Ulysses CP pair — carries none and is priced as a flat
+    all-to-all, which is what it is.
     """
     size = mat._family_size(world)
     port = flow_port(record.producer_port)
@@ -171,6 +178,7 @@ def exchange_row(
     else:
         anchor = record.node
         producer = record.producer
+    route_fanout = None
     if is_route:
         if route_evidence is None or not same(
             route_evidence.group, family
@@ -187,6 +195,18 @@ def exchange_row(
         route_flow = routed_flow_shape(mat, producer, evidence_state, port)
         flow_in = route_flow
         flow_out = route_flow
+        # The payload is the rows AS DISPATCHED — one copy of each. A leg
+        # whose rows a layout gathered carries several copies of a row, and
+        # the fan-out counts destinations per TOKEN, so the two readings
+        # would multiply. No such leg exists (a gather inside the zone is
+        # its own collective and the exchange takes the rows back first),
+        # and this says so rather than silently pricing one.
+        if evidence_state.workload.row_replication != 1:
+            raise ValueError(
+                f"{mat._node(record.node).display_path}: a route exchange "
+                "moves the rows as dispatched; these carry "
+                f"{evidence_state.workload.row_replication} copies of each")
+        route_fanout = evidence_state.workload.fanout
     else:
         flow_in = local_shape(mat, producer, record.arrived, port)
         flow_out = local_shape(mat, producer, record.required, port)
@@ -203,6 +223,7 @@ def exchange_row(
         collective_out_shape=flow_out,
         flow_out_shape=flow_out,
         payload_shape=flow_in,
+        route_fanout=route_fanout,
         meta=meta,
         attribution_uid=anchor,
         **_chained(source_event),

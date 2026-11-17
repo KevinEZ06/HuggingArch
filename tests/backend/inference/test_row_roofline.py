@@ -206,6 +206,73 @@ class TestTheSecondCardIsPricedByTheSameLoop(unittest.TestCase):
             self.assertGreater(comm_rows, 0, f"{key}: TP=2 has collectives to re-price")
 
 
+    def test_a_routed_exchange_is_re_levelled_on_the_second_card(self):
+        """The routed exchange is priced per placement level, and the levels
+        are the CARD's: one node of eight on an SXM board, two nodes of four
+        on PCIe cards. So a re-stamped row must be re-levelled there and not
+        carry the source card's levels — the 2026-10-31 judgement, on the
+        one collective whose bytes are not a function of its group's size.
+
+        A direct estimate on the second card is the comparison, as above; the
+        exchange's own level split is asserted apart, because the two cards
+        agreeing on a number they both read from the first card's levels
+        would pass the equality alone — and so is the conservation, because
+        two cards agreeing on a total that is missing a term would pass it
+        too.
+        """
+        from tests.sweep_parity import layout_at
+        from backend.inference.capacity import estimate_capacity
+        from backend.inference.comm_cost import (CollectiveSignature,
+                                                 placement_levels)
+        from backend.inference.row_roofline import RowRoofline
+        stem = "Qwen__Qwen3-30B-A3B"
+        common = dict(config=_config(stem), resolved=_resolved(stem),
+                      parallel=ParallelConfig(ep_moe=8, dp_attention=8),
+                      num_gpus=8, avg_input_tokens=1024, avg_output_tokens=128,
+                      prefill_batch_size=1, decode_batch_size=8)
+        stamped = layout_at(
+            {**common, "gpu_skus": ["H100-SXM", "H100-PCIe"]})
+        direct = estimate_capacity(gpu_sku="H100-PCIe", **common)
+        exchanges = 0
+        for key in ("per_op_timing", "per_op_timing_decode"):
+            got = {r["aggregation_id"]: r
+                   for r in stamped["H100-PCIe"]["sol"][key]}
+            for row in direct[key]:
+                sig = CollectiveSignature.of(row)
+                if sig is None or sig.route_fanout is None:
+                    continue
+                exchanges += 1
+                agg = row["aggregation_id"]
+                self.assertEqual(got[agg]["comm_route_fanout"],
+                                 row["comm_route_fanout"], agg)
+                self.assertAlmostEqual(
+                    got[agg]["t_comm_s"], row["t_comm_s"],
+                    delta=1e-12 * row["t_comm_s"], msg=agg)
+                # The PCIe card's nodes hold four GPUs, so this group of
+                # eight exchanges at BOTH levels; on the walked card it
+                # exchanges at one.
+                self.assertEqual(
+                    [level.fabric for level
+                     in placement_levels(sig.world, 4, sig.stride)],
+                    ["intra", "inter"], agg)
+                self.assertEqual(
+                    [level.fabric for level
+                     in placement_levels(sig.world, 8, sig.stride)],
+                    ["intra"], agg)
+                # Both levels together are the exchange's own bytes — the
+                # number the row publishes — so a level charged to nobody
+                # fails here and not only in a total two cards share.
+                _t, phases = RowRoofline.comm(
+                    sig, tensor_bytes=float(row["comm_tensor_bytes"]),
+                    fabric=_fabric("H100-PCIe"))
+                self.assertEqual(len(phases), 2, agg)
+                self.assertAlmostEqual(
+                    sum(ph["bytes_per_rank"] for ph in phases),
+                    float(row["comm_bytes_per_rank"]),
+                    delta=1e-6 * float(row["comm_bytes_per_rank"]), msg=agg)
+        self.assertGreater(exchanges, 0, "ep_moe=8 has a routed exchange")
+
+
 _PP_TIMES = ("t_compute_s", "t_memory_s", "t_comm_s", "t_sol_s")
 
 

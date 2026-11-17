@@ -94,6 +94,15 @@ MINIMAL_DIMS: Dict[str, int] = {
     # composed over an inner one.
     "n_comm_elems": 256,
     "n_comm_stride": 1,
+    # A routed exchange's fan-out (`routed_all_to_all`): how many
+    # destinations a token's top-k reaches, which is how many copies of it
+    # the dispatch sends. `n_experts_active` above is the top-k width; the
+    # two below are the destinations it draws from and the ones that hold
+    # weights. Unequal, so a cell that confused the denominator with the
+    # weighted count does not pass: 8 of the 10 destinations are experts,
+    # the other 2 a zero-compute reserve.
+    "n_route_targets": 10,
+    "n_route_experts": 8,
     "n_indexer_heads": 4,
     "d_indexer_head": 64,
     "s_sparse_block": 32,

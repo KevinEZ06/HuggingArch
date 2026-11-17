@@ -5253,6 +5253,16 @@ def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]
     provider reads, the way `allreduce_fused_rmsnorm` already passes its
     group.
 
+    A ROUTED exchange (`routed_all_to_all`) states three more scalars: the
+    top-k picks, the destinations they are drawn from and the ones that hold
+    weights. They change no shape either, and they are what makes the
+    launch the ragged one its cell names — how many distinct destinations a
+    token goes to, and so what the per-peer split is. A provider that
+    builds the split lists for a DeepEP dispatch reads them; without them it
+    could only build the flat equal split, which is the OTHER cell. Passed
+    for whichever of them the signature's cell declares, so the flat
+    exchange's inputs do not change.
+
     No oracle. On one process every one of these collectives is the
     identity, so an oracle here would agree with a provider that never
     communicated — which is exactly how a fused all-reduce once
@@ -5261,12 +5271,22 @@ def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]
     """
     import torch
     dims = _dims(inv)
-    return {
+    out = {
         "payload": torch.randn(*_shape(inv, "payload"),
                                dtype=_dtype(inv.dtype), device=device, generator=gen),
         "n_comm_ranks": int(dims["n_comm_ranks"]),
         "n_comm_stride": int(dims["n_comm_stride"]),
     }
+    # Only what this signature's cell declares: the flat exchange's inputs
+    # must not so much as LOOK at a routing axis, or every collective would
+    # read dims its cell does not have
+    # (`test_cell_dims_are_what_the_reference_reads`).
+    from backend.inference.op_signatures import get_signature
+    cell = getattr(get_signature(inv.signature), "cell_dims", ())
+    for axis in ("n_experts_active", "n_route_targets", "n_route_experts"):
+        if axis in cell:
+            out[axis] = int(dims[axis])
+    return out
 
 
 # Which signatures those are is the catalog's own declaration — the
