@@ -679,6 +679,24 @@ def _direct_batches(ceilings: CapacityCeilings, *,
 _STEP_ONLY = ("vs_naive_delta", "encode")
 
 
+def withheld_phase(name: str, reason: str) -> Dict[str, Any]:
+    """The phase a deployment with no step publishes: its name, no batch, and
+    why there is no step.
+
+    The ONE statement of that shape. A deployment that admits no request
+    reaches it two ways — its weights cannot load, so no phase is walked at
+    all (`_capacity_preparation`'s `refusal_reason`), or a walked phase is
+    narrowed at the publishing boundary (`without_step`) — and both publish
+    this. Nothing else: a consumer divides tokens by a step time and calls
+    the quotient a rate, and `batch is None` is how every reader (the phase
+    table, `batch_sweep.phase_at`, `_phase_at_length`) knows there is no
+    step to read. Ask here rather than spelling the three keys again; the
+    shape has changed once already and each hand-written copy went stale on
+    its own.
+    """
+    return {"phase": name, "batch": None, "time_unpublished_reason": reason}
+
+
 def without_step(result: dict, row_lists: Iterable[str]) -> dict:
     """`result` as a card that admits no request publishes it.
 
@@ -696,8 +714,7 @@ def without_step(result: dict, row_lists: Iterable[str]) -> dict:
         return result
     out = {k: v for k, v in result.items()
            if k not in set(row_lists) and k not in _STEP_ONLY}
-    out["phases"] = {name: {"phase": phase.get("phase", name), "batch": None,
-                            "time_unpublished_reason": reason}
+    out["phases"] = {name: withheld_phase(phase.get("phase", name), reason)
                      for name, phase in (result.get("phases") or {}).items()
                      if phase}
     return out
@@ -3298,11 +3315,8 @@ def _capacity_pending(
 
         def refused_estimate() -> dict:
             """The complete no-step answer; no phase walk can load its weights."""
-            phases = {
-                name: {"phase": name, "batch": None,
-                       "time_unpublished_reason": reason}
-                for name in ("prefill", "decode")
-            }
+            phases = {name: withheld_phase(name, reason)
+                      for name in ("prefill", "decode")}
             return without_step({
                 "gpu": gpu.to_json(),
                 "num_gpus": p.num_gpus,

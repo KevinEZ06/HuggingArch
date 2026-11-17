@@ -59,6 +59,25 @@ from .step_eval import evaluate_step
 from backend.measure.auto_sweep import MeasuredTrack
 
 
+#: The times a step publishes only when it HAS one. A phase that was walked
+#: but whose step time is withheld (`time_unpublished_reason`: a deployment
+#: that admits no batch at this seq) publishes EVERY one of these as `None`,
+#: never some of them — each is read as a latency or as the denominator of a
+#: rate, so a partial set is a wrong number, not a partial answer. Declared
+#: once because two producers state it: `estimate_phase`'s no-capacity
+#: branch below, and `batch_sweep.phase_at` when it re-prices such a step at
+#: another batch or card.
+WITHHELD_TIMES: Tuple[str, ...] = (
+    "t_compute_s", "t_memory_s", "t_comm_s", "t_sol_s",
+    "t_sol_by_bound", "t_sol_by_bound_share", "t_measured_s",
+)
+#: What survives in `pipeline_time` when the times go: the step's STRUCTURE —
+#: which stage this rank is, how many there are, and every stage's row laws —
+#: so a card that does admit a batch can price the same stages. The sums
+#: (`t_sol`, `t_compute`, `per_stage`, …) go with the times.
+WITHHELD_PIPELINE: Tuple[str, ...] = ("stages", "stage", "stage_laws")
+
+
 @dataclass
 class PhaseMetrics:
     phase: str
@@ -875,7 +894,7 @@ def estimate_phase(
         # would be the time of a run this deployment does not have.
         if pipeline_time is not None:
             pipeline_time = {key: value for key, value in pipeline_time.items()
-                             if key in ("stages", "stage", "stage_laws")}
+                             if key in WITHHELD_PIPELINE}
         t_compute = t_memory = t_comm = t_sol = t_measured = None
         t_sol_by_bound = None
     elif stage is not None and pipeline_time is not None:
