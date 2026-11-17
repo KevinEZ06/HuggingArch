@@ -1029,7 +1029,7 @@ def estimate_phases(
 
 def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
                      num_gpus: int) -> Dict[str, Any]:
-    """The three throughputs a phase dict supports, named, from its own
+    """The four throughputs a phase dict supports, named, from its own
     fields — so no page divides tokens by time itself.
 
     `t_sol_s` is one model-parallel replica group's step time and
@@ -1037,8 +1037,12 @@ def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
     so tokens over time is PER GROUP. Independent groups (dp_attention ×
     dp_replicas, the `unique_tokens_multiplier`) run in parallel, so the
     CLUSTER total multiplies by that count, and PER GPU divides the cluster
-    total by the GPU count. Each is computed for the theoretical step time
-    and, where a measured step time exists, for that too.
+    total by the GPU count. The fourth, `per_request`, is the rate ONE
+    request sees: the step's tokens that belong to one request over the
+    step time — decode's 1/TPOT and prefill's prompt tokens over TTFT are
+    the same quotient, named once here. Each is computed for the
+    theoretical step time and, where a measured step time exists, for that
+    too.
     """
     # A phase that never ran (OOM, infeasible) has no step time and so no
     # rate; one that ran states its tokens and how they were counted.
@@ -1052,13 +1056,18 @@ def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
     groups = max(1, int(unique_tokens_multiplier or 1))
     gpus = max(1, int(num_gpus or 1))
 
-    # A decode request's own tokens per step: 1, or 1 + α·K under
-    # speculative decoding, where one step verifies the drafts and keeps
-    # what is accepted. Its time per output token is the step over that.
+    # The tokens ONE request contributes to the step: its uncached prompt in
+    # prefill, 1 in decode — 1 + α·K when the step verifies K drafts and
+    # keeps what is accepted. Over the step time it is the rate one request
+    # sees (`per_request` below): decode's 1/TPOT and prefill's prompt
+    # tokens over TTFT are the same quotient of the same two fields, so no
+    # consumer divides tokens by a time itself.
     batch = phase.get("batch") or 0
-    per_request = (tokens / batch
-                   if phase.get("phase") == "decode" and tokens and batch
-                   else None)
+    per_request_tokens = tokens / batch if tokens and batch else None
+    # Decode's own name for the reciprocal; `output_tokens_per_request_step`
+    # and `concurrent_requests` are decode's vocabulary too.
+    decoding = phase.get("phase") == "decode"
+    per_request = per_request_tokens if decoding else None
 
     def rates(t: Optional[float]) -> Optional[Dict[str, Any]]:
         if t is None or t <= 0 or not tokens or tokens <= 0:
@@ -1069,6 +1078,9 @@ def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
             # (`t / (1 + α·K)`) — the step itself under plain decode.
             **({"time_per_output_token_s": t / per_request}
                if per_request else {}),
+            # Every phase: the tokens/s ONE request sees.
+            **({"per_request": per_request_tokens / t}
+               if per_request_tokens else {}),
             "per_group": per_group,
             "cluster": per_group * groups,
             "per_gpu": per_group * groups / gpus,
@@ -1087,6 +1099,10 @@ def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
 
     return {
         "tokens_per_step": tokens,
+        # The step's tokens that belong to one request, whatever the phase:
+        # the numerator of `per_request` above.
+        **({"tokens_per_request_step": per_request_tokens}
+           if per_request_tokens else {}),
         # Decode: the tokens one request outputs per step (1 + α·K), and
         # the requests the cluster decodes at once (B per group × groups).
         **({"output_tokens_per_request_step": per_request,

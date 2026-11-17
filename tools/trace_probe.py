@@ -206,13 +206,13 @@ def child(args: argparse.Namespace) -> None:
                selection_mode="theoretical_only", model_id=args.model)
     plan_t = rec.begin() if rec else None
     t0 = time.perf_counter()
-    plan = ps.ParallelSweepPlan.of(modes=args.modes.split(","), context_len=1024,
+    plan = ps.ParallelSweepPlan.of(modes=args.modes.split(","), contexts=[1024],
                                    gpu_skus=args.gpus.split(","), base_env=env)
     plan_s = time.perf_counter() - t0
     if rec:
         rec.end(plan_t)
     if args.list:
-        print(json.dumps([f"{c.mode}@{c.x}" for c in plan.cells]))
+        print(json.dumps([f"{'/'.join(c.modes)}@{c.x}" for c in plan.cells]))
         return
     picks = [int(i) for i in args.cells.split(",")]
     cells_out = []
@@ -224,7 +224,7 @@ def child(args: argparse.Namespace) -> None:
         r = ps.run_layout_cell(cell)
         dt = time.perf_counter() - t0
         results.append(r)
-        entry = {"cell": f"{cell.mode}@{cell.x}", "seconds": dt,
+        entry = {"cell": f"{'/'.join(cell.modes)}@{cell.x}", "seconds": dt,
                  "ok": "cards" in r}
         if rec:
             entry["codes"] = rec.end(t)

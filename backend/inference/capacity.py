@@ -2050,7 +2050,7 @@ def estimate_pending(
     )
 
 
-#: What a point of a (context × batch) sweep's decode cloud is held or grouped
+#: What a point of a (context × batch) sweep's throughput cloud is held or grouped
 #: by: the one point-cloud vocabulary, plus the Compare row a producer may tag
 #: the point with (`frontier.POINT_DIMS` names the point's own coordinates).
 SweepCloudDim = Literal["row", *POINT_DIMS]
@@ -2194,8 +2194,8 @@ class CapacitySweepPlan:
                 for j, (k, _pb, _db) in enumerate(self.points)}
         return grid if self.gridded else grid[None]
 
-    def decode_cloud(self, per_seq: List[List[Any]]) -> List[dict]:
-        """Every grid point as a point of the one decode cloud
+    def throughput_cloud(self, per_seq: List[List[Any]]) -> List[dict]:
+        """Every grid point as a point of the one throughput cloud
         (`point_cloud.estimate_cloud`)."""
         parallel = self.knobs.parallel
         num_gpus = (parallel.cluster_size if parallel is not None
@@ -2206,7 +2206,124 @@ class CapacitySweepPlan:
             gpu_sku=self.gpu_sku, parallel=parallel, num_gpus=num_gpus,
             acceptance_rate=self.knobs.acceptance_rate,
             ep_load_factor=self.knobs.ep_load_factor,
-            served=point_served).points
+            fits=fits).points
+
+
+@dataclass
+class ContextAnchor:
+    """One context of a sweep on one preparation, as its points read it:
+    the capacity ceilings at that length, the walk its rows are read off
+    (`pending`, whose own finished estimate is `anchor`), and the point
+    (`point`: the workload counts that move the walk to this context —
+    none at the walk's own).
+
+    `base()` is the estimate the context's points are stamped from
+    (`_point_rows`, `_stamp_gpu_on_result`): the anchor itself at the walk's
+    own context, else the anchor restated at this length — its capacity
+    (`_capacity_fields`) and its phases' frame (`_phase_at_length`) on
+    `preparation`'s card. Built only when a caller reads the context off,
+    so a context walked but not priced builds nothing.
+
+    `refused`: the deployment loads no weights on this card
+    (`_CapacityPreparation.refusal_reason`) — no walk is taken, and `anchor`
+    is the estimate there, the complete no-step answer every point of this
+    context is."""
+
+    preparation: "_CapacityPreparation"
+    ceilings: "CapacityCeilings"
+    pending: "PendingEstimate"
+    anchor: dict
+    point: Point
+    length: int
+    prefix: int
+    avg_output_tokens: int
+    refused: bool = False
+    _base: Optional[dict] = None
+
+    def base(self) -> dict:
+        if self._base is None:
+            pw, anchor = self.preparation, self.anchor
+            self._base = anchor if not self.point.counts else {
+                **anchor,
+                **_capacity_fields(pw, self.ceilings,
+                                   anchor["weight_breakdown"],
+                                   avg_input_tokens=self.length),
+                "phases": {name: _phase_at_length(
+                    phase, pw, self.ceilings, avg_input_tokens=self.length,
+                    avg_output_tokens=self.avg_output_tokens,
+                    s_prefix_cached=self.prefix)
+                    for name, phase in anchor["phases"].items() if phase}}
+        return self._base
+
+
+@dataclass
+class ContextAnchors:
+    """The walks a sweep's contexts on one card class are read off, and the
+    rule for which one a context reads: per pipeline stage its ceilings
+    bind, the first walk taken there at a verify width walked alike
+    (`_CapacityPreparation.walks_alike`) — taken at the first context that
+    needs it, at batch 1 — and every later context substitutes its length
+    and cached prefix into that walk's laws.
+
+    The one statement of that rule, read by both sweeps that price several
+    contexts off one walk: the Context × Batch cell (`_sweep_cell`) and the
+    parallel sweep's layouts (`parallel_sweep._estimate_layout`), which asks
+    it once per card class and hands it each card of the class (a card
+    restamped onto the class's walk, `_restamp_gpu`)."""
+
+    avg_output_tokens: int
+    _walked: Dict[Optional[int],
+                  List[Tuple["_CapacityPreparation", "PendingEstimate", dict]]
+                  ] = field(default_factory=dict)
+
+    def at(self, pw: "_CapacityPreparation", *, length: int, prefix: int,
+           schedule: PrefillChunkSchedule) -> ContextAnchor:
+        """Context `length` (with `prefix` of it cached) on `pw`: walked
+        here if no walk of its stage serves it yet. A context the
+        deployment cannot serve is refused as an estimate there refuses
+        it, and a point the walk does not admit (a sequence cut that does
+        not divide it) as a walk there would."""
+        out_tokens = self.avg_output_tokens
+        if pw.refusal_reason is not None:
+            pending = _capacity_pending(
+                pw, avg_input_tokens=length, avg_output_tokens=out_tokens,
+                prefill_chunk_schedule=schedule,
+                fold_prefill_chunks=False, breakdown=False)
+            return ContextAnchor(pw, pending.ceilings, pending,
+                                 pending.finish(), Point({}), int(length),
+                                 int(prefix), out_tokens, refused=True)
+        refusal = prefix_refusal(pw.parallel, phase="prefill",
+                                 input_tokens=length, s_prefix_cached=prefix)
+        if refusal is not None:
+            raise ValueError(refusal)
+        ceilings = capacity_ceilings(pw, avg_input_tokens=length,
+                                     avg_output_tokens=out_tokens,
+                                     prefill_chunk_schedule=schedule)
+        stage_walks = self._walked.setdefault(ceilings.pp_stage, [])
+        shared_walk = next((entry for entry in stage_walks
+                            if pw.walks_alike(entry[0])), None)
+        if shared_walk is None:
+            pending = _capacity_pending(
+                pw, avg_input_tokens=length, avg_output_tokens=out_tokens,
+                prefill_batch_override=1, decode_batch_override=1,
+                prefill_chunk_schedule=schedule,
+                fold_prefill_chunks=False, breakdown=False)
+            shared_walk = (pw, pending, pending.finish())
+            if pw.account_cells is not None:
+                pw.account_cells()
+            stage_walks.append(shared_walk)
+        p_walk, pending, anchor = shared_walk
+        own = (pw.s_verify == p_walk.s_verify
+               and (length, prefix) == (anchor["avg_input_tokens"],
+                                        p_walk.s_prefix_cached))
+        counts: Dict[str, int] = ({} if own else
+                                  {"s_input": int(length),
+                                   "s_prefix": int(prefix)})
+        if counts:
+            for walk in pending.walk_of_rows.values():
+                Point(counts).admit(walk.analysis)
+        return ContextAnchor(pw, ceilings, pending, anchor, Point(counts),
+                             int(length), int(prefix), out_tokens)
 
 
 def _sweep_cell(p: _CapacityPreparation, cell: Cell,
@@ -2247,12 +2364,8 @@ def _sweep_cell(p: _CapacityPreparation, cell: Cell,
     Facts of the walk's own point that no law carries are not passed on to
     a point: `vs_naive_delta` (the fusion delta, a step time there)."""
     w = cell.walk
-    out_tokens = w["avg_output_tokens"]
     preparations = {(p.s_verify, p.s_prefix_cached): p}
-    # Per bound stage, the walks read so far: each with the preparation it
-    # walked at and its finished anchor.
-    walked: Dict[Optional[int],
-                 List[Tuple[_CapacityPreparation, PendingEstimate, dict]]] = {}
+    anchors = ContextAnchors(avg_output_tokens=w["avg_output_tokens"])
     for index, (length, prefix, width, base_schedule) in enumerate(zip(
             w["seq_lens"], w["s_prefixes"], w["s_verifies"],
             w["prefill_chunk_schedules"], strict=True)):
@@ -2261,51 +2374,18 @@ def _sweep_cell(p: _CapacityPreparation, cell: Cell,
             preparations[preparation] = _preparation_at(
                 w, s_verify=width, s_prefix_cached=prefix)
         pw = preparations[preparation]
-        # A context the deployment cannot serve is refused as an estimate
-        # there refuses it.
-        refusal = prefix_refusal(pw.parallel, phase="prefill",
-                                 input_tokens=length, s_prefix_cached=prefix)
-        if refusal is not None:
-            raise ValueError(refusal)
-        ceilings = capacity_ceilings(pw, avg_input_tokens=length,
-                                     avg_output_tokens=out_tokens,
-                                     prefill_chunk_schedule=base_schedule)
-        stage_walks = walked.setdefault(ceilings.pp_stage, [])
-        shared_walk = next((entry for entry in stage_walks
-                            if pw.walks_alike(entry[0])), None)
-        if shared_walk is None:
-            pending = _capacity_pending(
-                pw, avg_input_tokens=length, avg_output_tokens=out_tokens,
-                prefill_batch_override=1, decode_batch_override=1,
-                prefill_chunk_schedule=base_schedule,
-                fold_prefill_chunks=False, breakdown=False)
-            shared_walk = (pw, pending, pending.finish())
-            if pw.account_cells is not None:
-                pw.account_cells()
-            stage_walks.append(shared_walk)
+        at = anchors.at(pw, length=length, prefix=prefix,
+                        schedule=base_schedule)
         if prices is not None and index not in prices:
             # Walked (the anchors above are this cell's, whatever the caller
             # asked for), not read off.
             yield index, None
             continue
-        p_walk, pending, anchor = shared_walk
-        if (pw is p_walk and (length, prefix)
-                == (anchor["avg_input_tokens"], p_walk.s_prefix_cached)):
-            counts: Dict[str, int] = {}
-            base = anchor
-        else:
-            counts = {"s_input": int(length), "s_prefix": int(prefix)}
-            # The point must be one the walk admits, refused as a walk there
-            # refuses it (a sequence cut that does not divide it).
-            for walk in pending.walk_of_rows.values():
-                Point(counts).admit(walk.analysis)
-            base = {**anchor,
-                    **_capacity_fields(pw, ceilings, anchor["weight_breakdown"],
-                                       avg_input_tokens=length),
-                    "phases": {name: _phase_at_length(
-                        phase, pw, ceilings, avg_input_tokens=length,
-                        avg_output_tokens=out_tokens, s_prefix_cached=prefix)
-                        for name, phase in anchor["phases"].items() if phase}}
+        if at.refused:
+            yield index, [{"sol": at.anchor, "measures": {}}
+                          for _point in cell.points]
+            continue
+        ceilings, pending, base = at.ceilings, at.pending, at.base()
         shared = {k: v for k, v in base.items() if k != "vs_naive_delta"}
         points = []
         # This context's chunked prefills, folded once per endpoint
@@ -2321,13 +2401,13 @@ def _sweep_cell(p: _CapacityPreparation, cell: Cell,
         for (_key, pb, db) in cell.points:
             batches = _direct_batches(ceilings, prefill_batch_override=pb,
                                       decode_batch_override=db)
-            rows = _point_rows(base, pw, batches, pending, Point(counts),
+            rows = _point_rows(base, pw, batches, pending, at.point,
                                breakdown=False)
             rows, keys = pending.keyed_at(rows, gpu_sku=pw.gpu_sku)
             point = without_step({**shared, **_stamp_gpu_on_result(
                 base, pw, ceilings, pending.walked_on, batches=batches,
                 rows=rows,
-                walks=pending.walk_of_rows, point=Point(counts),
+                walks=pending.walk_of_rows, point=at.point,
                 breakdown=False)}, pending.walk_of_rows)
             endpoint_schedule = base_schedule.with_endpoint_batch(
                 batches["per_op_timing"])
@@ -2888,16 +2968,25 @@ def capacity_ceilings(
     )
 
 
+def fits(*, max_batch_per_gpu: Any, requests: int) -> bool:
+    """Whether `requests` concurrent requests' cache fits on one GPU of this
+    deployment at this context (`max_batch_per_gpu`, the KV-bound per-GPU
+    ceiling) — the capacity fact alone. A throughput cloud draws every point
+    that fits, flagging one past the model's published length
+    (`CapacityCeilings.beyond_max_context`)."""
+    return int(max_batch_per_gpu or 0) >= int(requests)
+
+
 def point_served(*, max_batch_per_gpu: Any, beyond_max_context: bool,
                  requests: int) -> bool:
-    """Whether a point of `requests` concurrent requests exists on this
-    deployment at this context: the context is within the model's published
-    length (`CapacityCeilings.beyond_max_context`), and that many requests'
-    cache fits on one GPU (`max_batch_per_gpu`, the KV-bound per-GPU
-    ceiling). A page that draws points and a plan that measures them ask
-    this one question."""
+    """Whether a point of `requests` concurrent requests is one the model
+    serves: its context is within the model's published length
+    (`CapacityCeilings.beyond_max_context`) and its requests `fits`. What a
+    plan that measures points, and a surface that shows only served points
+    (the Gallery's frontier), ask; a throughput cloud asks `fits` and flags the
+    rest."""
     return (not beyond_max_context
-            and int(max_batch_per_gpu or 0) >= int(requests))
+            and fits(max_batch_per_gpu=max_batch_per_gpu, requests=requests))
 
 
 def floor_form_on(form: CardForm, gpu: Any) -> FloorForm:

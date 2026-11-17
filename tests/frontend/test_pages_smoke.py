@@ -63,7 +63,13 @@ _SWEEP = {
     "results_by_batch": {k: [_SWEEP_EST] * _SEQ_LENS for k in ("b1", "b16", "b64", "max")},
     "results": [_SWEEP_EST] * _SEQ_LENS,
 }
-_PAR_SWEEP = {"by_mode": {}}
+# `/inference/estimate-parallel-sweep`: the panel's default card priced at
+# every GPU count of the ladder, at the default context — the counts and the
+# card Context × Batch may offer (it offers no card the sweep did not price).
+_PAR_POINTS = [{"x": x, "context": 4096, "feasible": True,
+                "parallel": {"tp_attention": x}} for x in (1, 2, 4, 8, 16, 32, 64, 128)]
+_PAR_SWEEP = {"by_mode": {m: {"moe_enabled": True, "series": [
+    {"gpu_sku": "B200", "points": _PAR_POINTS}]} for m in ("dp_ep", "cp_ep", "tp_ep", "tp_tp")}}
 # `/inference/estimate-sweep/frontier`: two compared rows at the trade-off
 # chart's default context (16K), each a line over two batch points; row 1's
 # batch-1 point is on the envelope and on the max-batch front.
@@ -93,20 +99,66 @@ _COMPARE_FRONTS = {
     },
 }
 # `/inference/parallel-sweep/frontier`: one card's line through two points
-# of its decode cloud, and the values each hold control offers.
+# of its throughput cloud, and the values each hold control offers. A point
+# carries BOTH phases — the decode rung it is and the prefill of the same
+# deployment, which runs one request whatever the rung.
 _FRONTIER_VIEW_PT = {"tok_s_per_user": 50.0, "tok_s_per_gpu": 4000.0, "tpot_s": 0.02,
                      "batch": 64, "layout": "EP8·DP8", "num_gpus": 8,
                      "gpu_sku": "B200", "mode": "dp_ep", "x": 8, "concurrent_requests": 512,
-                     "batch_key": "b64",
+                     "batch_key": "b64", "context": 4096,
+                     "prefill_tok_s_per_user": 120000.0,
+                     "prefill_tok_s_per_gpu": 15000.0,
+                     "prefill_batch": 1, "prefill_t_s": 0.034,
+                     "decode_coverage": None, "prefill_coverage": None,
                      "parallel": {"dp_attention": 8, "ep_moe": 8}}
-_FRONTIER_VIEW = {
-    "series": [{"group": {"gpu_sku": "B200"}, "frontier": [
-        _FRONTIER_VIEW_PT,
-        {**_FRONTIER_VIEW_PT, "tok_s_per_user": 90.0, "tok_s_per_gpu": 900.0,
-         "batch": 8, "concurrent_requests": 64, "batch_key": "b8"}]}],
-    "values": {"gpu_sku": ["B200"], "mode": ["dp_ep", "tp_tp"],
-               "num_gpus": [8], "batch_key": ["b8", "b64"]},
+# One card's dp_ep line through two points (a front, or a line along X: the
+# stub answers every form with both). Prefill is the same on both rungs,
+# which is the fact the cloud derives "vs batch is no view of it" from.
+_FRONTIER_LINE = [
+    _FRONTIER_VIEW_PT,
+    {**_FRONTIER_VIEW_PT, "tok_s_per_user": 90.0, "tok_s_per_gpu": 900.0,
+     "batch": 8, "concurrent_requests": 64, "batch_key": "b8"}]
+#: What `frontier.view_forms` answers for a cloud like this one: every form
+#: of decode, and of prefill every form but the decode batch.
+_FRONTIER_FORMS = {
+    "decode": {"frontier": None, "num_gpus": None, "batch": None, "context": None},
+    "prefill": {"frontier": None, "num_gpus": None, "context": None,
+                "batch": "prefill does not move with batch here: every point "
+                         "of it is the same at every batch"},
 }
+_FRONTIER_AXES = {
+    "decode": {"sol": ["tok_s_per_user", "tok_s_per_gpu"],
+               "measured": ["tok_s_per_user_measured", "tok_s_per_gpu_measured"],
+               "partial": ["tok_s_per_user_partial", "tok_s_per_gpu_partial"],
+               "coverage": "decode_coverage"},
+    "prefill": {"sol": ["prefill_tok_s_per_user", "prefill_tok_s_per_gpu"],
+                "measured": ["prefill_tok_s_per_user_measured",
+                             "prefill_tok_s_per_gpu_measured"],
+                "partial": ["prefill_tok_s_per_user_partial",
+                            "prefill_tok_s_per_gpu_partial"],
+                "coverage": "prefill_coverage"},
+}
+
+
+def _frontier_view(phase: str = "decode", points=None) -> dict:
+    """The view the server would answer for `phase`: the same series and
+    controls, the phase's own axis fields, and what the cloud can answer."""
+    line = _FRONTIER_LINE if points is None else points
+    return {
+        "series": [{"group": {"gpu_sku": "B200", "mode": "dp_ep"},
+                    "frontier": line, "points": line}],
+        "values": {"gpu_sku": ["B200"], "mode": ["dp_ep", "tp_tp"],
+                   "num_gpus": [8], "context": [4096], "batch_key": ["b8", "b64"],
+                   "draft_tokens": [0], "acceptance": [1.0], "ep_load_factor": [1.0]},
+        "dims": ["mode", "num_gpus", "gpu_sku", "context", "batch_key",
+                 "draft_tokens", "acceptance", "ep_load_factor"],
+        "phase": phase,
+        "axes": _FRONTIER_AXES[phase],
+        "forms": _FRONTIER_FORMS,
+    }
+
+
+_FRONTIER_VIEW = _frontier_view()
 _GALLERY_MODEL = {
     "family": "deepseek", "total_params": 671e9, "active_params": 37e9, "is_moe": True,
     "release_date": "2024-12-26",
@@ -915,50 +967,281 @@ def _sweep_link() -> str:
             f"&s={enc}")
 
 
-def test_decode_frontier_is_a_view_the_backend_draws_of_the_sweep(browser_base):
-    """The Scaling panel's decode Pareto frontier asks the backend for a view
-    of the parallel sweep it shows (the same body, so the same cache entry):
-    a hold control adds each ticked value to `fix` (several of one dimension
-    at once), the lines control picks `group_by`; the page draws what comes
-    back and computes no front."""
+def open_pick(s: Session, control: str) -> None:
+    """Open one of the Decode section's multi-selects (`MultiPick`).
+
+    Its rows live in a popover, so they exist only while it is open; the
+    trigger is clicked at its top-left corner because the middle of it
+    carries the held values' chips, each with a × that removes one."""
+    if not s.page.is_visible(f"#{control} [data-pick-panel]"):
+        s.page.click(f"#{control} summary", position={"x": 10, "y": 8})
+    s.page.wait_for_selector(f"#{control} [data-pick-panel]", timeout=10000)
+
+
+def test_throughput_charts_are_views_the_backend_draws_of_one_cloud(browser_base):
+    """The Scaling panel's Throughput section asks the backend for views of
+    the parallel sweep it shows (the same SOL body, every context, so the
+    same cache entry). It first asks what the cloud serves at the section's
+    context (max-batch lines per card × mode), once; each form's default
+    holds and lines are read off that — Pareto (the form it opens on) the
+    context and Plan's card, a line per mode; vs GPUs the context at the
+    max batch in the first mode that serves, a line per card; vs batch a
+    card, mode and GPU count that serve, a line per context — and a hold
+    the reader ticks survives a form switch. Each switch asks one view: no request depends
+    on its own answer. The page draws what comes back and computes no line
+    or front."""
     browser, base = browser_base
     s = Session(browser, base)
-    s.goto("/inference.html#model=deepseek-ai%2FDeepSeek-V3&gpu=B200&ep=8&dp_attn=8")
     view = "/inference/parallel-sweep/frontier"
-    assert s.wait_for(lambda: s.count(view) >= 1)
-    first = s.requests[view][0]["body"]
-    # The panel's sweep body; the server reads it as the SOL answer.
+
+    def answer(route) -> None:
+        # Like the server, the answer's values follow the request's holds —
+        # here so that a default read off them would flip on every answer
+        # (a held 8 GPUs offers 4, a held 4 offers 8) and never settle —
+        # and its axes follow the phase asked for.
+        body = json.loads(route.request.post_data or "{}")
+        s.requests.setdefault(view, []).append({"body": body})
+        held = (body.get("fix") or {}).get("num_gpus")
+        answered = _frontier_view(body.get("phase") or "decode")
+        values = {**answered["values"],
+                  "num_gpus": [4] if held == [8] else [8]}
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps({**answered, "values": values}))
+
+    s.page.route(f"**{view}", answer)
+    s.goto("/inference.html#model=deepseek-ai%2FDeepSeek-V3&gpu=B200&ep=8&dp_attn=8")
+    assert s.wait_for(lambda: s.count(view) >= 2)
+    probe, first = s.requests[view][0]["body"], s.requests[view][1]["body"]
+    # The panel's SOL sweep body: every context of the routine grid.
     posted = s.requests["/inference/estimate-parallel-sweep"][-1]["body"]
     assert {**first["sweep"], "sol_only": True} == {**posted, "sol_only": True}
-    assert first["fix"] == {} and first["group_by"] == ["gpu_sku"]
+    assert len(posted["contexts"]) == 9
+    ctx = int(s.page.input_value("#infer-scaling-ctx"))
+    assert probe == {**probe, "fix": {"context": [ctx], "batch_key": ["max"]},
+                     "group_by": ["gpu_sku", "mode"], "form": "line", "x": "num_gpus"}
+    # It opens on Pareto, holding Plan's card: one card's layouts against
+    # each other, so its lines split by mode.
+    assert first["form"] == "frontier" and "x" not in first
+    assert first["fix"] == {"context": [ctx], "gpu_sku": ["B200"]}
+    assert first["group_by"] == ["gpu_sku", "mode"]
+    s.page.wait_for_timeout(1500)
+    assert s.count(view) == 2, "a view re-asked because of its own answer"
+
+    def last() -> dict:
+        return s.requests[view][-1]["body"]
+
+    def click(selector: str) -> None:
+        before = s.count(view)
+        s.page.click(selector)
+        assert s.wait_for(lambda: s.count(view) > before)
+        s.page.wait_for_timeout(1000)
+        assert s.count(view) - before <= 2, s.requests[view][before:]
+
+    def switch(form: str) -> None:
+        click(f"#infer-throughput-form-{form}")
+
+    switch("num_gpus")
+    assert last().get("x") == "num_gpus" and last()["form"] == "line"
+    assert last()["fix"] == {"context": [ctx], "batch_key": ["max"], "mode": ["dp_ep"]}
+    assert last()["group_by"] == ["gpu_sku"]
+
+    switch("batch")
+    assert last().get("x") == "batch" and last()["form"] == "line"
+    # What the cloud serves (`_frontier_view`), whatever card KV storage shows.
+    assert last()["fix"] == {"gpu_sku": ["B200"], "mode": ["dp_ep"], "num_gpus": [8]}
+    assert last()["group_by"] == ["gpu_sku", "context"]
+
+    switch("context")
+    assert last().get("x") == "context" and last()["form"] == "line"
+    # The X is the context, so the context is not held; the rung is.
+    assert last()["fix"] == {"gpu_sku": ["B200"], "mode": ["dp_ep"],
+                             "num_gpus": [8], "batch_key": ["max"]}
+
+    switch("frontier")
+    assert last()["form"] == "frontier"
+    assert "x" not in last()
+    assert last()["fix"] == {"context": [ctx], "gpu_sku": ["B200"]}
+    # One card on the chart: its lines split by mode.
+    assert last()["group_by"] == ["gpu_sku", "mode"]
+    assert last()["phase"] == "decode"
+
+    # The other phase of the same cloud: one view asked, the same holds, and
+    # the form the cloud cannot answer for it is disabled with its reason —
+    # the page keeps no rule about which phase moves with what.
+    click("#infer-throughput-phase-prefill")
+    assert last()["phase"] == "prefill"
+    assert last()["form"] == "frontier"
+    assert last()["fix"] == {"context": [ctx], "gpu_sku": ["B200"]}
+    assert s.page.is_disabled("#infer-throughput-form-batch")
+    assert "does not move with batch" in (
+        s.page.get_attribute("#infer-throughput-form-batch", "title") or "")
+    assert not s.page.is_disabled("#infer-throughput-form-context")
+    switch("context")
+    assert last() == {**last(), "phase": "prefill", "form": "line", "x": "context"}
+    click("#infer-throughput-phase-decode")
+    assert last()["phase"] == "decode" and last().get("x") == "context"
+
+    switch("frontier")
+    assert last()["form"] == "frontier"
 
     def tick(control: str, value: str) -> None:
-        box = f"#{control} input[value='{value}']"
-        if not s.page.is_visible(box):
-            s.page.click(f"#{control} summary")
-        s.page.check(box)
+        open_pick(s, control)
+        s.page.check(f"#{control} input[value='{value}']")
 
+    # Only the holds in play are controls of the row; the rest are behind
+    # Filters, and a dimension the cloud answers with ONE value is no
+    # control at all (it is said inside the drawer, not drawn as a dead
+    # "any" box). Which is which is the cloud's `values`, not a list this
+    # page keeps: here the mode and the batch are the two with a choice.
+    assert s.page.inner_text("#infer-throughput-filters [data-filters-count]") == "2"
+    assert s.page.query_selector("#infer-throughput-fix-draft_tokens") is None
+    open_pick(s, "infer-throughput-filters")
+    fixed = s.page.inner_text("#infer-throughput-filters [data-filters-fixed]")
+    assert "Draft tokens 0" in fixed and "GPU B200" in fixed
+    open_pick(s, "infer-throughput-fix-mode")
     s.page.wait_for_function(
-        "document.querySelectorAll('#infer-pareto-fix-mode input').length >= 2",
-        timeout=10000)
-    modes = s.page.eval_on_selector_all("#infer-pareto-fix-mode input",
+        'document.querySelectorAll("#infer-throughput-fix-mode input[type=checkbox]")'
+        ".length >= 2", timeout=10000)
+    modes = s.page.eval_on_selector_all("#infer-throughput-fix-mode input[type=checkbox]",
                                         "els => els.map(e => e.value)")
-    tick("infer-pareto-fix-mode", modes[0])
-    assert s.wait_for(lambda: s.requests[view][-1]["body"]["fix"] == {"mode": modes[:1]})
-    # A second value of the same dimension joins the first.
-    tick("infer-pareto-fix-mode", modes[1])
-    assert s.wait_for(lambda: s.requests[view][-1]["body"]["fix"] == {"mode": modes[:2]})
-    gpus = s.page.eval_on_selector_all("#infer-pareto-fix-num_gpus input",
-                                       "els => els.map(e => e.value)")
-    tick("infer-pareto-fix-num_gpus", gpus[0])
-    assert s.wait_for(lambda: s.requests[view][-1]["body"]["fix"]
-                      == {"mode": modes[:2], "num_gpus": [int(gpus[0])]})
-    tick("infer-pareto-lines", "batch_key")
-    assert s.wait_for(lambda: s.requests[view][-1]["body"]["group_by"]
-                      == ["gpu_sku", "batch_key"])
-    tick("infer-pareto-lines", "mode")
-    assert s.wait_for(lambda: s.requests[view][-1]["body"]["group_by"]
-                      == ["gpu_sku", "mode", "batch_key"])
+    tick("infer-throughput-fix-mode", modes[1])
+    assert s.wait_for(lambda: last()["fix"] == {"context": [ctx], "gpu_sku": ["B200"],
+                                                "mode": modes[1:2]})
+    tick("infer-throughput-lines", "batch_key")
+    assert s.wait_for(lambda: last()["group_by"] == ["gpu_sku", "mode", "batch_key"])
+    # The reader's hold and lines survive a switch; the rest are the form's
+    # — Pareto's card was a default, so vs GPUs draws every card again.
+    switch("num_gpus")
+    assert last().get("x") == "num_gpus"
+    assert last()["fix"] == {"context": [ctx], "batch_key": ["max"], "mode": modes[1:2]}
+    assert last()["group_by"] == ["gpu_sku", "mode", "batch_key"]
+    s.assert_clean()
+
+
+def test_throughput_holds_are_multi_selects_a_reader_can_see_are_multi(browser_base):
+    """Every hold of the Throughput section is a multi-select, and says so: the
+    trigger carries the held values as chips (a × apiece, two of them and
+    then a count), the popover filters when the dimension has many values
+    (every GPU), ticking a second value holds both and asks exactly one
+    view for the change, and Escape closes the popover. An empty hold is
+    "any" — the dimension is not held at all."""
+    browser, base = browser_base
+    s = Session(browser, base)
+    view = "/inference/parallel-sweep/frontier"
+    # Every card the sweep could serve, so the picker is a long list (its
+    # filter box appears past eight values); the cloud's values do not
+    # follow this request's holds, which is what the real view answers for
+    # the dimension it is asked about.
+    cards = ["A100-40G-SXM", "A100-40G-PCIe", "A100-80G-SXM", "A100-80G-PCIe",
+             "A800-80G-SXM", "H100-PCIe", "H100-SXM", "H200", "H20", "B100",
+             "B200", "B300", "GB200", "GB300", "RTX-4090"]
+
+    def answer(route) -> None:
+        s.requests.setdefault(view, []).append(
+            {"body": json.loads(route.request.post_data or "{}")})
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(
+            {**_FRONTIER_VIEW,
+             "values": {**_FRONTIER_VIEW["values"], "gpu_sku": cards}}))
+
+    s.page.route(f"**{view}", answer)
+    s.goto("/inference.html#model=deepseek-ai%2FDeepSeek-V3&gpu=B200&ep=8&dp_attn=8")
+    assert s.wait_for(lambda: s.count(view) >= 2)
+    s.page.wait_for_timeout(1200)  # the view the section opens on has settled
+
+    gpu = "infer-throughput-fix-gpu_sku"
+    rows = f"#{gpu} input[type=checkbox]"
+    # Closed, the control is one trigger: no row is in the page.
+    assert s.page.locator(rows).count() == 0
+    assert s.page.get_attribute(f"#{gpu} summary", "aria-expanded") == "false"
+    open_pick(s, gpu)
+    assert s.page.get_attribute(f"#{gpu} summary", "aria-expanded") == "true"
+    assert s.page.locator(rows).count() == len(cards)
+    s.page.fill(f"#{gpu} input[type=text]", "h1")
+    assert s.wait_for(lambda: s.page.locator(rows).count() == 2)
+    assert s.page.eval_on_selector_all(
+        rows, "els => els.map(e => e.value)") == ["H100-PCIe", "H100-SXM"]
+    s.page.fill(f"#{gpu} input[type=text]", "")
+    assert s.wait_for(lambda: s.page.locator(rows).count() == len(cards))
+
+    def held() -> list | None:
+        return (s.requests[view][-1]["body"].get("fix") or {}).get("gpu_sku")
+
+    # Pareto opens holding Plan's card; ticking two more holds all three,
+    # one view asked per tick, and the popover stays open for the next.
+    before = s.count(view)
+    s.page.check(f"#{gpu} input[value='H100-SXM']")
+    assert s.wait_for(lambda: held() == ["B200", "H100-SXM"])
+    s.page.check(f"#{gpu} input[value='H200']")
+    assert s.wait_for(lambda: held() == ["B200", "H100-SXM", "H200"])
+    s.page.wait_for_timeout(1200)
+    assert s.count(view) - before == 2, s.requests[view][before:]
+    assert s.page.is_visible(f"#{gpu} [data-pick-panel]")
+    trigger = s.page.inner_text(f"#{gpu} summary")
+    assert "B200" in trigger and "H100-SXM" in trigger and "+1" in trigger
+    s.page.keyboard.press("Escape")
+    assert s.wait_for(lambda: not s.page.is_visible(f"#{gpu} [data-pick-panel]"))
+
+    # A chip's × drops that card — one more view, and the click does not
+    # open the popover it sits in.
+    at = s.count(view)
+    s.page.click(f"#{gpu} summary button[aria-label='Remove H100-SXM']")
+    assert s.wait_for(lambda: held() == ["B200", "H200"])
+    s.page.wait_for_timeout(1000)
+    assert s.count(view) - at == 1, s.requests[view][at:]
+    assert not s.page.is_visible(f"#{gpu} [data-pick-panel]")
+
+    # Cleared, the dimension is not held: every card the cloud serves.
+    open_pick(s, gpu)
+    s.page.click(f"#{gpu} [data-pick-clear]")
+    assert s.wait_for(lambda: held() is None)
+    s.assert_clean()
+
+
+def test_a_dimension_the_cloud_gives_a_choice_on_is_a_control(browser_base):
+    """Whether a cloud dimension gets a picker is read off the cloud's own
+    `values`, not a list this page keeps: one value is nothing to pick and
+    is stated inside Filters; two or more make it a control again.
+
+    The speculative knobs are the case that matters — a plain decode sweep
+    answers one draft-token count, so eight "any" boxes used to sit in the
+    row with nothing behind them. Here the same cloud answers two, and the
+    picker is back."""
+    browser, base = browser_base
+    s = Session(browser, base)
+    view = "/inference/parallel-sweep/frontier"
+    drafted = _frontier_view()
+    drafted = {**drafted,
+               "values": {**drafted["values"], "draft_tokens": [0, 4]}}
+
+    def answer(route) -> None:
+        s.requests.setdefault(view, []).append(
+            {"body": json.loads(route.request.post_data or "{}")})
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(drafted))
+
+    s.page.route(f"**{view}", answer)
+    s.goto("/inference.html#model=deepseek-ai%2FDeepSeek-V3&gpu=B200&ep=8&dp_attn=8")
+    assert s.wait_for(lambda: s.count(view) >= 2)
+    s.page.wait_for_selector("#infer-throughput-filters", timeout=15000)
+    # Three dimensions with a choice and none of them held: mode, batch and
+    # now the draft tokens.
+    assert s.wait_for(lambda: s.page.inner_text(
+        "#infer-throughput-filters [data-filters-count]") == "3")
+    open_pick(s, "infer-throughput-filters")
+    assert s.page.query_selector("#infer-throughput-fix-draft_tokens") is not None
+    fixed = s.page.inner_text("#infer-throughput-filters [data-filters-fixed]")
+    assert "Draft tokens" not in fixed and "Acceptance 1" in fixed
+    # Holding one takes it out of the drawer and into the row, where the
+    # title says it — but not while the drawer the click landed in is open.
+    open_pick(s, "infer-throughput-fix-draft_tokens")
+    s.page.check("#infer-throughput-fix-draft_tokens input[value='4']")
+    assert s.wait_for(lambda: (s.requests[view][-1]["body"].get("fix") or {})
+                      .get("draft_tokens") == [4])
+    s.page.keyboard.press("Escape")
+    assert s.wait_for(lambda: s.page.query_selector(
+        "#infer-throughput-fix-draft_tokens") is not None)
+    assert s.page.inner_text(
+        "#infer-throughput-filters [data-filters-count]") == "2"
     s.assert_clean()
 
 
@@ -1184,9 +1467,7 @@ def test_inference_scaling_ngpu_hides_infeasible_degrees(browser_base):
     degrees on that SKU — infeasible rungs drop off the dropdown."""
     feasible = {4, 8, 16}
     points = [
-        {"x": x, "feasible": x in feasible,
-         "prefill_tps_per_gpu": 1000 if x in feasible else None,
-         "decode_tps_per_gpu": 100 if x in feasible else None}
+        {"x": x, "context": 4096, "feasible": x in feasible,}
         for x in (2, 4, 8, 16, 32, 64, 128)
     ]
     blob = {"moe_enabled": True, "series": [{"gpu_sku": "B200", "points": points}]}
@@ -1210,8 +1491,7 @@ def test_inference_scaling_ngpu_says_why_no_degree_fits(browser_base):
     """A swept SKU with no feasible degree offers no GPU count and says the
     backend's reason, instead of offering a default rung that does not fit."""
     reason = "weights (900.00 GiB) exceed usable HBM."
-    points = [{"x": x, "feasible": False, "reason": reason,
-               "prefill_tps_per_gpu": None, "decode_tps_per_gpu": None}
+    points = [{"x": x, "context": 4096, "feasible": False, "reason": reason}
               for x in (2, 4, 8, 16)]
     blob = {"moe_enabled": True, "series": [{"gpu_sku": "B200", "points": points}]}
     browser, base = browser_base
@@ -1239,52 +1519,66 @@ def test_inference_scaling_ctx_options_are_the_backend_grid(browser_base):
     s.assert_clean()
 
 
-def test_inference_scaling_measured_line_breaks_where_unmeasured(browser_base):
-    """The measured track never borrows the SOL value: at a degree with no
-    measured rate the hover lists the SOL line only."""
-    def pt(x, meas):
-        # A measured rate is drawn only at complete coverage (`measured.ts`).
-        cov = {"measured": 10, "total": 10} if meas is not None else {"measured": 0, "total": 10}
-        return {"x": x, "feasible": True, "prefill_tps_per_gpu": 1000, "decode_tps_per_gpu": 100,
-                "prefill_tps_per_gpu_measured": meas, "decode_tps_per_gpu_measured": meas,
-                "prefill_measured_coverage": cov, "decode_measured_coverage": cov}
-    blob = {"moe_enabled": True, "series": [
-        {"gpu_sku": "B200", "points": [pt(2, 80), pt(4, None), pt(8, 60)]}]}
-    browser, base = browser_base
-    s = Session(browser, base, overrides={
-        "/inference/estimate-parallel-sweep": {
-            "by_mode": {m: blob for m in ("dp_ep", "cp_ep", "tp_ep", "tp_tp")},
-        },
-    })
+def prefill_measured_session(browser, base, points):
+    """The Scaling panel showing Prefill vs GPUs with Measured ticked, over
+    canned cloud points: prefill is a value ON the throughput cloud's
+    points, so its measured track rides beside SOL there and nowhere else."""
+    view = "/inference/parallel-sweep/frontier"
+    s = Session(browser, base, overrides={view: _frontier_view("prefill", points)})
     s.goto("/inference.html")
-    s.page.wait_for_selector("#infer-par-measured", timeout=15000)
-    s.page.check("#infer-par-measured")
-    s.page.wait_for_selector("#infer-scaling canvas", timeout=15000)
-    s.page.wait_for_timeout(500)
-    canvas = s.page.query_selector_all("#infer-scaling canvas")[0]
+    s.page.wait_for_selector("#infer-throughput-measured", timeout=15000)
+    s.page.check("#infer-throughput-measured")
+    s.page.click("#infer-throughput-phase-prefill")
+    s.page.click("#infer-throughput-form-num_gpus")
+    s.page.wait_for_selector("#infer-throughput canvas", timeout=15000)
+    s.page.wait_for_selector("#infer-scaling [data-measured-rule]", timeout=5000)
+    s.page.wait_for_timeout(600)
+    return s
+
+
+def prefill_point(n, meas, cov):
+    """One cloud point at `n` GPUs: its SOL prefill rate, the measured one
+    the fold may have written beside it, and the step's coverage."""
+    return {**_FRONTIER_VIEW_PT, "num_gpus": n, "x": n,
+            "prefill_tok_s_per_gpu": 1000.0, "prefill_tok_s_per_user": 1000.0 * n,
+            "prefill_tok_s_per_gpu_measured": meas,
+            "prefill_t_measured_s": None if meas is None else 0.04,
+            "prefill_coverage": cov}
+
+
+def prefill_tooltip(s, i, of):
+    """The hover over the i-th of `of` GPU counts on the prefill line."""
+    canvas = s.page.query_selector_all("#infer-throughput canvas")[0]
+    # The chart sits below the fold on this page: a mouse move is in
+    # viewport coordinates, so it must be on screen to land on the plot.
+    canvas.scroll_into_view_if_needed()
+    s.page.wait_for_timeout(200)
     box = canvas.bounding_box()
-    # Grid is left 56 / right 20; three categories, boundaryGap false → x=4
-    # sits mid-grid.
-    x_of = lambda i: box["x"] + 56 + (box["width"] - 76) * i / 2
-    y = box["y"] + box["height"] / 2
+    x = box["x"] + 56 + (box["width"] - 76) * i / (of - 1)
+    s.page.mouse.move(x, box["y"] + box["height"] / 2)
+    assert s.wait_for(lambda: s.page.evaluate(
+        "() => [...document.querySelectorAll('#infer-throughput div')].some(d => "
+        "d.style && d.style.position === 'absolute' && /GPUs = /.test(d.innerText))"))
+    return s.page.evaluate(
+        "() => [...document.querySelectorAll('#infer-throughput div')]"
+        ".filter(d => d.style && d.style.position === 'absolute' && /GPUs = /.test(d.innerText))"
+        ".map(d => d.innerText).join('\\n')")
 
-    def tooltip_at(i):
-        s.page.mouse.move(x_of(i), y)
-        expected = f"EP = {[2, 4, 8][i]}"
-        assert s.wait_for(lambda: s.page.evaluate(
-            "() => [...document.querySelectorAll('#infer-scaling div')].some(d => "
-            "d.style && d.style.position === 'absolute' "
-            f"&& d.innerText.includes('{expected}'))"))
-        return s.page.evaluate(
-            "() => [...document.querySelectorAll('#infer-scaling div')]"
-            ".filter(d => d.style && d.style.position === 'absolute' && /EP = /.test(d.innerText))"
-            ".map(d => d.innerText).join('\\n')")
 
-    measured_at_2 = tooltip_at(0)
-    assert "B200 · measured" in measured_at_2, measured_at_2
-    unmeasured_at_4 = tooltip_at(1)
-    assert "EP = 4" in unmeasured_at_4, unmeasured_at_4
-    assert "B200 · measured" not in unmeasured_at_4, unmeasured_at_4
+def test_inference_scaling_measured_line_breaks_where_unmeasured(browser_base):
+    """The measured track never borrows the SOL value: at a GPU count with
+    no measured rate the hover lists the SOL line only."""
+    full = {"measured": 10, "total": 10}
+    none = {"measured": 0, "total": 10}
+    browser, base = browser_base
+    s = prefill_measured_session(browser, base, [
+        prefill_point(2, 80, full), prefill_point(4, None, none),
+        prefill_point(8, 60, full)])
+    at2 = prefill_tooltip(s, 0, 3)
+    assert "· measured" in at2, at2
+    at4 = prefill_tooltip(s, 1, 3)
+    assert "GPUs = 4" in at4, at4
+    assert "· measured" not in at4, at4
     s.assert_clean()
 
 
@@ -1312,31 +1606,37 @@ def test_inference_scaling_dropdown_roundtrip_hits_frontend_cache(browser_base):
 
 def test_inference_scaling_measured_toggle_asks_only_the_measured_answer(browser_base):
     """A sweep's SOL answer is drawn first (`sol_only`); ticking Measured asks
-    each sweep's measured answer once — the same body without `sol_only` —
-    and re-posts no SOL body (the tab holds it). Unticking asks nothing."""
+    the parallel sweep's measured answer once — the same body without
+    `sol_only`, for the context on screen alone: its SOL answer prices every
+    context, a measured one is read live — and re-posts no SOL body (the tab
+    holds it). The Context × Batch sweep draws KV storage, a capacity fact
+    with no step time, so it is never asked for a measured answer at all.
+    Unticking asks nothing."""
     browser, base = browser_base
     s = Session(browser, base)
     s.goto("/inference.html")
     assert s.wait_for(lambda: s.count("/inference/estimate-sweep") >= 1), "Scaling sweep never fired"
-    s.page.wait_for_selector("#infer-scaling-measured", timeout=15000)
+    s.page.wait_for_selector("#infer-throughput-measured", timeout=15000)
     s.page.wait_for_timeout(800)
-    paths = ("/inference/estimate-sweep", "/inference/estimate-parallel-sweep")
+    par = "/inference/estimate-parallel-sweep"
+    kv = "/inference/estimate-sweep"
     bodies = lambda p: [r["body"] for r in s.requests.get(p, [])]
-    for p in paths:
+    for p in (kv, par):
         assert bodies(p) and all(b.get("sol_only") is True for b in bodies(p)), p
-    before = {p: s.count(p) for p in paths}
-    s.page.check("#infer-scaling-measured")
-    s.page.check("#infer-par-measured")
+    before = {p: s.count(p) for p in (kv, par)}
+    s.page.check("#infer-throughput-measured")
     s.page.wait_for_timeout(1000)
-    for p in paths:
-        new = bodies(p)[before[p]:]
-        assert len(new) == 1 and "sol_only" not in new[0], (p, new)
-        assert {**new[0], "sol_only": True} == bodies(p)[before[p] - 1], p
-    after = {p: s.count(p) for p in paths}
-    s.page.uncheck("#infer-scaling-measured")
-    s.page.uncheck("#infer-par-measured")
+    fresh = bodies(par)[before[par]:]
+    assert len(fresh) == 1 and "sol_only" not in fresh[0], fresh
+    sol = bodies(par)[before[par] - 1]
+    ctx = int(s.page.input_value("#infer-scaling-ctx"))
+    assert fresh[0]["contexts"] == [ctx] and ctx in sol["contexts"]
+    assert {**fresh[0], "sol_only": True} == {**sol, "contexts": [ctx]}
+    assert s.count(kv) == before[kv], "KV storage asked for a measured answer"
+    after = {p: s.count(p) for p in (kv, par)}
+    s.page.uncheck("#infer-throughput-measured")
     s.page.wait_for_timeout(1000)
-    assert {p: s.count(p) for p in paths} == after, "unticking asked again"
+    assert {p: s.count(p) for p in (kv, par)} == after, "unticking asked again"
     s.assert_clean()
 
 
@@ -1927,11 +2227,11 @@ def test_kernel_bench_draws_one_utilization_chart_per_op(browser_base):
 @pytest.mark.parametrize("selection, ticked", [("latest", True), ("theoretical_only", True),
                                                ("latest", False)])
 def test_scaling_tab_cache_holds_sol_answers_only(browser_base, selection, ticked):
-    """Switching the Scaling context back to one already drawn: its SOL
-    answer is served from the tab whatever the mode (it reads no
-    measurements); its measured answer, while Measured is ticked and the
-    mode reads measurements, is asked of the server again — what Kernel
-    Bench holds may have changed since (docs/auto_sweep.md §7.5)."""
+    """Switching the Scaling context: the SOL answer prices every context,
+    so it is never asked again whatever the mode (it reads no measurements);
+    the measured answer, while Measured is ticked and the mode reads
+    measurements, is asked of the server for the context on screen — what
+    Kernel Bench holds may have changed since (docs/auto_sweep.md §7.5)."""
     browser, base = browser_base
     s = Session(browser, base)
     s.goto("/inference.html#model=deepseek-ai%2FDeepSeek-V3&gpu=B200&ep=8&dp_attn=8"
@@ -1939,7 +2239,7 @@ def test_scaling_tab_cache_holds_sol_answers_only(browser_base, selection, ticke
     path = "/inference/estimate-parallel-sweep"
     assert s.wait_for(lambda: s.count(path) >= 1)
     if ticked:
-        s.page.check("#infer-par-measured")
+        s.page.check("#infer-throughput-measured")
     s.page.wait_for_timeout(800)
     first = s.requests[path][-1]["body"]
     assert first["selection_mode"] == selection
@@ -1949,7 +2249,12 @@ def test_scaling_tab_cache_holds_sol_answers_only(browser_base, selection, ticke
     b = next(str(c) for c in SCALING_CONTEXTS if str(c) != a)
     n = s.count(path)
     s.page.select_option("#infer-scaling-ctx", b)
-    assert s.wait_for(lambda: s.count(path) == n + (2 if measured else 1))
+    if measured:
+        assert s.wait_for(lambda: s.count(path) == n + 1)
+        assert s.requests[path][-1]["body"]["contexts"] == [int(b)]
+    else:
+        s.page.wait_for_timeout(1000)
+        assert s.count(path) == n, "the SOL answer was asked again for a context it has"
     n = s.count(path)
     s.page.select_option("#infer-scaling-ctx", a)
     s.page.wait_for_timeout(1000)
@@ -1957,7 +2262,7 @@ def test_scaling_tab_cache_holds_sol_answers_only(browser_base, selection, ticke
     assert not any(x.get("sol_only") for x in back), "the SOL answer was asked again"
     assert len(back) == (1 if measured else 0), back
     if measured:
-        assert back[0]["context_len"] == int(a)
+        assert back[0]["contexts"] == [int(a)]
     s.assert_clean()
 
 

@@ -138,6 +138,20 @@ for _phase in ("prefill", "decode"):
             "leaf, so a re-read can key the row by the output it walks")
 for _phase in ("prefill", "decode"):
     ADDED[f"phases.{_phase}.binding.s_pairs"] = _PAIRS
+# The rate ONE request sees, stated once by the phase that owns the
+# throughput, beside the tokens of the step that belong to that request.
+# Every consumer of a per-request rate used to divide tokens by a time of
+# its own: the cloud's prefill axis did it, and so did the Compare page —
+# two roads to one number, which is the second producer this payload
+# exists to prevent. `phase_throughput` names it; `frontier._phase_rates`
+# reads it and takes no quotient.
+_PER_REQUEST = ("the rate one request sees, named once by the phase "
+                "(`phases.phase_throughput`), so no reader divides tokens "
+                "by a time it picked itself")
+for _phase in ("prefill", "decode"):
+    ADDED[f"phases.{_phase}.throughput.sol.per_request"] = _PER_REQUEST
+    ADDED[f"phases.{_phase}.throughput.tokens_per_request_step"] = _PER_REQUEST
+
 for _phase in ("prefill", "decode"):
     for _field in ("t_partial_s", "partial_measured_share", "throughput.partial"):
         ADDED[f"phases.{_phase}.{_field}"] = (

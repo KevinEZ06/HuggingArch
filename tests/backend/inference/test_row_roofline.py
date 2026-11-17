@@ -173,7 +173,7 @@ class TestTheSecondCardIsPricedByTheSameLoop(unittest.TestCase):
     row — the same `price_collective` and the same `act_dtype` lookup."""
 
     def test_stamped_rows_equal_a_direct_estimate(self):
-        from backend.inference.parallel_sweep import _estimate_layout
+        from tests.sweep_parity import layout_at
         from backend.inference.capacity import estimate_capacity
         config = _config("Qwen__Qwen3-8B")
         parallel = ParallelConfig(tp_attention=2, tp_dense_ffn=2)
@@ -184,7 +184,7 @@ class TestTheSecondCardIsPricedByTheSameLoop(unittest.TestCase):
                       parallel=parallel, num_gpus=2,
                       avg_input_tokens=1024, avg_output_tokens=128,
                       prefill_batch_size=1, decode_batch_size=8)
-        stamped = _estimate_layout({**common, "gpu_skus": ["H100-SXM", "A100-80G-SXM"]})
+        stamped = layout_at({**common, "gpu_skus": ["H100-SXM", "A100-80G-SXM"]})
         direct = estimate_capacity(gpu_sku="A100-80G-SXM", **common)
         for key in ("per_op_timing", "per_op_timing_decode"):
             got = {r["aggregation_id"]: r for r in stamped["A100-80G-SXM"]["sol"][key]}
@@ -278,13 +278,13 @@ class TestAPipelineStepReadElsewhere(unittest.TestCase):
 
     def test_another_card_is_an_estimate_on_that_card(self):
         """The sweep's points: one walk, every card re-priced from it."""
-        from backend.inference.parallel_sweep import _estimate_layout
+        from tests.sweep_parity import layout_at
         stem = "Qwen__Qwen3-30B-A3B"
         common = dict(config=_config(stem), resolved=_resolved(stem),
                       parallel=ParallelConfig(pp=2), num_gpus=2,
                       avg_input_tokens=2048, avg_output_tokens=256,
                       prefill_batch_size=4, decode_batch_size=16)
-        swept = _estimate_layout({**common,
+        swept = layout_at({**common,
                                   "gpu_skus": ["H100-SXM", "A100-80G-SXM"]})
         direct = _pp_estimate(stem, 4, gpu_sku="A100-80G-SXM")
         direct_decode = _pp_estimate(stem, 16, gpu_sku="A100-80G-SXM")
@@ -353,8 +353,8 @@ class TestAWithheldStepStaysWithheld(unittest.TestCase):
                              anchor["time_unpublished_reason"])
 
     def test_the_sweep_withholds_on_the_card_without_room(self):
-        from backend.inference.parallel_sweep import _estimate_layout
-        swept = _estimate_layout({**self._common(),
+        from tests.sweep_parity import layout_at
+        swept = layout_at({**self._common(),
                                   "gpu_skus": ["H100-SXM", "H200"]})
         h100, h200 = swept["H100-SXM"]["sol"], swept["H200"]["sol"]
         self.assertTrue(h100["infeasibility_reason"])

@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState,
+  type ChangeEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import type { EChartsOption, EChartsType } from "echarts";
 import { AXIS, HaChart, interactiveBits } from "../charts/HaChart";
 import { ApiError, fetchJson, isAbort, stillComputingNote } from "../api";
@@ -6,7 +7,7 @@ import { ComputeProgress } from "../ProgressBar";
 import { fetchSweepCached, isTheory, readSweepCache, solOnly } from "../sweepCache";
 import { binaryUnit, fmtCompact, fmtSeqLabel, formatGiB } from "../format";
 import { legendRows, useWidth } from "../charts/useWidth";
-import { SPEC_PRESETS, SWEEP_BATCH_GRID, SWEEP_COLORS, SWEEP_OUTPUT_TOKENS, SWEEP_SEQ_LENS } from "../compare";
+import { DEFAULT_PREFILL_CHUNK_SIZE, SCALING_PANEL_BATCH_GRID, SPEC_PRESETS, SWEEP_COLORS, SWEEP_OUTPUT_TOKENS, SWEEP_SEQ_LENS } from "../compare";
 import { precisionBody } from "../precision";
 import {
   PAR_SWEEP_MODES,
@@ -17,7 +18,7 @@ import {
 import { gpuOptionLabel, skuOf } from "../gpu";
 import type { Calibration, GpuItem } from "./PlanCard";
 import { FrontierChart, type FrontierPt, type FrontierSeries } from "./GalleryCharts";
-import { coverageText, isComplete, phaseCoverage, stateCounts, type MeasuredCoverage, type MeasuredPhase } from "../measured";
+import { coverageText, isComplete, stateCounts, type MeasuredCoverage, type MeasuredPhase } from "../measured";
 
 /** Viridis re-sampled at 9 stops for the sweep's 9 contexts; paired with a
  *  distinct line symbol per series so adjacent stops stay distinguishable. */
@@ -91,11 +92,19 @@ type LineSeries = {
   /** `v` is NaN where this track has no value: a measured line breaks there.
    *  `cov` (on a SOL point) is the measured coverage where the measured
    *  point is not drawn, for the hover. */
-  points: Array<{ x: number; v: number; b?: number | null; t?: number | null; cov?: string }>;
+  points: Array<{
+    x: number; v: number; b?: number | null; t?: number | null; cov?: string;
+    /** A line of hover text naming what the point is (its layout, context). */
+    note?: string;
+    /** The cloud point a click applies. */
+    src?: unknown;
+  }>;
 };
 
 type ParPoint = {
   x: number;
+  /** The context this point is priced at (the sweep prices every one). */
+  context?: number;
   /** The deployment this point is (`ParallelConfig.to_dict`). */
   parallel?: Partial<Parallel>;
   /** Axes the layout splits fewer ways than asked; their other ranks hold copies. */
@@ -105,30 +114,24 @@ type ParPoint = {
   reason?: string | null;
   /** Backend's error when this layout could not be estimated at all. */
   error?: string;
-  prefill_tps_per_gpu?: number | null;
-  decode_tps_per_gpu?: number | null;
-  prefill_tps_per_gpu_measured?: number | null;
-  decode_tps_per_gpu_measured?: number | null;
-  /** Hover facts beside a throughput point: the batch the phase ran at and
-    * its step time (t follows the SOL/measured source toggle). */
-  prefill_batch_per_gpu?: number | null;
-  decode_batch_per_gpu?: number | null;
-  prefill_t_sol_s?: number | null;
-  decode_t_sol_s?: number | null;
-  prefill_t_measured_s?: number | null;
-  decode_t_measured_s?: number | null;
-  /** Each phase's measured coverage: the measured rate and time are drawn
-   *  only where it is complete. */
-  prefill_measured_coverage?: MeasuredCoverage | null;
-  decode_measured_coverage?: MeasuredCoverage | null;
   /** The request at this context runs past the model's published context. */
   beyond_max_context?: boolean;
   max_context_tokens?: number | null;
 };
-/** One point of the sweep's decode cloud: a layout of a mode on a card at
- *  one per-GPU decode batch (`parallel_sweep.decode_point`). */
+/** One point of the sweep's throughput cloud: a layout of a mode on a card
+ *  at one context and per-GPU decode batch, carrying BOTH phases — the
+ *  decode rung it is and the prefill of the same deployment, which runs one
+ *  request whatever the rung (`point_cloud.parallel_records`). */
 type ParFrontierPt = FrontierPt & {
-  gpu_sku: string; mode: ParSweepMode; x: number; concurrent_requests: number; parallel: Partial<Parallel>;
+  gpu_sku: string; mode: ParSweepMode; x: number; context: number; batch_key: string;
+  concurrent_requests: number; parallel: Partial<Parallel>; beyond_max_context?: boolean;
+  prefill_tok_s_per_user?: number | null;
+  prefill_tok_s_per_gpu?: number | null;
+  prefill_tok_s_per_gpu_measured?: number | null;
+  prefill_batch?: number | null;
+  prefill_t_s?: number | null;
+  prefill_t_measured_s?: number | null;
+  prefill_coverage?: MeasuredCoverage | null;
 };
 type ParGpuSeries = { gpu_sku?: string; points?: ParPoint[] };
 /** What a decode point is held at or grouped by (`frontier.POINT_DIMS`). */
@@ -136,11 +139,6 @@ type CloudDim =
   | "gpu_sku" | "mode" | "num_gpus" | "context" | "batch_key"
   | "draft_tokens" | "acceptance" | "ep_load_factor";
 type CloudValue = string | number;
-/** A frontier view of the cloud (`/inference/parallel-sweep/frontier`). */
-type CloudView = {
-  series: { group: Partial<Record<CloudDim, CloudValue>>; frontier: ParFrontierPt[] }[];
-  values: Record<CloudDim, CloudValue[]>;
-};
 // `unavailable` is set when EVERY point of this mode failed to lay out (e.g. CP
 // over a recurrent mixer) — the backend
 // collapses the series and carries the reason, so the UI says "not applicable",
@@ -163,40 +161,90 @@ type LegendSelected = Record<string, boolean>;
 
 export type ScalingApply = { gpu?: string; seq?: number; batch?: number; par?: Parallel };
 
+/** Degrees whose note reads exactly the same are one row: the sentence is
+ *  said once, with every degree it holds for. Nothing here shortens or
+ *  re-words the backend's text (§2.7) — rows group by equality alone. */
+function byNote(rows: { x: number; lines: string[] }[]): { xs: number[]; lines: string[] }[] {
+  const out = new Map<string, { xs: number[]; lines: string[] }>();
+  for (const r of rows) {
+    const key = r.lines.join("\u0000");
+    const at = out.get(key);
+    if (at) at.xs.push(r.x);
+    else out.set(key, { xs: [r.x], lines: r.lines });
+  }
+  return [...out.values()].map((g) => ({ ...g, xs: [...g.xs].sort((a, b) => a - b) }));
+}
+
+/** How a run of degrees reads: the ends of the ladder past two of them. */
+function degreeRange(unit: string, xs: number[]): string {
+  if (xs.length > 2) return `${unit}${xs[0]}–${unit}${xs[xs.length - 1]}`;
+  return xs.map((x) => `${unit}${x}`).join(", ");
+}
+
 /** What the layout said about the degrees the chart does not draw: each
  *  refused degree with its reason, the degrees drawn that replicate, and the
- *  bound past which nothing was enumerated. */
+ *  bound past which nothing was enumerated.
+ *
+ *  Collapsed by default to one line that counts them and names the degrees:
+ *  the reasons are a paragraph apiece and a ladder refuses six of them at a
+ *  time, which buried the charts under a wall of amber. The detail is one
+ *  click away and unabridged. */
 function LadderNotes({ blob, unit }: { blob: ParModeBlob; unit: string }) {
-  const refused = blob.ladder?.refused || [];
+  const refused = byNote((blob.ladder?.refused || []).map(
+    (r) => ({ x: r.x, lines: [r.reason] })));
   const cap = blob.ladder?.beyond_cap;
-  const replicated = new Map<number, string[]>();
+  const seen = new Map<number, string[]>();
   for (const s of blob.series || []) {
     for (const p of s.points || []) {
-      if (p.warnings?.length) replicated.set(p.x, p.warnings);
+      if (p.warnings?.length) seen.set(p.x, p.warnings);
     }
   }
+  const replicated = byNote([...seen.entries()].map(([x, lines]) => ({ x, lines })));
   // A card none of whose points could be priced (it lists no peak for the
   // format a step computes in) draws no line: say why. The reason names the card.
   const unpriced = (blob.series || []).filter((s) =>
     (s.points || []).length > 0 && (s.points || []).every((p) => p.error));
-  if (!refused.length && !cap && !replicated.size && !unpriced.length) return null;
+  const counted = (n: number, what: string) => `${n} ${what}${n === 1 ? "" : "s"}`;
+  const degrees = (groups: { xs: number[] }[], said: (n: number) => string) => {
+    const xs = groups.flatMap((g) => g.xs).sort((a, b) => a - b);
+    return xs.length
+      ? `${counted(xs.length, "degree")} ${said(xs.length)} (${degreeRange(unit, xs)})` : "";
+  };
+  const headline = [
+    unpriced.length ? `${counted(unpriced.length, "card")} not drawn` : "",
+    degrees(refused, () => "did not hold"),
+    degrees(replicated, (n) => `replicate${n === 1 ? "s" : ""} an axis`),
+  ].filter(Boolean).join(" · ");
+  if (!headline && !cap) return null;
   return (
     <div className="mt-2 text-11 text-gray-500 space-y-0.5">
-      {unpriced.map((s) => (
-        <div key={`unpriced-${s.gpu_sku}`} data-ladder="unpriced" data-gpu={s.gpu_sku}>
-          {s.gpu_sku} not drawn: {s.points?.[0]?.error}
-        </div>
-      ))}
-      {refused.map((r) => (
-        <div key={`refused-${r.x}`} data-ladder="refused" data-x={r.x}>
-          {unit}{r.x}: this deployment does not hold — {r.reason}
-        </div>
-      ))}
-      {[...replicated.entries()].sort((a, b) => a[0] - b[0]).map(([x, ws]) => (
-        <div key={`replicated-${x}`} data-ladder="replicated" data-x={x} className="text-amber-700">
-          {unit}{x}: {ws.join(" ")}
-        </div>
-      ))}
+      {headline ? (
+        <details data-ladder-notes>
+          <summary className="cursor-pointer select-none marker:text-gray-300 hover:text-gray-700">
+            {headline} — show why
+          </summary>
+          <div className="mt-1 space-y-1 pl-4">
+            {unpriced.map((s) => (
+              <div key={`unpriced-${s.gpu_sku}`} data-ladder="unpriced" data-gpu={s.gpu_sku}>
+                {s.gpu_sku} not drawn: {s.points?.[0]?.error}
+              </div>
+            ))}
+            {refused.map((g) => (
+              <div key={`refused-${g.xs.join(",")}`} data-ladder="refused"
+                data-x={g.xs[0]} data-xs={g.xs.join(",")}>
+                {g.xs.map((x) => `${unit}${x}`).join(", ")}: this deployment does not
+                hold — {g.lines.join(" ")}
+              </div>
+            ))}
+            {replicated.map((g) => (
+              <div key={`replicated-${g.xs.join(",")}`} data-ladder="replicated"
+                data-x={g.xs[0]} data-xs={g.xs.join(",")} className="text-amber-700">
+                {g.xs.map((x) => `${unit}${x}`).join(", ")}: {g.lines.join(" ")}
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
       {cap ? (
         <div data-ladder="beyond-cap">Not swept past {cap.cap} GPUs (cap {cap.cap}).</div>
       ) : null}
@@ -225,31 +273,33 @@ function legendSelEqual(a: LegendSelected | undefined, b: LegendSelected): boole
   return true;
 }
 
-/** GPU counts the parallel sweep marked feasible on this SKU (max-decode
- *  batch > 0), within the backend's ladder. Empty when the sweep has not
- *  arrived, or this GPU has no series. */
-function feasibleDegrees(blob: ParModeBlob | null | undefined, gpuSku: string, ladder: number[]): number[] {
+/** GPU counts the parallel sweep marked feasible on this SKU at context
+ *  `ctx` (max-decode batch > 0), within the backend's ladder. Empty when the
+ *  sweep has not arrived, or this GPU has no series. */
+function feasibleDegrees(blob: ParModeBlob | null | undefined, gpuSku: string, ladder: number[], ctx: number): number[] {
   if (!blob?.series?.length) return [];
   const match = blob.series.find((s) => s.gpu_sku === gpuSku);
   if (!match) return [];
   const xs = new Set<number>();
   for (const p of match.points || []) {
-    if (p.feasible && ladder.includes(p.x)) xs.add(p.x);
+    if (p.context === ctx && p.feasible && ladder.includes(p.x)) xs.add(p.x);
   }
   return [...xs].sort((a, b) => a - b);
 }
 
 /** The GPU counts to offer. `refused` is null while there is something to
  *  offer; when the parallel sweep says nothing fits on this SKU it is the
- *  backend's reason at the largest degree it tried. */
+ *  backend's reason at the largest degree it tried, and a card the sweep
+ *  did not price is said as such — never the whole ladder offered blind. */
 function degreeOptions(
-  blob: ParModeBlob | null | undefined, gpuSku: string, ladder: number[],
+  blob: ParModeBlob | null | undefined, gpuSku: string, ladder: number[], ctx: number,
 ): { options: number[]; refused: string | null } {
   const match = blob?.series?.find((s) => s.gpu_sku === gpuSku);
-  if (!match) return { options: ladder, refused: null };
-  const options = feasibleDegrees(blob, gpuSku, ladder);
+  if (!match) return { options: [], refused: `the Parallelism sweep did not price ${gpuSku}` };
+  const options = feasibleDegrees(blob, gpuSku, ladder, ctx);
   if (options.length) return { options, refused: null };
-  const last = [...(match.points || [])].reverse().find((p) => p.reason || p.error);
+  const last = [...(match.points || [])].reverse()
+    .find((p) => p.context === ctx && (p.reason || p.error));
   return { options, refused: last?.reason || last?.error || "" };
 }
 
@@ -274,20 +324,6 @@ function fmtT(s: number): string {
   if (ms < 1) return `${ms.toFixed(2)} ms`;
   if (ms < 1000) return `${ms.toFixed(ms < 100 ? 1 : 0)} ms`;
   return `${s.toFixed(2)} s`;
-}
-
-function throughputValue(est: SweepEst | undefined, phase: "prefill" | "decode", source: "sol" | "measured"): number {
-  if (!est) return NaN;
-  const p = est.phases?.[phase] || {};
-  // A measured rate is all or nothing: none unless every op is measured.
-  if (source === "measured" && !isComplete(phaseCoverage(p))) return NaN;
-  const tp = p.throughput;
-  if (tp && typeof tp === "object") {
-    const src = source === "measured" ? tp.measured : tp.sol;
-    const v = src?.per_gpu;
-    return typeof v === "number" && v > 0 ? v : NaN;
-  }
-  return source === "sol" && typeof tp === "number" && tp > 0 ? tp : NaN;
 }
 
 /** Where a sweep's measured answer is, beside its SOL answer on screen:
@@ -345,14 +381,6 @@ function MeasuredRule() {
   );
 }
 
-/** Whether the estimates at context index `si` run past the model's
- *  published context (the backend's `beyond_max_context`; the request is
- *  the same at every batch). */
-function pastContext(by: Record<string, SweepEst[]>, si: number): boolean {
-  return Object.values(by).some((rows) => rows?.[si]?.beyond_max_context);
-}
-
-
 /** The measured answer's note while it is read, and when it failed. */
 const READING_MEASURED: MeasuredNote = { text: "reading measurements…" };
 function measuredFailed(e: unknown): MeasuredNote {
@@ -380,78 +408,6 @@ function ContextLimitNote({ limit, past }: { limit: number | null; past: number[
   );
 }
 
-/** Decode: one line per context length, X = the per-GPU decode batch, in
- *  batch order. The grid's `max` point lands on its ceiling batch (once, if
- *  that is also a ladder batch), and a ladder batch past the ceiling is not
- *  a point — its requests' cache does not fit (`capacity.point_served`).
- *  Prefill runs one request at every grid point, so it does not move with
- *  the decode batch: one line, X = context length. SOL is always present;
- *  measured is an optional same-colour dashed twin. */
-function batchSeries(
-  by: Record<string, SweepEst[]>,
-  showMeasured: boolean,
-): { pre: LineSeries[]; dec: LineSeries[] } {
-  const dec: LineSeries[] = [];
-  const twin = (base: LineSeries, meas: LineSeries["points"], into: LineSeries[]) => {
-    into.push(base);
-    if (showMeasured && meas.some((p) => Number.isFinite(p.v))) {
-      into.push({ ...base, key: `${base.key}:meas`, dashed: true, points: meas });
-    }
-  };
-  const point = (est: SweepEst | undefined, phase: "prefill" | "decode", x: number) => {
-    const sv = throughputValue(est, phase, "sol");
-    if (!Number.isFinite(sv)) return null;
-    // Beside every SOL point; NaN where not every op was measured (a gap),
-    // and the SOL point's hover says the coverage instead.
-    const mv = showMeasured ? throughputValue(est, phase, "measured") : NaN;
-    return {
-      sol: {
-        x, v: sv,
-        ...(showMeasured && !Number.isFinite(mv) ? { cov: coverageNote(phaseCoverage(est?.phases?.[phase])) } : {}),
-      },
-      meas: { x, v: mv },
-    };
-  };
-  SWEEP_SEQ_LENS.forEach((seqLen, si) => {
-    const solPts: LineSeries["points"] = [];
-    const measPts: LineSeries["points"] = [];
-    for (const bp of SWEEP_BATCH_GRID) {
-      const est = by[bp.key]?.[si];
-      const ceiling = est?.max_batch_per_gpu || 0;
-      const B = bp.key === "max" ? ceiling : (bp.decode_batch_size || 1);
-      if (B <= 0 || B > ceiling || solPts.some((p) => p.x === B)) continue;
-      const pt = point(est, "decode", B);
-      if (!pt) continue;
-      solPts.push(pt.sol);
-      measPts.push(pt.meas);
-    }
-    const order = (a: { x: number }, b: { x: number }) => a.x - b.x;
-    solPts.sort(order);
-    measPts.sort(order);
-    twin({
-      key: String(seqLen), applyKey: String(seqLen), label: fmtSeqLabel(seqLen),
-      color: VIRIDIS[si % VIRIDIS.length], symbol: SYMBOLS[si % SYMBOLS.length],
-      points: solPts,
-    }, measPts, dec);
-  });
-  const preSol: LineSeries["points"] = [];
-  const preMeas: LineSeries["points"] = [];
-  SWEEP_SEQ_LENS.forEach((seqLen, si) => {
-    // One request's cache must fit for the request to exist at all.
-    const est = by[SWEEP_BATCH_GRID[0].key]?.[si];
-    const pt = (est?.max_batch_per_gpu || 0) >= 1 ? point(est, "prefill", seqLen) : null;
-    if (!pt) return;
-    preSol.push(pt.sol);
-    preMeas.push(pt.meas);
-  });
-  const pre: LineSeries[] = [];
-  twin({
-    key: "prefill", applyKey: "prefill", label: "prefill",
-    color: VIRIDIS[0], symbol: SYMBOLS[0], points: preSol,
-  }, preMeas, pre);
-  return { pre, dec };
-}
-
 function SweepChart({
   title,
   series,
@@ -474,7 +430,7 @@ function SweepChart({
   yTitle?: string;
   /** Appended to tooltip values, e.g. " tok/s". */
   valueUnit?: string;
-  onPoint?: (s: LineSeries, p: { x: number; v: number }) => void;
+  onPoint?: (s: LineSeries, p: LineSeries["points"][number]) => void;
   /** Shared legend selection across a chart pair: toggling a series in one
    *  chart hides it in its sibling too. */
   legendSel?: LegendSelected;
@@ -488,7 +444,7 @@ function SweepChart({
     series: LineSeries[];
     xs: number[];
     hidden?: Record<string, boolean>;
-    onPoint?: (s: LineSeries, p: { x: number; v: number }) => void;
+    onPoint?: (s: LineSeries, p: LineSeries["points"][number]) => void;
     skipPlotClick?: boolean;
   }>({
     series: [],
@@ -501,7 +457,7 @@ function SweepChart({
       const [ox, oy] = [e.offsetX, e.offsetY];
       // Legend / toolbox / axis-margin clicks are not chart clicks.
       if (skipPlotClick || !fn || !axis.length || !chart.containPixel("grid", [ox, oy])) return;
-      let best: { s: LineSeries; p: { x: number; v: number }; d: number } | null = null;
+      let best: { s: LineSeries; p: LineSeries["points"][number]; d: number } | null = null;
       for (const s of ss) {
         if (hidden?.[s.label] === false) continue; // legend-toggled-off is not clickable
         for (const p of s.points) {
@@ -564,7 +520,10 @@ function SweepChart({
   // ran into the toolbox and the y-axis name on a phone: the plot gives up
   // one row of height per row the legend wraps into at this width.
   const names = legendNames(series);
-  const rows = legendRows(names, width, { iconPx: 16, gapPx: 14, charPx: 6.6 });
+  // A legend label's width at its 11px font runs past 6.6px a character
+  // for capitals and digits ("H100-SXM · TP-EP"): an estimate short of the
+  // drawn rows let the legend climb into the axis name.
+  const rows = legendRows(names, width, { iconPx: 16, gapPx: 14, charPx: 7.4 });
   const legendH = rows * 18;
   const height = 260 + legendH;
   const option: EChartsOption = {
@@ -611,7 +570,8 @@ function SweepChart({
               ? ` <span style="color:#9ca3af">(B/GPU=${p.b} · t=${fmtT(p.t)})</span>`
               : "";
             const cov = p?.cov ? `<div style="color:#9ca3af;padding-left:14px">${p.cov}</div>` : "";
-            return `<div>${it.marker ?? ""}${name}: <b>${fmtNum(v)}${valueUnit || ""}</b>${facts}</div>${cov}`;
+            const note = p?.note ? `<div style="color:#9ca3af;padding-left:14px">${p.note}</div>` : "";
+            return `<div>${it.marker ?? ""}${name}: <b>${fmtNum(v)}${valueUnit || ""}</b>${facts}</div>${note}${cov}`;
           })
           .join("");
         return head + rows;
@@ -668,32 +628,28 @@ function SweepChart({
  *  work got, while its 503s say so. */
 type SweepStatus = { text: string; failed?: boolean; progress?: { done: number; total: number } };
 
+/** Which deployments this model admits: the context every chart below is
+ *  read at, each parallel mode's ladder, and the degrees the layout refused
+ *  with their reasons. It draws no curve — every throughput of the panel,
+ *  prefill and decode alike, is a view of the one cloud
+ *  (`ThroughputSection`), so nothing here is a second producer of a
+ *  number. */
 function ParallelSection({
   ctx,
   onCtx,
   contexts,
   byMode,
   status,
-  measuredNote,
-  showMeasured,
-  onShowMeasured,
   hideEp,
-  onApply,
 }: {
   ctx: number;
   onCtx: (n: number) => void;
   contexts: number[];
   byMode: Record<string, ParModeBlob> | null;
   status: SweepStatus | null;
-  measuredNote: MeasuredNote | null;
-  showMeasured: boolean;
-  onShowMeasured: (v: boolean) => void;
   hideEp: boolean;
-  onApply?: (p: ScalingApply) => void;
 }) {
   const [mode, setMode] = useState<ParSweepMode>("dp_ep");
-  const [legendSel, setLegendSel] = useState<LegendSelected>({});
-  const [applied, setApplied] = useState("");
 
   const disabledReason = (m: ParSweepMode): string => {
     if (m !== "tp_tp") {
@@ -734,48 +690,10 @@ function ParallelSection({
       </div>
     );
   } else {
-    const num = (a: unknown): number => (typeof a === "number" && a > 0 ? a : NaN);
-    const build = (phase: "prefill" | "decode"): LineSeries[] =>
-      (blob.series || []).flatMap((s, idx) => {
-        const gpu = s.gpu_sku || `gpu-${idx}`;
-        const solKey = `${phase}_tps_per_gpu` as keyof ParPoint;
-        const measKey = `${phase}_tps_per_gpu_measured` as keyof ParPoint;
-        const bKey = `${phase}_batch_per_gpu` as keyof ParPoint;
-        const tSolKey = `${phase}_t_sol_s` as keyof ParPoint;
-        const tMeasKey = `${phase}_t_measured_s` as keyof ParPoint;
-        const covKey = `${phase}_measured_coverage` as const;
-        const color = SWEEP_COLORS[idx % SWEEP_COLORS.length];
-        // The measured track sits beside every SOL point; NaN where not
-        // every op was measured, so its line breaks there and the SOL
-        // point's hover gives the coverage.
-        const fed = (s.points || []).filter((p) => p.feasible && num(p[solKey]) > 0);
-        const complete = (p: ParPoint) => isComplete(p[covKey]);
-        const ptsOf = (vKey: keyof ParPoint, tKey: keyof ParPoint, measured: boolean) =>
-          fed.map((p) => ({
-            x: p.x,
-            v: measured && !complete(p) ? NaN : num(p[vKey]),
-            b: p[bKey] as number | null,
-            t: measured && !complete(p) ? null : p[tKey] as number | null,
-            ...(!measured && showMeasured && !complete(p) ? { cov: coverageNote(p[covKey]) } : {}),
-          }));
-        const solPts = ptsOf(solKey, tSolKey, false);
-        const out: LineSeries[] = [{
-          key: gpu, applyKey: gpu, label: gpu, color, points: solPts,
-        }];
-        if (showMeasured) {
-          const measPts = ptsOf(measKey, tMeasKey, true);
-          if (measPts.some((p) => Number.isFinite(p.v))) {
-            out.push({
-              key: `${gpu}:meas`, applyKey: gpu, label: gpu,
-              color, dashed: true, points: measPts,
-            });
-          }
-        }
-        return out;
-      });
-    const pre = build("prefill");
-    const dec = build("decode");
-    if (pre.every((s) => !s.points.length) && dec.every((s) => !s.points.length)) {
+    // The sweep prices every context; this section reads the one on screen.
+    const atCtx = (pts: ParPoint[] | undefined) => (pts || []).filter((p) => p.context === ctx);
+    const allPts = (blob.series || []).flatMap((s) => atCtx(s.points));
+    if (!allPts.some((p) => p.feasible)) {
       // Still computing: the cells that landed so far fit nothing, the rest
       // may — not a verdict yet.
       content = status
@@ -786,55 +704,20 @@ function ParallelSection({
           </div>
         );
     } else {
-      const xTitle = mode === "tp_tp" ? "TP degree (= #GPUs)" : "EP degree (= #GPUs)";
-      const xUnit = mode === "tp_tp" ? "TP" : "EP";
-      const click = (gpu: string, x: number) => {
-        const point = blob.series?.find((s) => s.gpu_sku === gpu)?.points?.find((p) => p.x === x);
-        if (point?.parallel) {
-          setApplied(`Applied: ${gpu} · ${MODE_LABEL[mode]} ${x}`);
-          onApply?.({ gpu, seq: ctx, par: parallelOf(point.parallel) });
-        }
-      };
-      content = (
-        <div className="flex gap-4 flex-wrap">
-          <SweepChart
-            title="Prefill"
-            xTitle={xTitle}
-            xUnit={xUnit}
-            yTitle="tok/s / GPU"
-            valueUnit=" tok/s"
-            series={pre}
-            onPoint={onApply ? (s, p) => click(s.applyKey, p.x) : undefined}
-            legendSel={legendSel}
-            onLegendSel={setLegendSel}
-          />
-          <SweepChart
-            title="Decode"
-            xTitle={xTitle}
-            xUnit={xUnit}
-            yTitle="tok/s / GPU"
-            valueUnit=" tok/s"
-            series={dec}
-            onPoint={onApply ? (s, p) => click(s.applyKey, p.x) : undefined}
-            legendSel={legendSel}
-            onLegendSel={setLegendSel}
-          />
-        </div>
-      );
+      content = null;
     }
     // One context for every point: if its request runs past the model's
-    // published context, every point here extrapolates — said above them.
-    const allPts = (blob.series || []).flatMap((s) => s.points || []);
+    // published context, every throughput below extrapolates — said here.
     const past = allPts.some((p) => p.beyond_max_context);
     const limit = maxContextOf(allPts);
     const pastNote = past ? (
       <div data-context-limit className="mb-2 text-11 text-amber-700">
         ctx {fmtSeqLabel(ctx)} is past the model's published max context
-        {limit ? ` (${limit.toLocaleString("en-US")} tokens)` : ""}; these throughputs
+        {limit ? ` (${limit.toLocaleString("en-US")} tokens)` : ""}; these deployments
         extrapolate beyond what the model serves.
       </div>
     ) : null;
-    content = <>{pastNote}{content}{showMeasured ? <MeasuredRule /> : null}<LadderNotes blob={blob} unit={mode === "tp_tp" ? "TP" : "EP"} /></>;
+    content = <>{pastNote}{content}<LadderNotes blob={blob} unit={mode === "tp_tp" ? "TP" : "EP"} /></>;
   }
   // Drawn from the cells that landed while the rest compute: a small note
   // in the corner says so, not a bar over the chart.
@@ -851,21 +734,18 @@ function ParallelSection({
 
   return (
     <div className="mb-6">
-      <div className="flex items-center gap-3 flex-wrap mb-3">
-        <div className="text-sm font-medium text-gray-800">Parallelism</div>
-        <label className="inline-flex items-center gap-1.5 text-xs text-gray-500">
-          ctx
-          <select
-            id="infer-scaling-ctx"
-            className="text-sm border border-gray-200 rounded-lg px-2 py-1.5 bg-white text-gray-800"
-            disabled={!contexts.length}
-            value={ctx}
-            onChange={(e) => onCtx(Number(e.target.value))}
-          >
-            {contexts.map((c) => <option key={c} value={c}>{fmtSeqLabel(c)}</option>)}
-          </select>
-        </label>
-        <div className="inline-flex rounded-lg border border-gray-200 bg-gray-50 p-0.5 text-xs">
+      <div className={`${PICK_ROW} mb-3`}>
+        <div className="text-sm font-medium text-gray-800 mr-1">Parallelism</div>
+        <OnePick
+          id="infer-scaling-ctx"
+          label="Context"
+          disabled={!contexts.length}
+          value={ctx}
+          onChange={(e) => onCtx(Number(e.target.value))}
+        >
+          {contexts.map((c) => <option key={c} value={c}>{fmtSeqLabel(c)}</option>)}
+        </OnePick>
+        <div className={SEGMENTED}>
           {PAR_SWEEP_MODES.map((m) => {
             const reason = disabledReason(m);
             const active = m === mode;
@@ -878,7 +758,7 @@ function ParallelSection({
                 title={reason || undefined}
                 onClick={() => setMode(m)}
                 className={
-                  "px-2.5 py-1 rounded-md transition-colors " +
+                  SEGMENT +
                   (reason
                     ? "text-gray-300 cursor-not-allowed"
                     : active
@@ -891,9 +771,6 @@ function ParallelSection({
             );
           })}
         </div>
-        <MeasuredCheck id="infer-par-measured" checked={showMeasured} onChange={onShowMeasured}
-          note={showMeasured ? measuredNote : null} />
-        {applied ? <div className="text-11 text-green-600">{applied}</div> : null}
       </div>
       {content}
     </div>
@@ -908,25 +785,203 @@ const MODE_LINE: Record<ParSweepMode, { lineType: "solid" | "dashed" | "dotted";
   tp_tp: { lineType: "solid", symbol: "diamond" },
 };
 
-/** The dimensions a line of the frontier chart can be one value of, beside
- *  the card (a line never mixes cards); with none picked, each card's line
- *  is its best over every layout. */
-const LINE_DIMS: CloudDim[] = ["mode", "num_gpus", "batch_key"];
-
 const LINE_TYPES = ["solid", "dashed", "dotted"] as const;
 
 /** One cloud dimension's value, as a label. */
 function cloudLabel(d: CloudDim, v: CloudValue): string {
-  if (d === "mode") return MODE_LABEL[v as ParSweepMode] ?? String(v);
+  if (d === "mode") return v === "tp1" ? "1 GPU" : MODE_LABEL[v as ParSweepMode] ?? String(v);
   if (d === "num_gpus") return `${v} GPU${v === 1 ? "" : "s"}`;
   if (d === "batch_key") return v === "max" ? "max batch" : `batch ${String(v).replace(/^b/, "")}`;
+  if (d === "context") return `ctx ${fmtSeqLabel(Number(v))}`;
   return String(v);
 }
 
-/** A dimension's multi-select: a dropdown of its values, each a checkbox;
- *  none ticked admits every value. */
+/** The one shell every control of these sections wears: a rounded trigger
+ *  with the control's name as a muted caption above its value, the same
+ *  height, radius, border and focus ring whether the control holds several
+ *  values (`MultiPick`) or exactly one (`OnePick`). */
+const PICK_SHELL = "inline-flex items-center gap-1.5 rounded-lg border bg-white pl-2.5 pr-1 h-8"
+  + " transition-colors min-w-0";
+const PICK_QUIET = "border-gray-200 hover:border-gray-300";
+/** The trigger of a control that holds something: amber, like its chips. */
+const PICK_HELD = "border-amber-200 hover:border-amber-300";
+const PICK_OPEN = "border-amber-400 ring-2 ring-amber-400/30";
+const PICK_CAPTION = "text-10 font-medium uppercase tracking-wide text-gray-400 leading-none";
+const PICK_VALUE = "flex items-center gap-1 min-w-0 min-h-[1rem] text-xs leading-tight text-gray-900";
+/** A row of these controls: they wrap, and a popover hangs below one. */
+const PICK_ROW = "flex items-center gap-1.5 flex-wrap";
+/** The row's segmented switch (one of a few forms / modes), at the pickers'
+ *  height: one choice at a time, so it is buttons and not a dropdown. */
+const SEGMENTED = "inline-flex items-center h-8 rounded-lg border border-gray-200 bg-gray-50 p-0.5 text-xs";
+const SEGMENT = "px-2.5 py-1 rounded-md transition-colors ";
+
+/** The caret every control of the row shows (the native select's own is
+ *  turned off, so one shape points one way). */
+function Caret({ up = false }: { up?: boolean }) {
+  return (
+    <svg className={`w-3 h-3 shrink-0 text-gray-400 transition-transform ${up ? "rotate-180" : ""}`}
+      viewBox="0 0 12 12" fill="none" aria-hidden="true">
+      <path d="M3 4.5 6 7.5 9 4.5" stroke="currentColor" strokeWidth="1.5"
+        strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+/** A single-valued dropdown in the multi-selects' shell: still a native
+ *  <select> — these parameterise one estimate sweep, so one value is the
+ *  whole answer — wearing the trigger the holds beside it wear. */
+function OnePick({
+  id, label, value, title, disabled, onChange, className = "", children,
+}: {
+  id: string;
+  label: string;
+  value: string | number;
+  title?: string;
+  disabled?: boolean;
+  onChange: (e: ChangeEvent<HTMLSelectElement>) => void;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <label
+      title={title}
+      className={`${PICK_SHELL} ${PICK_QUIET} cursor-pointer max-w-full`
+        + " focus-within:border-amber-400 focus-within:ring-2 focus-within:ring-amber-400/30 "
+        + className}
+    >
+      <span className="flex flex-col min-w-0 leading-tight">
+        <span className={PICK_CAPTION}>{label}</span>
+        <select
+          id={id}
+          className="appearance-none bg-transparent border-0 p-0 min-w-0 max-w-full truncate
+            text-xs leading-tight text-gray-900 cursor-pointer focus:outline-none
+            disabled:cursor-default disabled:text-gray-400"
+          disabled={disabled}
+          value={value}
+          onChange={onChange}
+        >
+          {children}
+        </select>
+      </span>
+      <Caret />
+    </label>
+  );
+}
+
+/** The popover every multi-valued control of these sections hangs below
+ *  its trigger: a `<details>` whose summary IS the trigger, closing on
+ *  Escape or a click outside, and hanging from the trigger's right edge
+ *  when it would otherwise run past the viewport (a phone, or the row's
+ *  last control). One shell, so a dimension's values and the Filters
+ *  drawer that holds the dimensions themselves open the same way. */
+function PickPopover({
+  id, label, held, title, trigger, open, onOpen, onOpened, onKeyDown,
+  panelClass = "", children,
+}: {
+  id: string;
+  label: string;
+  /** The trigger wears the held colour (amber) when it holds something. */
+  held: boolean;
+  title?: string;
+  /** What the trigger reads, inside the shell. */
+  trigger: ReactNode;
+  open: boolean;
+  onOpen: (v: boolean) => void;
+  /** The panel, once it is on screen and measured: focus, scroll. */
+  onOpened?: (panel: HTMLElement) => void;
+  onKeyDown?: (e: ReactKeyboardEvent<HTMLElement>) => void;
+  panelClass?: string;
+  children: ReactNode;
+}) {
+  const [flip, setFlip] = useState(false);
+  const root = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    if (!open) {
+      setFlip(false);
+      return;
+    }
+    // Dismissed on the CLICK outside, not its mousedown: closing this
+    // popover can move the row under the pointer (a hold promoted out of
+    // the Filters drawer), and a control that moves between a press and
+    // its release never receives the click at all — the first click
+    // outside would be spent on the dismissal.
+    const onOutside = (e: MouseEvent) => {
+      if (root.current && !root.current.contains(e.target as Node)) onOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      onOpen(false);
+      root.current?.querySelector<HTMLElement>("summary")?.focus();
+    };
+    document.addEventListener("click", onOutside);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("click", onOutside);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open, onOpen]);
+  // Measured on the way open: the panel's own width against the viewport.
+  useEffect(() => {
+    if (!open) return;
+    const el = root.current;
+    const panel = el?.querySelector<HTMLElement>("[data-pick-panel]");
+    if (!el || !panel) return;
+    setFlip(el.getBoundingClientRect().left + panel.offsetWidth > window.innerWidth - 8);
+    onOpened?.(panel);
+    // Once per opening: it focuses and scrolls, which a re-render must
+    // not repeat under the reader's hands.
+  }, [open]);
+  return (
+    <details
+      id={id}
+      ref={root}
+      className="relative max-w-full"
+      open={open}
+      onKeyDown={onKeyDown}
+    >
+      <summary
+        // Opened by this handler, not by the browser's own toggling: a
+        // re-render between the native toggle and its (async) `toggle`
+        // event — another popover closing on the same click, a view
+        // landing — put the element's `open` back and swallowed the
+        // click. One owner of the state, so that cannot happen.
+        onClick={(e) => {
+          e.preventDefault();
+          onOpen(!open);
+        }}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        title={title}
+        className={`${PICK_SHELL} list-none select-none cursor-pointer max-w-[15rem]`
+          + " focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50 "
+          + (open ? PICK_OPEN : held ? PICK_HELD : PICK_QUIET)}
+      >
+        {trigger}
+        <Caret up={open} />
+      </summary>
+      {open ? (
+        <div
+          data-pick-panel
+          role="group"
+          aria-label={label}
+          className={"absolute z-30 mt-1 w-max min-w-[11rem] max-w-[min(18rem,calc(100vw-2rem))]"
+            + " rounded-xl border border-gray-200 bg-white shadow-lg "
+            + (flip ? "right-0 " : "left-0 ") + (panelClass || "overflow-hidden")}
+        >
+          {children}
+        </div>
+      ) : null}
+    </details>
+  );
+}
+
+/** A dimension's multi-select: a popover of its values, each a checkbox;
+ *  none ticked admits every value (no hold). The trigger says how many
+ *  values are held — as chips with a × apiece — so several of them are
+ *  plain without opening it; the popover filters when the dimension has
+ *  many values (every GPU), and closes on Escape or a click outside. */
 function MultiPick({
-  id, label, options, picked, text, onChange,
+  id, label, options, picked, text, onChange, emptyText = "any",
 }: {
   id: string;
   label: string;
@@ -934,41 +989,155 @@ function MultiPick({
   picked: CloudValue[];
   text: (v: CloudValue) => string;
   onChange: (next: CloudValue[]) => void;
+  /** What the trigger reads with nothing ticked; "any" (no hold) by default. */
+  emptyText?: string;
 }) {
-  const summary = picked.length ? picked.map(text).join(", ") : "any";
-  return (
-    <span className="inline-flex items-center gap-1.5 text-xs text-gray-500">
-      {label}
-      <details id={id} className="relative">
-        <summary className="list-none cursor-pointer text-xs border rounded px-1 py-0.5 bg-white text-gray-800 max-w-[12rem] truncate"
-          title={summary}>
-          {summary} ▾
-        </summary>
-        <div className="absolute z-20 mt-1 min-w-full bg-white border rounded shadow-sm py-1">
-          {options.map((v) => {
-            const on = picked.some((x) => x === v);
-            return (
-              <label key={String(v)} className="flex items-center gap-1.5 px-2 py-0.5 whitespace-nowrap cursor-pointer hover:bg-gray-50 text-gray-700">
-                <input
-                  type="checkbox"
-                  className="accent-gray-700"
-                  value={String(v)}
-                  checked={on}
-                  onChange={() => onChange(on ? picked.filter((x) => x !== v) : [...picked, v])}
-                />
-                {text(v)}
-              </label>
-            );
-          })}
-          {picked.length ? (
-            <button type="button" className="block w-full text-left px-2 py-0.5 text-gray-400 hover:text-gray-700"
-              onClick={() => onChange([])}>
-              clear
-            </button>
-          ) : null}
-        </div>
-      </details>
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const search = useRef<HTMLInputElement>(null);
+  useEffect(() => { if (!open) setQuery(""); }, [open]);
+  const held = picked.length ? picked.map(text).join(", ") : emptyText;
+  const q = query.trim().toLowerCase();
+  const shown = q ? options.filter((v) => text(v).toLowerCase().includes(q)) : options;
+  const chips = picked.slice(0, 2);
+  const more = picked.length - chips.length;
+  const toggle = (v: CloudValue, on: boolean) =>
+    onChange(on ? picked.filter((x) => x !== v) : [...picked, v]);
+  const trigger = (
+    <span className="flex flex-col min-w-0 leading-tight">
+      <span className={PICK_CAPTION}>{label}</span>
+      <span className={PICK_VALUE}>
+        {picked.length ? (
+          <>
+            {chips.map((v) => (
+              <span
+                key={String(v)}
+                className="inline-flex items-center gap-0.5 max-w-[7rem] rounded-md
+                  border border-amber-200 bg-amber-50 pl-1.5 pr-0.5 text-10 text-amber-900"
+              >
+                <span className="truncate">{text(v)}</span>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  aria-label={`Remove ${text(v)}`}
+                  className="px-0.5 leading-none text-amber-500 hover:text-amber-800"
+                  onClick={(e) => {
+                    // A click inside a <summary> would toggle the popover.
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onChange(picked.filter((x) => x !== v));
+                  }}
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+            {more > 0 ? (
+              <span className="rounded-md bg-amber-100 px-1 text-10 text-amber-900">+{more}</span>
+            ) : null}
+          </>
+        ) : <span className="text-gray-400 truncate">{emptyText}</span>}
+      </span>
     </span>
+  );
+  return (
+    <PickPopover
+      id={id}
+      label={label}
+      held={!!picked.length}
+      title={`${label}: ${held}`}
+      trigger={trigger}
+      open={open}
+      onOpen={setOpen}
+      onOpened={(panel) => {
+        if (options.length > 8) search.current?.focus();
+        // A long list opens on what it holds, not on its first row.
+        panel.querySelector<HTMLElement>("input:checked")
+          ?.closest("label")?.scrollIntoView({ block: "nearest" });
+      }}
+      onKeyDown={(e) => {
+        // The arrows walk the rows from wherever the focus is — the
+        // trigger (which they open), the filter box, or another row.
+        if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+        e.preventDefault();
+        if (!open) {
+          setOpen(true);
+          return;
+        }
+        const boxes = [...(e.currentTarget.querySelectorAll<HTMLInputElement>(
+          "[data-pick-panel] input[type=checkbox]") || [])];
+        if (!boxes.length) return;
+        const at = boxes.indexOf(document.activeElement as HTMLInputElement);
+        const next = e.key === "ArrowDown"
+          ? (at + 1) % boxes.length
+          : (at <= 0 ? boxes.length - 1 : at - 1);
+        boxes[next].focus();
+      }}
+    >
+      {options.length > 8 ? (
+        <div className="p-1.5 border-b border-gray-100">
+          <input
+            ref={search}
+            type="text"
+            aria-label={`Filter ${label}`}
+            placeholder="Filter…"
+            className="w-full px-2 py-1 text-11 border border-gray-200 rounded-md
+              focus:outline-none focus:border-amber-400"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </div>
+      ) : null}
+      {options.length > 3 ? (
+        <div className="flex items-center justify-between gap-2 px-2.5 py-1.5
+          border-b border-gray-100 text-10 text-gray-500">
+          <span>{picked.length ? `${picked.length} of ${options.length} held` : emptyText}</span>
+          <span className="flex items-center gap-1.5">
+            <button type="button" data-pick-all className="hover:text-amber-700"
+              onClick={() => onChange([...options])}>
+              Select all
+            </button>
+            <span className="text-gray-200">|</span>
+            <button type="button" data-pick-clear className="hover:text-amber-700"
+              onClick={() => onChange([])}>
+              Clear
+            </button>
+          </span>
+        </div>
+      ) : null}
+      <div className="max-h-56 overflow-y-auto py-1">
+        {shown.map((v) => {
+          const on = picked.some((x) => x === v);
+          return (
+            <label
+              key={String(v)}
+              className={"flex items-center gap-2 px-2.5 py-1.5 text-11 cursor-pointer "
+                + (on ? "bg-amber-50/70 text-amber-900" : "text-gray-700 hover:bg-gray-50")}
+            >
+              <input
+                type="checkbox"
+                className="w-3.5 h-3.5 shrink-0 accent-amber-500"
+                value={String(v)}
+                checked={on}
+                onChange={() => toggle(v, on)}
+              />
+              <span className="truncate">{text(v)}</span>
+            </label>
+          );
+        })}
+        {!shown.length ? (
+          <div className="px-2.5 py-2 text-11 text-gray-400">no match</div>
+        ) : null}
+      </div>
+      {options.length <= 3 && picked.length ? (
+        <button type="button" data-pick-clear
+          className="block w-full border-t border-gray-100 px-2.5 py-1.5 text-left
+            text-10 text-gray-500 hover:text-amber-700"
+          onClick={() => onChange([])}>
+          Clear (any)
+        </button>
+      ) : null}
+    </PickPopover>
   );
 }
 
@@ -985,46 +1154,335 @@ const HOLD_LABEL: Record<CloudDim, string> = {
   ep_load_factor: "EP load",
 };
 
-/** Decode Pareto frontier at the sweep's context: tokens/s one request sees
- *  against tokens/s per GPU, a view of the sweep's decode point cloud (every
- *  layout at every per-GPU decode batch) the backend draws: the dimensions
- *  held, the ones each line is one value of, each line its front. A click
+/** The dimensions not in play, behind one trigger: the holds a reader can
+ *  still add, and — said in a line rather than rendered as a dead "any"
+ *  box — the ones this cloud answers with a single value (the speculative
+ *  knobs of a plain decode sweep). Which dimension is here and which is a
+ *  control of the row is read off the cloud's own answer, never a list
+ *  this page keeps.
+ *
+ *  Which dimensions it holds is the caller's (the section freezes them
+ *  while the drawer is open and keeps them out of the row): holding a
+ *  value promotes that dimension to the row, and a control must not
+ *  vanish from under the click that set it, nor stand in two places. */
+function FiltersPick({
+  id, dims, fixed, values, picked, onPick, open, onOpen,
+}: {
+  id: string;
+  /** The dimensions it offers as controls, in the cloud's order. */
+  dims: CloudDim[];
+  /** The dimensions this cloud has one value for, with that value. */
+  fixed: CloudDim[];
+  values: Record<string, CloudValue[]> | undefined;
+  picked: Holds;
+  onPick: (d: CloudDim, vs: CloudValue[]) => void;
+  open: boolean;
+  onOpen: (v: boolean) => void;
+}) {
+  const shown = dims.filter((d) => (values?.[d]?.length ?? 0) > 1);
+  return (
+    <PickPopover
+      id={id}
+      label="Filters"
+      held={false}
+      title={`${dims.length} more dimension${dims.length === 1 ? "" : "s"} to hold`}
+      open={open}
+      onOpen={onOpen}
+      panelClass="overflow-visible"
+      trigger={
+        <span className="flex items-center gap-1.5 text-xs text-gray-700">
+          Filters
+          {dims.length ? (
+            <span data-filters-count
+              className="rounded-full bg-gray-100 px-1.5 text-10 leading-4 text-gray-600">
+              {dims.length}
+            </span>
+          ) : null}
+        </span>
+      }
+    >
+      <div className="flex flex-col items-start gap-1.5 p-2">
+        {shown.map((d) => (
+          <MultiPick
+            key={d}
+            id={`infer-throughput-fix-${d}`}
+            label={HOLD_LABEL[d] ?? d}
+            options={values?.[d] || []}
+            picked={picked[d] || []}
+            text={(v) => cloudLabel(d, v)}
+            onChange={(vs) => onPick(d, vs)}
+          />
+        ))}
+        {!shown.length ? (
+          <span className="px-0.5 text-11 text-gray-400">nothing else to hold</span>
+        ) : null}
+      </div>
+      {fixed.length ? (
+        <div data-filters-fixed
+          className="border-t border-gray-100 px-2.5 py-1.5 text-10 leading-relaxed text-gray-500">
+          One value in this cloud: {fixed.map((d) =>
+            `${HOLD_LABEL[d] ?? d} ${cloudLabel(d, (values?.[d] || [])[0])}`).join(" · ")}
+        </div>
+      ) : null}
+    </PickPopover>
+  );
+}
+
+/** The one chart area's two controls, orthogonal: which PHASE of the one
+ *  cloud is drawn, and in which FORM. The form keys are the backend's own
+ *  (`frontier.FORM_KEYS`): the Pareto front, or a line along one of its X
+ *  axes — so a form is the request, not a second table translating one. */
+type CloudPhase = "prefill" | "decode";
+type FormKey = "frontier" | "num_gpus" | "batch" | "context";
+
+const PHASES: { phase: CloudPhase; label: string }[] = [
+  { phase: "prefill", label: "Prefill" },
+  { phase: "decode", label: "Decode" },
+];
+
+const FORMS: { form: FormKey; label: string }[] = [
+  { form: "frontier", label: "Pareto" },
+  { form: "num_gpus", label: "vs GPUs" },
+  { form: "context", label: "vs context" },
+  { form: "batch", label: "vs batch" },
+];
+
+/** What a form asks the server for: the front needs no X, every other form
+ *  is a line along the axis it is named after. */
+function formView(form: FormKey): { form: "line" | "frontier"; x?: FormKey } {
+  return form === "frontier" ? { form: "frontier" } : { form: "line", x: form };
+}
+
+type Holds = Partial<Record<CloudDim, CloudValue[]>>;
+
+/** Either view's answer: per group its points (a front, or a line along X),
+ *  each control's values, the dimensions the cloud declares — what a line
+ *  may be one value of — the phase drawn with the fields its axes and
+ *  coverage are on, and which (phase, form) pairs this cloud can answer at
+ *  all, with the reason where it cannot (`frontier.view_forms`). */
+type CloudView = {
+  series: {
+    group: Partial<Record<CloudDim, CloudValue>>;
+    frontier?: ParFrontierPt[];
+    points?: ParFrontierPt[];
+  }[];
+  values: Record<CloudDim, CloudValue[]>;
+  dims: CloudDim[];
+  phase: CloudPhase;
+  axes: { sol: [string, string]; measured?: [string, string];
+          partial?: [string, string]; coverage: string };
+  forms: Record<CloudPhase, Partial<Record<FormKey, string | null>>>;
+};
+
+/** The GPU count the vs-batch and vs-context forms hold first: the KV
+ *  storage default where it serves. */
+const CLOUD_BATCH_DEGREE = BATCH_PAR_DEGREE;
+
+/** What the cloud serves at a context, read once per (sweep, context): the
+ *  max-batch lines per card × mode along the GPU count (`baseRequest`).
+ *  Every form's defaults are read off it, and no view's request depends on
+ *  that view's own answer — a default read off the answer it shapes never
+ *  settles. */
+type CloudBase = { served: Map<string, Map<string, number[]>>; view: CloudView };
+
+function baseRequest(sweepBody: Record<string, unknown>, ctx: number) {
+  return {
+    sweep: sweepBody, fix: { context: [ctx], batch_key: ["max"] },
+    group_by: ["gpu_sku", "mode"], form: "line", x: "num_gpus",
+  };
+}
+
+function cloudBase(view: CloudView): CloudBase {
+  const served = new Map<string, Map<string, number[]>>();
+  for (const s of view.series) {
+    const ns = (s.points || []).map((p) => p.num_gpus);
+    if (!ns.length) continue;
+    const card = String(s.group.gpu_sku);
+    if (!served.has(card)) served.set(card, new Map());
+    served.get(card)?.set(String(s.group.mode), ns);
+  }
+  return { served, view };
+}
+
+/** A form's holds where the reader has set none, read off what the cloud
+ *  serves (`CloudBase`), never off another section's pickers: a value the
+ *  cloud does not have would draw an empty chart with a false reason.
+ *  Pareto and vs GPUs hold the section's context (Pareto also Plan's card,
+ *  so one card's layouts stand against each other); the forms whose X is
+ *  the context do not hold it, and pin a card, a mode and a GPU count that
+ *  serve instead. */
+function formDefaults(form: FormKey, ctx: number, planGpu: string,
+                      base: CloudBase): Holds {
+  const modeServing = (modes: Map<string, number[]> | undefined) =>
+    PAR_SWEEP_MODES.find((m) => modes?.has(m)) ?? [...(modes?.keys() || [])][0];
+  // The card a form holds when the reader has not picked one: Plan's, so
+  // the section opens on the deployment the page is about.
+  const planOr = () => (base.served.has(planGpu) ? planGpu : [...base.served.keys()][0]);
+  // One card's layouts against each other — every mode its own line (the
+  // lines default reads `cardsHeld === 1`), which is what the frontier is
+  // asked for. Other cards are added back by clearing the GPU hold.
+  if (form === "frontier") {
+    const gpu = planOr();
+    return { context: [ctx], ...(gpu ? { gpu_sku: [gpu] } : {}) };
+  }
+  if (form === "num_gpus") {
+    const any = new Map<string, number[]>();
+    for (const modes of base.served.values()) for (const [m, ns] of modes) any.set(m, ns);
+    const mode = modeServing(any);
+    return { context: [ctx], batch_key: ["max"], ...(mode ? { mode: [mode] } : {}) };
+  }
+  const gpu = planOr();
+  const modes = gpu ? base.served.get(gpu) : undefined;
+  const mode = modeServing(modes);
+  const ns = (mode && modes?.get(mode)) || [];
+  const n = ns.includes(CLOUD_BATCH_DEGREE) ? CLOUD_BATCH_DEGREE : Math.min(...ns);
+  return {
+    ...(gpu ? { gpu_sku: [gpu] } : {}),
+    ...(mode ? { mode: [mode] } : {}),
+    ...(Number.isFinite(n) ? { num_gpus: [n] } : {}),
+    // Along the context, one rung per card so the line is one deployment's
+    // ceiling at each length rather than its whole ladder.
+    ...(form === "context" ? { batch_key: ["max"] } : {}),
+  };
+}
+
+async function postView(body: unknown, signal: AbortSignal): Promise<CloudView> {
+  return fetchJson<CloudView>("/inference/parallel-sweep/frontier", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+/** How a (phase, form) reads under the chart: what it plots and why that
+ *  pair of axes is the comparison. */
+const SUBTITLE: Record<CloudPhase, Record<"frontier" | "line", string>> = {
+  decode: {
+    frontier: "Every layout of the Parallelism sweep at every per-GPU decode batch, kept to the held values; each line keeps the points no other point of it beats on both axes, up and to the right is better — faster for one request AND more tokens per GPU.",
+    line: "Decode tokens/s per GPU, every layout of the Parallelism sweep kept to the held values; where several points of a line share an X, the line keeps the best (the hover names it). One GPU is the first point of every mode's line.",
+  },
+  prefill: {
+    frontier: "Every layout of the Parallelism sweep, kept to the held values, at one request: how fast that request's prompt is read (its tokens over its time to first token) against what each GPU contributes. The knob along a line is the deployment — more GPUs cut the time to first token and cost per-GPU efficiency — so up and to the right is better, as decode's is.",
+    line: "Prefill tokens/s per GPU at one request, every layout of the Parallelism sweep kept to the held values; where several points of a line share an X, the line keeps the best (the hover names it). One GPU is the first point of every mode's line.",
+  },
+};
+
+/** What prefill here is priced under, said where it is read: this panel
+ *  surveys deployments at the DEFAULT serving schedule and sends no
+ *  `prefill_chunk_size`, so Plan's prefill-chunk box does not move these
+ *  curves (and every reader shares one warm cache entry). The budget comes
+ *  from the shared constant, so the sentence cannot drift from the body. */
+const PREFILL_SCHEDULE_NOTE =
+  ` Prefill is priced at the default chunked-prefill budget (${DEFAULT_PREFILL_CHUNK_SIZE.toLocaleString("en-US")} tokens per`
+  + " forward), whatever Plan's prefill-chunk box says.";
+
+const AXIS_TITLE: Record<CloudPhase, { x: string; y: string }> = {
+  decode: { x: "Interactivity (tok/s per user)", y: "Output throughput (tok/s per GPU)" },
+  prefill: { x: "Prompt read speed (tok/s per request)", y: "Prefill throughput (tok/s per GPU)" },
+};
+
+/** Throughput: EVERY chart of it — prefill and decode, front and lines — is
+ *  a view of the parallel sweep's one point cloud (every layout from one
+ *  GPU, on every card, at every context and per-GPU decode batch, each
+ *  point carrying both phases). The phase and form switches pick the view;
+ *  the holds and the lines are shared across both and survive a switch. A
+ *  hold or the lines the reader has not set take the form's default, read
+ *  off what the cloud serves at the section's context (`formDefaults`). A
+ *  (phase, form) pair the cloud cannot answer is disabled with the cloud's
+ *  own reason (`view.forms`) — never a rule this page keeps. A click
  *  applies the point. */
-function ParetoSection({
+function ThroughputSection({
   ctx,
   sweepBody,
   gpus,
+  planGpu,
+  showMeasured,
+  onShowMeasured,
+  measuredNote,
   onApply,
 }: {
   ctx: number;
-  /** The parallel sweep's body, as posted: the view reads its cache entry. */
+  /** The parallel sweep's body whose answer every view reads: the SOL one,
+   *  or — with Measured ticked — the measured one the panel also posts, so
+   *  the prefill track it folds is on these very points. */
   sweepBody: Record<string, unknown>;
   gpus: string[];
+  /** Plan's card: the one a form holds first, if the cloud serves it. */
+  planGpu: string;
+  showMeasured: boolean;
+  onShowMeasured: (v: boolean) => void;
+  measuredNote: MeasuredNote | null;
   onApply?: (p: ScalingApply) => void;
 }) {
-  const [lineDims, setLineDims] = useState<CloudDim[]>([]);
-  const [fix, setFix] = useState<Partial<Record<CloudDim, CloudValue[]>>>({});
-  // The view with the request it answers: one drawn under other inputs
-  // (another context, other holds) is not shown, so a click never applies a
-  // point of the previous sweep.
+  const [phase, setPhase] = useState<CloudPhase>("decode");
+  const [form, setForm] = useState<FormKey>("frontier");
+  // The reader's own holds and lines; a dimension absent here takes the
+  // form's default.
+  const [picked, setPicked] = useState<Holds>({});
+  const [pickedLines, setPickedLines] = useState<CloudDim[] | null>(null);
+  // The Filters drawer: null while closed, else the dimensions it holds
+  // (frozen on the way open, so the row and the drawer never show one
+  // dimension twice).
+  const [drawer, setDrawer] = useState<CloudDim[] | null>(null);
+  const [baseAnswer, setBaseAnswer] = useState<{ key: string; base: CloudBase } | null>(null);
   const [answer, setAnswer] = useState<{ key: string; view: CloudView } | null>(null);
   const [failed, setFailed] = useState("");
   const [applied, setApplied] = useState("");
-  const by: CloudDim[] = ["gpu_sku", ...LINE_DIMS.filter((d) => lineDims.includes(d))];
   const sweepKey = JSON.stringify(sweepBody);
-  // A new sweep holds nothing: its cloud may not have the held values.
-  useEffect(() => { setFix({}); }, [sweepKey]);
-  const reqBody = JSON.stringify({ sweep: sweepBody, fix, group_by: by });
-  const view = answer?.key === reqBody ? answer.view : null;
+  // A new sweep holds nothing the reader picked: its cloud may not have it.
+  useEffect(() => { setPicked({}); setPickedLines(null); setDrawer(null); }, [sweepKey]);
+  // What the cloud serves at this context: asked once per (sweep, context).
+  const baseKey = JSON.stringify(baseRequest(sweepBody, ctx));
+  const base = baseAnswer?.key === baseKey ? baseAnswer.base : null;
   useEffect(() => {
     const ctrl = new AbortController();
     setFailed("");
-    fetchJson<CloudView>("/inference/parallel-sweep/frontier", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: reqBody,
-      signal: ctrl.signal,
-    })
+    postView(JSON.parse(baseKey), ctrl.signal)
+      .then((v) => setBaseAnswer({ key: baseKey, base: cloudBase(v) }))
+      .catch((e) => {
+        if (isAbort(e)) return;
+        setFailed(e instanceof Error ? e.message : String(e));
+      });
+    return () => ctrl.abort();
+  }, [baseKey]);
+  // Which (phase, form) pairs this cloud answers, as the cloud says. The
+  // chosen form falls through to the first the phase can answer — decided
+  // here, while the request is built, so a switch asks one view and not two.
+  const refusals = base?.view.forms;
+  const refusedFor = (f: FormKey): string => refusals?.[phase]?.[f] || "";
+  const drawnForm: FormKey = !refusals || !refusedFor(form)
+    ? form : (FORMS.map((f) => f.form).find((f) => !refusedFor(f)) ?? form);
+  const fix: Holds = base ? formDefaults(drawnForm, ctx, planGpu, base) : {};
+  for (const [d, vs] of Object.entries(picked) as [CloudDim, CloudValue[]][]) {
+    if (vs.length) fix[d] = vs; else delete fix[d];
+  }
+  // The values each control offers: the last answer's, so a control does
+  // not empty while the next view is in flight; before the first answer,
+  // what the cloud serves at this context (`base`), so the first paint is
+  // not a row of empty boxes.
+  const lastValues = (answer?.view ?? base?.view)?.values;
+  const cardsHeld = fix.gpu_sku?.length ?? base?.served.size ?? gpus.length;
+  const lineDims: CloudDim[] = pickedLines ?? (drawnForm === "batch"
+    ? ["context"] : drawnForm === "frontier" && cardsHeld === 1 ? ["mode"] : []);
+  // What a line may be one value of: the cloud's own dimensions beside the
+  // card (a line never mixes cards), each with more than one value here.
+  const cloudDims = base?.view.dims || [];
+  const lineOptions = cloudDims.filter((d) => d !== "gpu_sku"
+    && ((lastValues?.[d]?.length ?? 0) > 1 || lineDims.includes(d)));
+  const by: CloudDim[] = ["gpu_sku", ...lineDims.filter((d) => d !== "gpu_sku")];
+  // No view is asked before its defaults are known: the request is one
+  // function of the sweep, the context, the phase, the form and the
+  // reader's picks.
+  const reqBody = base
+    ? JSON.stringify({ sweep: sweepBody, phase, fix, group_by: by,
+                       ...formView(drawnForm) }) : "";
+  const view = reqBody && answer?.key === reqBody ? answer.view : null;
+  useEffect(() => {
+    if (!reqBody) return;
+    const ctrl = new AbortController();
+    setFailed("");
+    postView(JSON.parse(reqBody), ctrl.signal)
       .then((v) => setAnswer({ key: reqBody, view: v }))
       .catch((e) => {
         if (isAbort(e)) return;
@@ -1033,82 +1491,311 @@ function ParetoSection({
     return () => ctrl.abort();
   }, [reqBody]);
   const colorOf = new Map(gpus.map((g, i) => [g, SWEEP_COLORS[i % SWEEP_COLORS.length]]));
+  // More cards than colours: each further round of the palette takes
+  // another symbol (a dashed line is the measured track), so no two
+  // cards' lines look alike.
+  const roundOf = new Map(gpus.map((g, i) => [g, Math.floor(i / SWEEP_COLORS.length)]));
+  // Each line's group and its points, whichever form drew them; a group of
+  // absent points alone draws nothing and names no legend entry.
+  const groups = (view?.series || [])
+    .map((s) => ({ group: s.group, points: s.frontier ?? s.points ?? [] }))
+    .filter((s) => s.points.length);
   // Cards tell lines apart by colour; with one card on the chart, the
-  // other dimension takes the colour instead.
-  const cards = new Set((view?.series || []).map((s) => s.group.gpu_sku));
+  // other dimension takes the colour instead (contexts their own scale).
+  const cards = new Set(groups.map((s) => s.group.gpu_sku));
   const rest = by.filter((d) => d !== "gpu_sku");
-  const restKeys = [...new Set((view?.series || []).map((s) => rest.map((d) => s.group[d]).join("·")))];
-  const series: FrontierSeries<ParFrontierPt>[] = (view?.series || []).map((s, i) => {
-    const restKey = rest.map((d) => s.group[d]).join("·");
-    const ri = restKeys.indexOf(restKey);
-    const gpu = String(s.group.gpu_sku ?? "");
-    const mode = s.group.mode as ParSweepMode | undefined;
+  const restKeys = [...new Set(groups.map((s) => rest.map((d) => s.group[d]).join("·")))];
+  const style = (group: Partial<Record<CloudDim, CloudValue>>, i: number) => {
+    const ri = restKeys.indexOf(rest.map((d) => group[d]).join("·"));
+    const mode = group.mode as ParSweepMode | undefined;
+    const ci = rest.length === 1 && rest[0] === "context"
+      ? SWEEP_SEQ_LENS.indexOf(Number(group.context)) : -1;
     return {
-      key: `${gpu}:${restKey}:${i}`,
-      label: by.map((d) => cloudLabel(d, s.group[d] ?? "")).join(" · "),
+      key: `${group.gpu_sku}:${rest.map((d) => group[d]).join("·")}:${i}`,
+      label: by.map((d) => cloudLabel(d, group[d] ?? "")).join(" · "),
       color: cards.size > 1
-        ? colorOf.get(gpu) || SWEEP_COLORS[0]
-        : SWEEP_COLORS[ri % SWEEP_COLORS.length],
-      points: s.frontier,
-      ...(cards.size > 1 && rest.length
-        ? (rest.length === 1 && mode ? MODE_LINE[mode] : { lineType: LINE_TYPES[ri % LINE_TYPES.length] })
-        : {}),
+        ? colorOf.get(String(group.gpu_sku ?? "")) || SWEEP_COLORS[0]
+        : ci >= 0 ? VIRIDIS[ci % VIRIDIS.length] : SWEEP_COLORS[ri % SWEEP_COLORS.length],
+      mode, ri,
     };
-  });
-  const pick = (_s: FrontierSeries<ParFrontierPt>, p: ParFrontierPt) => {
-    setApplied(`Applied: ${p.gpu_sku} · ${p.layout} · batch ${p.batch}`);
-    onApply?.({ gpu: p.gpu_sku, seq: ctx, batch: p.batch ?? undefined, par: parallelOf(p.parallel) });
   };
-  // The controls stay while a new view loads: the last answer's dimensions.
-  const dims = Object.keys((view || answer?.view)?.values || {}) as CloudDim[];
-  const holds = dims.map((d) => ({ d, label: HOLD_LABEL[d] ?? d }));
-  const held = holds.filter((h) => fix[h.d]?.length)
-    .map((h) => (fix[h.d] as CloudValue[]).map((v) => cloudLabel(h.d, v)).join(", ")).join(" · ");
-  const options = (d: CloudDim) => (view || answer?.view)?.values[d] || [];
+  const apply = (p: ParFrontierPt) => {
+    // The deployment and context the point is, at the batch the DRAWN phase
+    // ran: a decode rung is the point's own batch, prefill is the one
+    // request every prefill point of this cloud prices.
+    const batch = (phase === "decode" ? p.batch : p.prefill_batch) ?? undefined;
+    setApplied(`Applied: ${p.gpu_sku} · ${p.layout} · ctx ${fmtSeqLabel(p.context)} · batch ${batch ?? "—"}`);
+    onApply?.({ gpu: p.gpu_sku, seq: p.context, batch, par: parallelOf(p.parallel) });
+  };
+  const dims = cloudDims;
+  // The title says every held value — the context among them, which the
+  // Parallelism dropdown above no longer drives once the reader holds one.
+  const held = dims.filter((d) => fix[d]?.length)
+    .map((d) => (fix[d] as CloudValue[]).map((v) => cloudLabel(d, v)).join(", ")).join(" · ");
   const specK = Number(sweepBody.speculative_draft_tokens) || 0;
-  const specNote = specK > 0
+  const specNote = phase === "decode" && specK > 0
     ? ` Speculative decoding, K = ${specK} at α = ${sweepBody.acceptance_rate}: ${sweepBody.speculative_draft
       ? "each step runs the K MTP draft forwards and the verify over K + 1 positions"
       : "each step is the verify over K + 1 positions alone (no draft forward on the GPU)"}, keeping 1 + α·K tokens per request.`
     : "";
-  return (
-    <FrontierChart<ParFrontierPt>
-      bare
-      title={`Decode Pareto frontier — ctx ${fmtSeqLabel(ctx)}${held ? ` · ${held}` : ""}`}
-      subtitle={`Every layout of the Parallelism sweep at every per-GPU decode batch, kept to the held values; each line keeps the points no other point of it beats on both axes, up and to the right is better. Throughput is per GPU.${specNote} SOL only.${onApply ? " Click a point to apply it." : ""}`}
-      controls={
-        <div className="flex items-center gap-3 flex-wrap">
-          {applied ? <span className="text-11 text-green-600">{applied}</span> : null}
-          {holds.map(({ d, label }) => (
-            <MultiPick
-              key={d}
-              id={`infer-pareto-fix-${d}`}
-              label={label}
-              options={options(d)}
-              picked={fix[d] || []}
-              text={(v) => cloudLabel(d, v)}
-              onChange={(vs) => setFix((f) => {
-                const next = { ...f };
-                if (vs.length) next[d] = vs; else delete next[d];
-                return next;
-              })}
-            />
-          ))}
-          <MultiPick
-            id="infer-pareto-lines"
-            label="Lines: GPU ×"
-            options={LINE_DIMS}
-            picked={lineDims}
-            text={(d) => HOLD_LABEL[d as CloudDim]}
-            onChange={(ds) => setLineDims(ds as CloudDim[])}
-          />
-        </div>
-      }
-      series={series}
-      height={420}
-      empty={failed ? `frontier load failed: ${failed}` : view ? "No layout serves these held values on these GPUs." : "Loading…"}
-      onPoint={onApply ? pick : undefined}
+  const drawn = groups.flatMap((s) => s.points);
+  const past = drawn.some((p) => p.beyond_max_context);
+  const segment = (active: boolean, reason: string) => SEGMENT + (reason
+    ? "text-gray-300 cursor-not-allowed"
+    : active
+      ? "bg-white shadow-sm text-gray-900 font-medium"
+      : "text-gray-500 hover:text-gray-800");
+  // Which dimensions are controls of the row, and which sit behind
+  // Filters — read off the cloud's own answer (`values`), never a list
+  // this page keeps. A dimension the cloud offers ONE value for is
+  // nothing to pick (the speculative knobs of a plain decode sweep): it
+  // is stated inside Filters, not rendered as a dead "any" box. Of the
+  // rest, the ones actually in play — the form's defaults and whatever
+  // the reader holds — are the row; the others are behind Filters.
+  const offered = (d: CloudDim) => lastValues?.[d]?.length ?? 0;
+  const inPlay = (d: CloudDim) => (fix[d]?.length ?? 0) > 0;
+  // The drawer's dimensions are frozen while it is open — holding a value
+  // promotes that dimension to the row, and a control must neither vanish
+  // from under the click that set it nor stand in two places at once.
+  const drawerDims = drawer ?? dims.filter((d) => offered(d) > 1 && !inPlay(d));
+  const rowDims = dims.filter((d) => offered(d) > 1 && inPlay(d)
+    && !drawerDims.includes(d));
+  const fixedDims = dims.filter((d) => offered(d) === 1);
+  const hold = (d: CloudDim) => (
+    <MultiPick
+      key={d}
+      id={`infer-throughput-fix-${d}`}
+      label={HOLD_LABEL[d] ?? d}
+      options={lastValues?.[d] || []}
+      picked={fix[d] || []}
+      text={(v) => cloudLabel(d, v)}
+      onChange={(vs) => setPicked((f) => ({ ...f, [d]: vs }))}
     />
+  );
+  // The phase and the form sit with the chart's title, not among the
+  // holds: they are what is drawn, the holds are what it is kept to.
+  const switches = (
+    <div className="flex items-center gap-1.5 flex-wrap">
+      <div className={SEGMENTED}>
+        {PHASES.map(({ phase: ph, label }) => {
+          // A phase no point of this cloud prices is not a view of it; the
+          // cloud says so for every form, so its Pareto's reason stands for
+          // the phase.
+          const reason = refusals?.[ph]?.frontier || "";
+          return (
+            <button
+              key={ph}
+              id={`infer-throughput-phase-${ph}`}
+              type="button"
+              disabled={!!reason}
+              title={reason || undefined}
+              onClick={() => setPhase(ph)}
+              className={segment(ph === phase, reason)}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
+      <div className={SEGMENTED}>
+        {FORMS.map(({ form: f, label }) => {
+          const reason = refusedFor(f);
+          return (
+            <button
+              key={f}
+              id={`infer-throughput-form-${f}`}
+              type="button"
+              disabled={!!reason}
+              title={reason || undefined}
+              onClick={() => setForm(f)}
+              className={segment(f === drawnForm, reason)}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+  const controls = (
+    <div className={PICK_ROW}>
+      {rowDims.map(hold)}
+      {drawerDims.length || fixedDims.length ? (
+        <FiltersPick
+          id="infer-throughput-filters"
+          dims={drawerDims}
+          fixed={fixedDims}
+          values={lastValues}
+          picked={fix}
+          onPick={(d, vs) => setPicked((f) => ({ ...f, [d]: vs }))}
+          open={drawer !== null}
+          onOpen={(v) => setDrawer(v ? drawerDims : null)}
+        />
+      ) : null}
+      {lineOptions.length ? (
+        <MultiPick
+          id="infer-throughput-lines"
+          label="Lines"
+          emptyText="GPU only"
+          options={lineOptions}
+          picked={lineDims}
+          text={(d) => HOLD_LABEL[d as CloudDim] ?? String(d)}
+          onChange={(ds) => setPickedLines(ds as CloudDim[])}
+        />
+      ) : null}
+      <span title="Prefill only: a decode rung of the cloud keys no measurement, so decode is SOL.">
+        <MeasuredCheck id="infer-throughput-measured" checked={showMeasured}
+          onChange={onShowMeasured} note={showMeasured ? measuredNote : null} />
+      </span>
+      {applied ? <span className="text-11 text-green-600">{applied}</span> : null}
+    </div>
+  );
+  const subtitle = SUBTITLE[phase][drawnForm === "frontier" ? "frontier" : "line"]
+    + (phase === "prefill" ? PREFILL_SCHEDULE_NOTE : "") + specNote + ` SOL${showMeasured ? ", measured beside it where every op of the step is measured" : " only"}.`
+    + (onApply ? " Click a point to apply it." : "");
+  const empty = failed ? `view load failed: ${failed}` : view ? "No layout serves these held values on these GPUs." : "Loading…";
+  const pastNote = past ? (
+    <div data-context-limit className="mt-1 text-11 text-amber-700">
+      Some points are past the model's published max context; they extrapolate beyond what the model serves.
+    </div>
+  ) : null;
+  const title = `${phase === "decode" ? "Decode" : "Prefill"}${held ? ` · ${held}` : ""}`;
+  // One header for every form: what is drawn (the title and the two
+  // switches on one line), why that is the comparison, and what the view
+  // is kept to.
+  const header = (
+    <>
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 mb-1.5">
+        <div className="text-sm font-medium text-gray-800 min-w-0 truncate">{title}</div>
+        {switches}
+      </div>
+      <p className="text-10 leading-snug text-gray-400 mb-2 max-w-[90ch]">{subtitle}</p>
+      <div className="mb-2">{controls}</div>
+    </>
+  );
+  // The fields this view is drawn from, as the backend named them: the page
+  // restates no part of the point's vocabulary. While a view is in flight
+  // the last answer's names stand — the series drawn are that answer's, so
+  // the chart's shape does not change under the controls and a popover the
+  // reader has open stays open.
+  const axes = (view ?? answer?.view ?? base?.view)?.axes;
+  const covOf = (p: ParFrontierPt) =>
+    (p as unknown as Record<string, unknown>)[axes?.coverage || ""] as MeasuredCoverage | null;
+  const numAt = (p: ParFrontierPt, field: string | undefined) => {
+    const v = field ? (p as unknown as Record<string, unknown>)[field] : null;
+    return typeof v === "number" && Number.isFinite(v) ? v : NaN;
+  };
+  let chart: ReactNode;
+  if (!axes) {
+    chart = (
+      <div>
+        {header}
+        <div className="text-xs text-gray-400 text-center py-6">{empty}</div>
+      </div>
+    );
+  } else if (drawnForm === "frontier") {
+    const series: FrontierSeries<ParFrontierPt>[] = groups.map((s, i) => {
+      const st = style(s.group, i);
+      return {
+        key: st.key, label: st.label, color: st.color, points: s.points,
+        ...(showMeasured
+          ? { measured: s.points.filter((p) => isComplete(covOf(p))) } : {}),
+        ...(cards.size > 1 && (roundOf.get(String(s.group.gpu_sku)) ?? 0) > 0
+          ? { symbol: SYMBOLS[(roundOf.get(String(s.group.gpu_sku)) ?? 0) % SYMBOLS.length] } : {}),
+        ...(cards.size > 1 && rest.length
+          ? (rest.length === 1 && st.mode && MODE_LINE[st.mode] ? MODE_LINE[st.mode] : { lineType: LINE_TYPES[st.ri % LINE_TYPES.length] })
+          : {}),
+      };
+    });
+    chart = (
+      <>
+        {header}
+        <FrontierChart<ParFrontierPt>
+          bare
+          title=""
+          series={series}
+          axes={{ sol: axes.sol, measured: showMeasured ? axes.measured : null,
+                  partial: null }}
+          xTitle={AXIS_TITLE[phase].x}
+          yTitle={AXIS_TITLE[phase].y}
+          hover={(p) => (phase === "decode"
+            ? `batch ${p.batch ?? "—"} / GPU${p.concurrent_requests != null ? ` · ${p.concurrent_requests} concurrent` : ""} · TPOT ${(p.tpot_s * 1000).toPrecision(3)} ms`
+            : `one request · ctx ${fmtSeqLabel(p.context)} · TTFT ${p.prefill_t_s != null ? fmtT(p.prefill_t_s) : "—"}`)}
+          height={420}
+          empty={empty}
+          onPoint={onApply ? (_s, p) => apply(p) : undefined}
+        />
+      </>
+    );
+  } else {
+    const x = drawnForm;
+    const [, gpuField] = axes.sol;
+    const measField = showMeasured ? axes.measured?.[1] : undefined;
+    const tField = phase === "decode" ? "tpot_s" : "prefill_t_s";
+    const bField = phase === "decode" ? "batch" : "prefill_batch";
+    const series: LineSeries[] = groups.flatMap((s, i) => {
+      const st = style(s.group, i);
+      const shape = {
+        key: st.key, applyKey: st.key, label: st.label, color: st.color,
+        ...(cards.size > 1 && (roundOf.get(String(s.group.gpu_sku)) ?? 0) > 0
+          ? { symbol: SYMBOLS[(roundOf.get(String(s.group.gpu_sku)) ?? 0) % SYMBOLS.length] }
+          : {}),
+        ...(cards.size > 1 && st.mode && MODE_LINE[st.mode] && rest.length === 1
+          ? { symbol: MODE_LINE[st.mode].symbol } : {}),
+      };
+      const note = (p: ParFrontierPt) =>
+        `${p.num_gpus} GPU${p.num_gpus === 1 ? "" : "s"} · ${p.layout} · ctx ${fmtSeqLabel(p.context)}`;
+      const sol: LineSeries = {
+        ...shape,
+        points: s.points.map((p) => ({
+          x: Number(p[x as keyof ParFrontierPt] as unknown as number),
+          v: numAt(p, gpuField),
+          b: numAt(p, bField) || null,
+          t: numAt(p, tField) || null,
+          src: p,
+          note: note(p),
+          // Beside every SOL point: where the measured track is asked for
+          // and this step is not fully measured, the hover says what is
+          // missing instead of a number.
+          ...(measField && !isComplete(covOf(p))
+            ? { cov: coverageNote(covOf(p)) } : {}),
+        })),
+      };
+      if (!measField) return [sol];
+      const meas: LineSeries["points"] = s.points.map((p) => ({
+        x: Number(p[x as keyof ParFrontierPt] as unknown as number),
+        v: isComplete(covOf(p)) ? numAt(p, measField) : NaN,
+        b: numAt(p, bField) || null,
+        t: isComplete(covOf(p)) ? numAt(p, "prefill_t_measured_s") || null : null,
+      }));
+      if (!meas.some((p) => Number.isFinite(p.v))) return [sol];
+      return [sol, { ...shape, key: `${shape.key}:meas`, dashed: true, points: meas }];
+    });
+    const xName: Record<Exclude<FormKey, "frontier">, string> = {
+      num_gpus: "GPUs", batch: "decode batch / GPU", context: "context",
+    };
+    chart = (
+      <div>
+        {header}
+        {series.length ? (
+          <SweepChart
+            title={`${phase === "decode" ? "Decode" : "Prefill"} vs ${xName[x]}`}
+            series={series}
+            xTitle={xName[x]}
+            xUnit={x === "num_gpus" ? "GPUs" : x === "batch" ? "batch" : "ctx"}
+            {...(x === "context" ? { xLabel: fmtSeqLabel } : {})}
+            yTitle="tok/s / GPU"
+            valueUnit=" tok/s"
+            onPoint={onApply ? (_s, p) => { if (p.src) apply(p.src as ParFrontierPt); } : undefined}
+          />
+        ) : <div className="text-xs text-gray-400 text-center py-6">{empty}</div>}
+      </div>
+    );
+  }
+  return (
+    <div id="infer-throughput" className="mb-6">
+      {chart}{pastNote}{showMeasured ? <MeasuredRule /> : null}
+    </div>
   );
 }
 
@@ -1274,8 +1961,7 @@ function KvStorageSection({ rows }: { rows: SweepEst[] | null }) {
   const kvUnit = binaryUnit(Math.max(...kvPts.map((p) => p.v), 0));
 
   return (
-    <div id="infer-scaling-kv" className="mt-6">
-      <div className="text-sm font-medium text-gray-800 mb-3">KV storage</div>
+    <div id="infer-scaling-kv">
       <div className="flex gap-4 flex-wrap">
         <KvChart
           title="KV per request, on one GPU"
@@ -1333,7 +2019,6 @@ export function ScalingPanel(props: {
   const [ovPar, setOvPar] = useState<ParSweepMode>("dp_ep");
   const [ovDegree, setOvDegree] = useState(BATCH_PAR_DEGREE);
   const [ctx, setCtx] = useState(4096);
-  const [showBatchMeas, setShowBatchMeas] = useState(false);
   // Speculative decoding for every sweep of the panel (Parallelism, its
   // Pareto frontier, Context × Batch): a preset's K drafts verified per step
   // at acceptance α. "none" sends neither field, so the default bodies (and
@@ -1346,30 +2031,24 @@ export function ScalingPanel(props: {
   const [draftAvail, setDraftAvail] = useState<{ key: string; available: boolean; reason: string | null } | null>(null);
   const [showParMeas, setShowParMeas] = useState(false);
   const [status, setStatus] = useState<SweepStatus | null>({ text: "Pick a model and GPU." });
-  // The (batch × context) sweep as the backend returned it. Measured only
-  // chooses what to read out of it, so toggling it never re-posts.
+  // The (batch × context) sweep as the backend returned it: KV storage's
+  // one source. Its throughputs are not read here — prefill and decode
+  // alike are views of the parallel sweep's one cloud.
   const [batchResults, setBatchResults] = useState<Record<string, SweepEst[]> | null>(null);
-  const { pre, dec } = useMemo(
-    () => (batchResults ? batchSeries(batchResults, showBatchMeas) : { pre: [], dec: [] }),
-    [batchResults, showBatchMeas],
-  );
   const kvRows = useMemo(
     () => (batchResults ? sweepSeqResults({ results_by_batch: batchResults }) : null),
     [batchResults],
   );
-  const [batchLegend, setBatchLegend] = useState<LegendSelected>({});
   const [parStatus, setParStatus] = useState<SweepStatus | null>({ text: "Loading…" });
-  const [batchMeasNote, setBatchMeasNote] = useState<MeasuredNote | null>(null);
   const [parMeasNote, setParMeasNote] = useState<MeasuredNote | null>(null);
   const [byMode, setByMode] = useState<Record<string, ParModeBlob> | null>(null);
   // The parallel sweep's last answer for this model, for the GPU counts the
   // Context × Batch sweep may take: kept while another context's parallel
   // sweep is computed, so that sweep never falls back to a count nobody chose.
   const [degreeAnswer, setDegreeAnswer] = useState<{ model: string; byMode: Record<string, ParModeBlob> } | null>(null);
-  // The parallel sweep's body the charts show: the frontier view reads its
-  // SOL answer's cache entry.
+  // The parallel sweep body whose answer is on screen: the throughput
+  // views read that same cache entry.
   const [parBody, setParBody] = useState<Record<string, unknown> | null>(null);
-  const [appliedNote, setAppliedNote] = useState("");
   const seq = useRef(0);
   const parSeq = useRef(0);
   // The body each chart now shows: a re-render with the same body (another
@@ -1429,13 +2108,18 @@ export function ScalingPanel(props: {
   const lapsed = (e: unknown) => {
     if (calibrateMine && e instanceof ApiError && e.status === 401) props.onSessionLapsed?.();
   };
-  const skuOpts = props.gpus.map(skuOf).filter(Boolean);
   const [grid, setGrid] = useState<ScalingGrid | null>(null);
   const [gridError, setGridError] = useState("");
   const degreeModes = degreeAnswer?.model === props.modelId.trim() ? degreeAnswer.byMode : null;
+  // The cards Context × Batch offers: the ones the Parallelism sweep priced,
+  // whose GPU counts it knows — none until it has answered.
+  const swept = new Set(Object.values(degreeModes || {})
+    .flatMap((m) => (m.series || []).map((s) => s.gpu_sku || "")));
+  const sweptGpus = props.gpus.filter((g) => swept.has(skuOf(g)));
+  const skuOpts = sweptGpus.map(skuOf).filter(Boolean);
   const { options: batchDegrees, refused: noDegreeFits } = useMemo(
-    () => degreeOptions(degreeModes?.[ovPar], ovGpu, grid?.degrees || []),
-    [degreeModes, ovPar, ovGpu, grid],
+    () => degreeOptions(degreeModes?.[ovPar], ovGpu, grid?.degrees || [], ctx),
+    [degreeModes, ovPar, ovGpu, grid, ctx],
   );
   // The GPU counts are not known yet: this model has no parallel answer, and
   // its parallel sweep can run (a GPU to run it on) and has not failed.
@@ -1467,9 +2151,6 @@ export function ScalingPanel(props: {
   }, [skuOpts, ovGpu]);
 
   useEffect(() => {
-    // A measured answer still being read belongs to the body this run
-    // replaces; this run says its own.
-    setBatchMeasNote(null);
     const id = props.modelId.trim();
     const gpu = ovGpu;
     if (!id || !gpu) {
@@ -1507,8 +2188,11 @@ export function ScalingPanel(props: {
       model_id: id,
       gpu_sku: gpu,
       seq_lens: SWEEP_SEQ_LENS,
-      batch_grid: SWEEP_BATCH_GRID.map((p) => ({ ...p })),
-      avg_output_tokens: SWEEP_OUTPUT_TOKENS,
+      // The rungs this section still draws: one request (prefill) and the
+      // ceiling (KV storage); its decode is the Decode section's.
+      batch_grid: SCALING_PANEL_BATCH_GRID.map((p) => ({ ...p })),
+      // One output length per panel: Plan's, as the Parallelism sweep's.
+      avg_output_tokens: props.outTok ?? SWEEP_OUTPUT_TOKENS,
       parallel_preset: { mode: ovPar, degree: batchDegree, ...(rho ? { ep_load_factor: rho } : {}) },
       ...precisionBody(props.precision),
       gpu_memory_fraction: props.frac,
@@ -1520,10 +2204,11 @@ export function ScalingPanel(props: {
       ...specBody,
       ...(calibrateMine ? { calibrate_with_mine: true } : {}),
     };
-    // The measured answer is read only while it is drawn: unticked, the
-    // charts read the SOL answer alone and nothing is asked of Kernel Bench.
-    const wantMeasured = showBatchMeas && !isTheory(body);
-    const bodyKey = JSON.stringify(body) + (wantMeasured ? "|measured" : "");
+    // KV storage is a capacity fact, not a timing: this sweep is read as
+    // its SOL answer alone and nothing is ever asked of Kernel Bench for
+    // it. The measured track lives where a step time is drawn — the
+    // throughput cloud above.
+    const bodyKey = JSON.stringify(body);
     if (bodyKey === shownBody.current) return;
     const path = "/inference/estimate-sweep";
     const sol = solOnly(body);
@@ -1538,45 +2223,18 @@ export function ScalingPanel(props: {
     shownBody.current = "";
     const my = ++seq.current;
     const ctrl = new AbortController();
-    // The SOL answer drawn, the measured answer is read live and drawn over
-    // it; a measured answer that does not come leaves the SOL curves.
-    const measure = () => {
-      if (!wantMeasured) {
-        shownBody.current = bodyKey;
-        setBatchMeasNote(null);
-        return;
-      }
-      setBatchMeasNote(READING_MEASURED);
-      fetchSweepCached<SweepResp>(path, body, { signal: ctrl.signal },
-        (info) => { if (my === seq.current) setBatchMeasNote({ text: stillComputingNote(info) }); })
-        .then((resp) => {
-          if (my !== seq.current) return;
-          if (!show(resp)) {
-            setBatchMeasNote(measuredFailed(missing));
-            return;
-          }
-          shownBody.current = bodyKey;
-          setBatchMeasNote(null);
-        })
-        .catch((e) => {
-          if (my !== seq.current || isAbort(e)) return;
-          lapsed(e);
-          setBatchMeasNote(measuredFailed(e));
-        });
-    };
     const hit = readSweepCache<SweepResp>(path, sol);
     if (hit && show(hit)) {
-      measure();
+      shownBody.current = bodyKey;
       return () => ctrl.abort();
     }
     setStatus({ text: "Drawing…" });
-    setBatchMeasNote(null);
     fetchSweepCached<SweepResp>(path, sol, { signal: ctrl.signal },
       (info) => { if (my === seq.current) setStatus({ text: stillComputingNote(info), progress: info.progress }); })
       .then((resp) => {
         if (my !== seq.current) return;
         if (show(resp)) {
-          measure();
+          shownBody.current = bodyKey;
           return;
         }
         { shownBody.current = ""; setBatchResults(null); }
@@ -1588,7 +2246,7 @@ export function ScalingPanel(props: {
         setStatus({ text: e instanceof Error ? e.message : String(e), failed: true });
       });
     return () => ctrl.abort();
-  }, [props.modelId, ovGpu, ovPar, batchDegree, noDegreeFits, degreesPending, grid, gridError, props.precision, props.frac, props.commLatencyUs, props.launchFloorUs, props.selectionMode, props.framework, props.kvBlock, rho, sweepHold, specBody, calibrateMine, showBatchMeas]);
+  }, [props.modelId, ovGpu, ovPar, batchDegree, noDegreeFits, degreesPending, grid, gridError, props.precision, props.frac, props.commLatencyUs, props.launchFloorUs, props.outTok, props.selectionMode, props.framework, props.kvBlock, rho, sweepHold, specBody, calibrateMine]);
 
   useEffect(() => {
     setParMeasNote(null);
@@ -1603,10 +2261,12 @@ export function ScalingPanel(props: {
       setParStatus({ text: sweepHold });
       return;
     }
-    const body = {
+    // The SOL answer prices every context (the Decode cloud's, the Prefill
+    // chart's), so the context dropdown re-asks nothing; the measured answer
+    // is read live, so it asks only for the context on screen.
+    const base = {
       model_id: id,
       gpu_sku: props.gpuSku,
-      context_len: ctx,
       modes: [...PAR_SWEEP_MODES],
       ...precisionBody(props.precision),
       gpu_memory_fraction: props.frac,
@@ -1620,16 +2280,21 @@ export function ScalingPanel(props: {
       ...specBody,
       ...(calibrateMine ? { calibrate_with_mine: true } : {}),
     };
+    const all = { ...base, contexts: SWEEP_SEQ_LENS };
+    const body = { ...base, contexts: [ctx] };
     const wantMeasured = showParMeas && !isTheory(body);
-    const bodyKey = JSON.stringify(body) + (wantMeasured ? "|measured" : "");
+    const bodyKey = JSON.stringify(all) + (wantMeasured ? `|measured|${ctx}` : "");
     if (bodyKey === shownParBody.current) return;
     const path = "/inference/estimate-parallel-sweep";
-    const sol = solOnly(body);
-    const show = (resp: ParResp) => {
+    const sol = solOnly(all);
+    // `read` is the sweep body whose answer this response IS: the views
+    // read that one, so the measured answer's prefill track — folded into
+    // the very points of its cloud — is what the charts draw once it lands.
+    const show = (resp: ParResp, read: Record<string, unknown>) => {
       const mapped = resp.by_mode || (resp.mode ? { [resp.mode]: resp } : {});
       setByMode(mapped);
       setDegreeAnswer({ model: id, byMode: mapped });
-      setParBody(body);
+      setParBody(read);
       setParStatus(null);
     };
     shownParBody.current = "";
@@ -1647,7 +2312,7 @@ export function ScalingPanel(props: {
         (info) => { if (my === parSeq.current) setParMeasNote({ text: stillComputingNote(info) }); })
         .then((resp) => {
           if (my !== parSeq.current) return;
-          show(resp);
+          show(resp, body);
           shownParBody.current = bodyKey;
           setParMeasNote(null);
         })
@@ -1659,7 +2324,7 @@ export function ScalingPanel(props: {
     };
     const hit = readSweepCache<ParResp>(path, sol);
     if (hit) {
-      show(hit);
+      show(hit, sol);
       measure();
       return () => ctrl.abort();
     }
@@ -1681,7 +2346,7 @@ export function ScalingPanel(props: {
       })
       .then((resp) => {
         if (my !== parSeq.current) return;
-        show(resp);
+        show(resp, sol);
         measure();
       })
       .catch((e) => {
@@ -1692,36 +2357,22 @@ export function ScalingPanel(props: {
     return () => ctrl.abort();
   }, [props.modelId, props.gpuSku, ctx, props.precision, props.frac, props.commLatencyUs, props.launchFloorUs, props.outTok, props.selectionMode, props.framework, props.kvBlock, rho, sweepHold, specBody, calibrateMine, showParMeas]);
 
-  // The deployment the curves were drawn for, as the backend resolved it.
-  const batchEst = batchResults ? Object.values(batchResults).flat().find((r) => r?.parallel) : undefined;
-  const batchPar = batchEst?.parallel ? parallelOf(batchEst.parallel) : undefined;
-  // Contexts whose requests run past the model's published context.
-  const batchPast = batchResults
-    ? SWEEP_SEQ_LENS.filter((_, si) => pastContext(batchResults, si))
-    : [];
-  const batchLimit = batchResults ? maxContextOf(Object.values(batchResults).flat()) : null;
-
   return (
     <section id="infer-scaling" className="card p-4 sm:p-6 mb-6">
       <div className="flex items-center justify-between flex-wrap gap-3 mb-3">
         <h2 className="text-lg font-semibold text-gray-900">Scaling</h2>
         <div className="flex items-center gap-3 flex-wrap">
-          <label
-            className="inline-flex items-center gap-1.5 text-xs text-gray-500"
+          <OnePick
+            id="infer-scaling-spec"
+            label="Spec decode"
             title="Decode, every sweep below: the target verifies K draft tokens in one forward over K + 1 positions and keeps 1 + α·K tokens per step."
+            value={specMode}
+            onChange={(e) => setSpecMode(e.target.value)}
           >
-            Spec decode
-            <select
-              id="infer-scaling-spec"
-              className="text-sm border border-gray-200 rounded-lg px-2 py-1.5 bg-white text-gray-800"
-              value={specMode}
-              onChange={(e) => setSpecMode(e.target.value)}
-            >
-              {Object.entries(SPEC_PRESETS).filter(([v]) => v !== "custom").map(([v, p]) => (
-                <option key={v} value={v}>{p.label}</option>
-              ))}
-            </select>
-          </label>
+            {Object.entries(SPEC_PRESETS).filter(([v]) => v !== "custom").map(([v, p]) => (
+              <option key={v} value={v}>{p.label}</option>
+            ))}
+          </OnePick>
           {spec.K > 0 ? (
             <label
               className={`inline-flex items-center gap-1.5 text-xs ${draft?.available ? "text-gray-500" : "text-gray-400"}`}
@@ -1740,7 +2391,6 @@ export function ScalingPanel(props: {
               Count draft cost (MTP stack)
             </label>
           ) : null}
-          {appliedNote ? <div className="text-xs text-green-600">{appliedNote}</div> : null}
         </div>
       </div>
       <ParallelSection
@@ -1749,113 +2399,59 @@ export function ScalingPanel(props: {
         contexts={grid?.contexts || []}
         byMode={byMode}
         status={parStatus}
-        measuredNote={parMeasNote}
-        showMeasured={showParMeas}
-        onShowMeasured={setShowParMeas}
         hideEp={hideEp}
-        onApply={props.onApply}
       />
       {byMode && parBody && !parStatus ? (
-        <ParetoSection ctx={ctx} sweepBody={parBody || {}} onApply={props.onApply}
+        <ThroughputSection ctx={ctx} sweepBody={parBody} onApply={props.onApply}
+          planGpu={props.gpuSku}
+          showMeasured={showParMeas} onShowMeasured={setShowParMeas}
+          measuredNote={parMeasNote}
           gpus={(Object.values(byMode).find((m) => m.series?.length)?.series || []).map((s) => s.gpu_sku || "")} />
       ) : null}
       <div>
-        <div className="flex items-center gap-3 flex-wrap mb-3">
-          <div className="text-sm font-medium text-gray-800">Context × Batch</div>
-          <label className="inline-flex items-center gap-1.5 text-xs text-gray-500 max-w-full min-w-0">
-            GPU
-            <select
-              id="infer-scaling-gpu"
-              className="min-w-0 max-w-full text-sm border border-gray-200 rounded-lg px-2 py-1.5 bg-white text-gray-800"
-              value={skuOpts.includes(ovGpu) ? ovGpu : (skuOpts[0] || ovGpu)}
-              onChange={(e) => setOvGpu(e.target.value)}
-            >
-              {skuOpts.length
-                ? props.gpus.filter((g) => skuOf(g)).map((g) => <option key={skuOf(g)} value={skuOf(g)}>{gpuOptionLabel(g)}</option>)
-                : <option value={ovGpu}>{ovGpu}</option>}
-            </select>
-          </label>
-          <label className="inline-flex items-center gap-1.5 text-xs text-gray-500">
-            Parallel
-            <select
-              id="infer-scaling-par"
-              className="text-sm border border-gray-200 rounded-lg px-2 py-1.5 bg-white text-gray-800"
-              value={ovPar}
-              onChange={(e) => setOvPar(e.target.value as ParSweepMode)}
-            >
-              {PAR_SWEEP_MODES.filter((m) => m === "tp_tp" || !hideEp).map((m) => (
-                <option key={m} value={m}>{MODE_LABEL[m]}</option>
-              ))}
-            </select>
-          </label>
-          <label className="inline-flex items-center gap-1.5 text-xs text-gray-500">
-            GPUs
-            <select
-              id="infer-scaling-ngpu"
-              className="text-sm border border-gray-200 rounded-lg px-2 py-1.5 bg-white text-gray-800"
-              disabled={!grid}
-              value={batchDegree}
-              onChange={(e) => setOvDegree(Number(e.target.value))}
-            >
-              {batchDegrees.map((n) => <option key={n} value={n}>{n}</option>)}
-            </select>
-          </label>
-          <MeasuredCheck id="infer-scaling-measured" checked={showBatchMeas} onChange={setShowBatchMeas}
-            note={showBatchMeas ? batchMeasNote : null} />
+        <div className={`${PICK_ROW} mb-3`}>
+          <div className="text-sm font-medium text-gray-800 mr-1">KV storage</div>
+          <OnePick
+            id="infer-scaling-gpu"
+            label="GPU"
+            className="w-[15rem]"
+            value={skuOpts.includes(ovGpu) ? ovGpu : (skuOpts[0] || ovGpu)}
+            onChange={(e) => setOvGpu(e.target.value)}
+          >
+            {skuOpts.length
+              ? sweptGpus.map((g) => <option key={skuOf(g)} value={skuOf(g)}>{gpuOptionLabel(g)}</option>)
+              : <option value={ovGpu}>{ovGpu}</option>}
+          </OnePick>
+          <OnePick
+            id="infer-scaling-par"
+            label="Parallel"
+            value={ovPar}
+            onChange={(e) => setOvPar(e.target.value as ParSweepMode)}
+          >
+            {PAR_SWEEP_MODES.filter((m) => m === "tp_tp" || !hideEp).map((m) => (
+              <option key={m} value={m}>{MODE_LABEL[m]}</option>
+            ))}
+          </OnePick>
+          <OnePick
+            id="infer-scaling-ngpu"
+            label="GPUs"
+            disabled={!grid}
+            value={batchDegree}
+            onChange={(e) => setOvDegree(Number(e.target.value))}
+          >
+            {batchDegrees.map((n) => <option key={n} value={n}>{n}</option>)}
+          </OnePick>
         </div>
         {status ? (
-          // Reserve the batch row's height so the parallel section above keeps
-          // its position while this (independent) sweep is still loading —
+          // Reserve the row's height so the sections above keep their
+          // position while this (independent) sweep is still loading —
           // otherwise the two sweeps finishing out of order make the page jump.
           <div className="text-xs text-gray-400 text-center py-4 mb-2">
             {status.progress
               ? <ComputeProgress compact label={status.text} progress={status.progress} />
               : status.text}
           </div>
-        ) : (
-          <div className="flex gap-4 flex-wrap">
-            <SweepChart
-              title="Prefill (B=1)"
-              series={pre}
-              xTitle="context"
-              xUnit="ctx"
-              xLabel={fmtSeqLabel}
-              yTitle="tok/s"
-              valueUnit=" tok/s"
-              onPoint={props.onApply ? (_s, p) => {
-                setAppliedNote(`Applied: ctx ${fmtSeqLabel(p.x)} · batch 1`);
-                props.onApply?.({
-                  gpu: ovGpu || undefined,
-                  seq: p.x,
-                  batch: 1,
-                  par: batchPar,
-                });
-              } : undefined}
-            />
-            <SweepChart
-              title="Decode"
-              series={dec}
-              xTitle="decode batch"
-              xUnit="batch"
-              yTitle="tok/s"
-              valueUnit=" tok/s"
-              onPoint={props.onApply ? (s, p) => {
-                setAppliedNote(`Applied: ctx ${fmtSeqLabel(Number(s.applyKey))} · batch ${p.x}`);
-                props.onApply?.({
-                  gpu: ovGpu || undefined,
-                  seq: Number(s.applyKey) || undefined,
-                  batch: p.x,
-                  par: batchPar,
-                });
-              } : undefined}
-              legendSel={batchLegend}
-              onLegendSel={setBatchLegend}
-            />
-          </div>
-        )}
-        {!status ? <ContextLimitNote limit={batchLimit} past={batchPast} /> : null}
-        {!status && showBatchMeas ? <MeasuredRule /> : null}
-        {!status ? <KvStorageSection rows={kvRows} /> : null}
+        ) : <KvStorageSection rows={kvRows} />}
       </div>
     </section>
   );
