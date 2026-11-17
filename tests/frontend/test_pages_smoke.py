@@ -1513,21 +1513,25 @@ def test_gallery_speculative_switch_reasks_the_frontier_under_its_draft(browser_
     s.assert_clean()
 
 
-def test_inspector_reads_the_hash_of_each_visit(browser_base):
-    """Arriving with #model=… auto-analyzes it; coming back through the nav
-    (client-side route, same JS module) with no hash must not re-analyze the
-    first visit's model."""
+def test_inspector_nav_restores_the_last_visit_without_reanalysis(browser_base):
+    """The Inspector nav returns to its model and inner view. Its expensive
+    result remains in memory across a top-level client-side route change."""
     browser, base = browser_base
     s = Session(browser, base)
     s.goto("/inspector.html#model=deepseek-ai%2FDeepSeek-V3.2")
     assert s.wait_for(lambda: s.count("/analyze") >= 1)
     assert s.requests["/analyze"][0]["body"]["model_id"] == "deepseek-ai/DeepSeek-V3.2"
+    s.page.click("#tab-diagram")
+    assert "tab-active" in (s.page.get_attribute("#tab-diagram", "class") or "")
     s.page.click("a[data-tab='fusion']")
     s.page.wait_for_selector("main", timeout=10000)
     s.page.click("a[data-tab='inspector']")
     s.page.wait_for_selector("#model-id", timeout=10000)
     s.page.wait_for_timeout(1000)
     assert s.count("/analyze") == 1, [r["body"] for r in s.requests["/analyze"]]
+    assert "model=deepseek-ai%2FDeepSeek-V3.2" in s.page.evaluate("window.location.hash")
+    assert "view=diagram" in s.page.evaluate("window.location.hash")
+    assert "tab-active" in (s.page.get_attribute("#tab-diagram", "class") or "")
     s.assert_clean()
 
 
