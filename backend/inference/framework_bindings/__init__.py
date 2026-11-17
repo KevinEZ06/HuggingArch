@@ -272,7 +272,25 @@ class ResolvedLaunch:
         activation = env.get("activation")
         if not isinstance(activation, str):
             raise ValueError("a resolved launch states its activation dtype")
-        return cls(activation, env)
+        # Canonicalised, because the other side of the comparison is.
+        # `DispatchCondition.of` puts a condition's own values through
+        # `canonical(...).lower()`, so `activation_dtype: [int8]` is STORED
+        # as `i8` — while a key spells the same dtype `int8`, and `_among`
+        # compares the two strings. Of the twelve corpus tokens only five
+        # survive that round trip unchanged, `bf16` among them, which is
+        # why every bf16 condition worked and nothing else ever could.
+        #
+        # `ServingDeployment.at` already canonicalises its own activation
+        # dtype for exactly this reason; this is the launch-side half of
+        # the same fact, which had been read raw. An unknown spelling
+        # becomes None, as it does there: a fact nothing can name satisfies
+        # no condition that names one, which is what an unmatched spelling
+        # did anyway.
+        try:
+            dtype = canonical(activation).lower()
+        except UnknownDtype:
+            dtype = None
+        return cls(dtype, env)
 
     @property
     def unquantized_bf16(self) -> bool:
