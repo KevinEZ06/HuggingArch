@@ -1708,79 +1708,19 @@ def _capacity_preparation(
         weight_bytes_per_rank=weight_bytes_per_rank,
         static=kv_static_per_rank,
         constant_state=kv_constant_state_per_rank)
+    # Whether a request can run here at all. A refused card runs no phase
+    # walk — that is `_capacity_pending`'s `refused_estimate`, and it is where
+    # the saving is (the walks are the minutes; the tree below is milliseconds).
+    # The preparation itself is built the same way either way: a refused rank
+    # still answers every budget question a feasible one does — which modules
+    # its weights are, how many bytes each holds — and those answers have one
+    # producer (`_weight_tree`), whatever the verdict on fitting them.
     refusal_reason = (
         None if card_fields["fits"] else _weight_overflow_reason(
             gpu=card, weight_bytes=weight_bytes_per_rank,
             usable_bytes=price.usable_bytes,
             static_bytes=kv_static_per_rank,
             constant_state_bytes=kv_constant_state_per_rank))
-
-    if refusal_reason is not None:
-        # A rank that cannot load its weights has no display tree to build and
-        # no phase rows to walk. Keep the budget facts already read — enough
-        # for every ceiling and the no-step response — and return here.
-        wb = {
-            "total_bytes_per_rank": weight_bytes_per_rank,
-            "deployment_total_bytes": weight_bytes_total,
-            "deployment_data_bytes": weight_bytes_total,
-            "deployment_scale_bytes": 0.0,
-            "unattributed_scale_bytes": 0.0,
-            "pipeline": {"stage": pp_stage},
-            "published_checkpoint_bytes": published_weight_bytes,
-            "left_out_stacks": [],
-            "groups": [],
-            "model_level": [],
-        }
-        return _CapacityPreparation(
-            **card_fields,
-            cluster_size=cluster_size, num_gpus=num_gpus,
-            parallel=parallel,
-            gpu_memory_fraction=gpu_memory_fraction,
-            model_id=knobs.model_id,
-            resolved=resolved,
-            precision=precision,
-            resolved_precision=resolved_precision,
-            precision_report=analysis.precision_effective(),
-            kv_div=kv_div,
-            kv_reader=kv_reader,
-            kv_static_per_rank=kv_static_per_rank,
-            kv_constant_state_per_rank=kv_constant_state_per_rank,
-            per_token_per_rank=per_token_per_rank,
-            wb=wb,
-            weight_tree_at=lambda _stage=None: wb,
-            weight_bytes_per_rank=weight_bytes_per_rank,
-            weight_bytes_total=weight_bytes_total,
-            host_offload_bytes=host_offload_bytes,
-            host_offload=knobs.host_offload,
-            pp_stages=pp_stages,
-            pp_bound=pp_bound,
-            unique_tokens_multiplier=(
-                parallel.dp_attention * parallel.dp_replicas),
-            kv_replication_factor=kv_replication_factor,
-            comm_latency_s=knobs.comm_latency_us * 1e-6,
-            launch_floor_s=knobs.launch_floor_us * 1e-6,
-            roles_present=[],
-            shape_warnings=[],
-            max_context=max_context,
-            framework=fw,
-            framework_binding=framework_binding,
-            measurement_scope=knobs.measurement_scope or NO_MEASUREMENTS,
-            calibration_rows=knobs.calibration_rows,
-            strategy=strategy,
-            enable_measured_lookup=enable_measured_lookup,
-            selection_mode=knobs.selection_mode,
-            kernel_mix=knobs.kernel_mix,
-            kv_block_size=deployment_kv_block_size(
-                framework_binding, knobs.kv_block_size),
-            s_prefix_cached=knobs.s_prefix_cached,
-            s_verify=knobs.s_verify,
-            acceptance_rate=knobs.acceptance_rate,
-            ep_load_factor=knobs.ep_load_factor,
-            draft=draft,
-            refusal_reason=refusal_reason,
-            cells=cells,
-            account_cells=account_cells,
-        )
 
     # The tree is built for the stage the numbers beside it describe.
     wb = _weight_tree(pp_stage)
