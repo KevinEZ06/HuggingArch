@@ -981,15 +981,16 @@ def open_pick(s: Session, control: str) -> None:
 def test_throughput_charts_are_views_the_backend_draws_of_one_cloud(browser_base):
     """The Scaling panel's Throughput section asks the backend for views of
     the parallel sweep it shows (the same SOL body, every context, so the
-    same cache entry). It first asks what the cloud serves at the section's
-    context (max-batch lines per card × mode), once; each form's default
-    holds and lines are read off that — Pareto (the form it opens on) the
-    context and Plan's card, a line per mode; vs GPUs the context at the
-    max batch in the first mode that serves, a line per card; vs batch a
-    card, mode and GPU count that serve, a line per context — and a hold
-    the reader ticks survives a form switch. Each switch asks one view: no request depends
-    on its own answer. The page draws what comes back and computes no line
-    or front."""
+    same cache entry). It first asks what the cloud serves (max-batch lines
+    per card × mode), once and holding no context — that probe is a function
+    of the sweep alone; each form's default holds and lines are read off it
+    — Pareto (the form it opens on) the default context, which the cloud's
+    own values decide, and Plan's card, a line per mode; vs GPUs the context
+    at the max batch in the first mode that serves, a line per card; vs
+    batch a card, mode and GPU count that serve, a line per context — and a
+    hold the reader ticks survives a form switch. Each switch asks one view:
+    no request depends on its own answer. The page draws what comes back and
+    computes no line or front."""
     browser, base = browser_base
     s = Session(browser, base)
     view = "/inference/parallel-sweep/frontier"
@@ -1016,8 +1017,11 @@ def test_throughput_charts_are_views_the_backend_draws_of_one_cloud(browser_base
     posted = s.requests["/inference/estimate-parallel-sweep"][-1]["body"]
     assert {**first["sweep"], "sol_only": True} == {**posted, "sol_only": True}
     assert len(posted["contexts"]) == 9
-    ctx = int(s.page.input_value("#infer-scaling-ctx"))
-    assert probe == {**probe, "fix": {"context": [ctx], "batch_key": ["max"]},
+    # The context the panel opens on is the cloud's own: the Throughput
+    # section's Context hold is the panel's one context control, and the
+    # default it takes is read off what the cloud priced.
+    ctx = _frontier_view()["values"]["context"][0]
+    assert probe == {**probe, "fix": {"batch_key": ["max"]},
                      "group_by": ["gpu_sku", "mode"], "form": "line", "x": "num_gpus"}
     # It opens on Pareto, holding Plan's card: one card's layouts against
     # each other, so its lines split by mode.
@@ -1503,19 +1507,103 @@ def test_inference_scaling_ngpu_says_why_no_degree_fits(browser_base):
     s.goto("/inference.html")
     s.page.wait_for_selector("#infer-scaling-ngpu", timeout=15000)
     assert s.wait_for(lambda: s.count("/inference/estimate-parallel-sweep") >= 1)
+    # No count to offer is a dash, not an empty box over a value nobody
+    # chose: the select is disabled and carries why.
     assert s.wait_for(lambda: s.page.eval_on_selector_all(
-        "#infer-scaling-ngpu option", "els => els.map(e => e.value)") == [])
+        "#infer-scaling-ngpu option", "els => els.map(e => e.textContent)") == ["—"])
+    assert s.wait_for(lambda: s.page.is_disabled("#infer-scaling-ngpu"))
+    assert s.page.input_value("#infer-scaling-ngpu") == ""
     assert s.wait_for(lambda: reason in s.page.inner_text("#infer-scaling"))
     s.assert_clean()
 
 
-def test_inference_scaling_ctx_options_are_the_backend_grid(browser_base):
+def test_inference_scaling_while_it_computes_keeps_its_shape_and_says_so_once(browser_base):
+    """A cold panel — no sweep of it has answered — is not a void with a
+    sentence in it: the Throughput section's title, switches and controls'
+    row stand (greyed), both chart areas are skeletons of the size their
+    charts will be, and the status is said ONCE, naming what is computed and
+    that a first visit has nothing cached. The GPU-count select shows a dash
+    rather than an empty box."""
     browser, base = browser_base
     s = Session(browser, base)
+    # Neither sweep nor any view of it ever answers.
+    for path in ("/inference/estimate-parallel-sweep", "/inference/estimate-sweep",
+                 "/inference/parallel-sweep/frontier"):
+        s.hold.add(path)
+    s.goto("/inference.html#model=deepseek-ai%2FDeepSeek-V3&gpu=B200&ep=8&dp_attn=8")
+    s.page.wait_for_selector("#infer-throughput", timeout=15000)
+    # The shape the answer will have: the section's header and controls, and
+    # a skeleton where each chart goes (the throughput chart, and KV
+    # storage's pair).
+    assert s.page.inner_text("#infer-throughput-phase-decode") == "Decode"
+    assert s.page.is_disabled("#infer-throughput-phase-decode")
+    assert s.page.is_disabled("#infer-throughput-form-frontier")
+    assert s.page.locator("#infer-throughput [data-controls-skeleton]").count() == 1
+    assert s.wait_for(lambda: s.page.locator("[data-chart-skeleton]").count() == 3), (
+        s.page.locator("[data-chart-skeleton]").count())
+    assert s.page.locator("#infer-throughput [data-chart-skeleton]").count() == 1
+    # One status line for the panel, saying what is being computed and why a
+    # first visit is slow — and only one, whatever is still pending.
+    assert s.page.locator("#infer-scaling [data-panel-status]").count() == 1
+    said = s.page.inner_text("[data-panel-status]")
+    assert "Computing the deployment sweep" in said, said
+    assert "nothing is cached" in said, said
+    assert s.page.inner_text("#infer-scaling").count("Computing the deployment sweep") == 1
+    # The GPU count has no answer yet: a dash, disabled — never an empty box.
+    assert s.page.eval_on_selector_all(
+        "#infer-scaling-ngpu option", "els => els.map(e => e.textContent)") == ["—"]
+    assert s.page.is_disabled("#infer-scaling-ngpu")
+    assert s.page.inner_text("#infer-scaling-ngpu") == "—"
+    s.assert_clean()
+
+
+def test_inference_scaling_says_a_hold_shared_by_both_sweeps_once(browser_base):
+    """Both sweeps of the panel wait on the same thing — the caller's
+    calibration rows, still being read — and the panel says it once: the
+    sentence that used to be printed by each block on its own."""
+    browser, base = browser_base
+    s = Session(browser, base, overrides={"/api/auth/me": {
+        "authEnabled": True, "user": {"id": "u1", "email": "a@b.c"},
+        "profile": {"display_name": "A"}, "isAdmin": False}})
+    s.hold.add("/api/bench/calibration")
+    s.goto("/inference.html#model=deepseek-ai%2FDeepSeek-V3&gpu=B200&ep=8&dp_attn=8")
+    s.page.wait_for_selector("[data-panel-status]", timeout=15000)
+    assert s.wait_for(
+        lambda: "calibration rows" in s.page.inner_text("[data-panel-status]")), (
+        s.page.inner_text("[data-panel-status]"))
+    panel = s.page.inner_text("#infer-scaling")
+    assert panel.count("Reading your calibration rows") == 1, panel
+    # Nothing was asked while the rows are unknown: an uncalibrated sweep
+    # would have to be thrown away and asked again.
+    assert s.count("/inference/estimate-parallel-sweep") == 0
+    assert s.count("/inference/estimate-sweep") == 0
+    s.assert_clean()
+
+
+def test_inference_scaling_context_is_held_once_in_the_throughput_row(browser_base):
+    """The panel has ONE context control — the Throughput section's Context
+    hold, offering the contexts the cloud priced. There is no second context
+    picker above it, and the panel opens holding one context (so the
+    measured answer has a context to be read at)."""
+    view = "/inference/parallel-sweep/frontier"
+    answered = _frontier_view()
+    contexts = [1024, 4096, 131072]
+    browser, base = browser_base
+    s = Session(browser, base, overrides={
+        view: {**answered, "values": {**answered["values"], "context": contexts}}})
     s.goto("/inference.html")
-    s.page.wait_for_selector("#infer-scaling-ctx", timeout=15000)
-    assert s.wait_for(lambda: s.page.eval_on_selector_all(
-        "#infer-scaling-ctx option", "els => els.map(e => Number(e.value))") == SCALING_CONTEXTS)
+    s.page.wait_for_selector("#infer-throughput-fix-context", timeout=15000)
+    assert s.page.query_selector("#infer-scaling-ctx") is None
+    open_pick(s, "infer-throughput-fix-context")
+    offered = s.page.eval_on_selector_all(
+        "#infer-throughput-fix-context [data-pick-panel] input[type=checkbox]",
+        "els => els.map(e => Number(e.value))")
+    assert offered == contexts, offered
+    ticked = s.page.eval_on_selector_all(
+        "#infer-throughput-fix-context [data-pick-panel] input:checked",
+        "els => els.map(e => Number(e.value))")
+    assert ticked == [4096], ticked
+    assert not s.page.is_disabled("#infer-throughput-measured")
     s.assert_clean()
 
 
@@ -1629,8 +1717,12 @@ def test_inference_scaling_measured_toggle_asks_only_the_measured_answer(browser
     fresh = bodies(par)[before[par]:]
     assert len(fresh) == 1 and "sol_only" not in fresh[0], fresh
     sol = bodies(par)[before[par] - 1]
-    ctx = int(s.page.input_value("#infer-scaling-ctx"))
-    assert fresh[0]["contexts"] == [ctx] and ctx in sol["contexts"]
+    # The context the measured answer is read at is the one the Throughput
+    # section holds — one of the contexts the SOL answer priced, and exactly
+    # one (several held would mix measurements of different lengths).
+    assert len(fresh[0]["contexts"]) == 1, fresh[0]["contexts"]
+    ctx = fresh[0]["contexts"][0]
+    assert ctx in sol["contexts"]
     assert {**fresh[0], "sol_only": True} == {**sol, "contexts": [ctx]}
     assert s.count(kv) == before[kv], "KV storage asked for a measured answer"
     after = {p: s.count(p) for p in (kv, par)}
@@ -2227,17 +2319,23 @@ def test_kernel_bench_draws_one_utilization_chart_per_op(browser_base):
 @pytest.mark.parametrize("selection, ticked", [("latest", True), ("theoretical_only", True),
                                                ("latest", False)])
 def test_scaling_tab_cache_holds_sol_answers_only(browser_base, selection, ticked):
-    """Switching the Scaling context: the SOL answer prices every context,
-    so it is never asked again whatever the mode (it reads no measurements);
-    the measured answer, while Measured is ticked and the mode reads
-    measurements, is asked of the server for the context on screen — what
-    Kernel Bench holds may have changed since (docs/auto_sweep.md §7.5)."""
+    """Holding another context in the Throughput row — the panel's one
+    context control: the SOL answer prices every context, so it is never
+    asked again whatever the mode (it reads no measurements); the measured
+    answer, while Measured is ticked and the mode reads measurements, is
+    asked of the server for the context held — what Kernel Bench holds may
+    have changed since (docs/auto_sweep.md §7.5)."""
     browser, base = browser_base
-    s = Session(browser, base)
+    view = "/inference/parallel-sweep/frontier"
+    answered = _frontier_view()
+    a, b = 4096, 131072
+    s = Session(browser, base, overrides={
+        view: {**answered, "values": {**answered["values"], "context": [a, b]}}})
     s.goto("/inference.html#model=deepseek-ai%2FDeepSeek-V3&gpu=B200&ep=8&dp_attn=8"
            f"&selection={selection}")
     path = "/inference/estimate-parallel-sweep"
     assert s.wait_for(lambda: s.count(path) >= 1)
+    s.page.wait_for_selector("#infer-throughput-fix-context", timeout=15000)
     if ticked:
         s.page.check("#infer-throughput-measured")
     s.page.wait_for_timeout(800)
@@ -2245,24 +2343,31 @@ def test_scaling_tab_cache_holds_sol_answers_only(browser_base, selection, ticke
     assert first["selection_mode"] == selection
     bodies = lambda: [r["body"] for r in s.requests[path]]
     measured = selection != "theoretical_only" and ticked
-    a = s.page.eval_on_selector("#infer-scaling-ctx", "e => e.value")
-    b = next(str(c) for c in SCALING_CONTEXTS if str(c) != a)
+
+    def hold_context(ctx: int) -> None:
+        """Hold exactly that context: tick it, untick whatever else is held."""
+        open_pick(s, "infer-throughput-fix-context")
+        s.page.check(f"#infer-throughput-fix-context input[value='{ctx}']")
+        for other in (a, b):
+            if other != ctx:
+                s.page.uncheck(f"#infer-throughput-fix-context input[value='{other}']")
+
     n = s.count(path)
-    s.page.select_option("#infer-scaling-ctx", b)
+    hold_context(b)
     if measured:
         assert s.wait_for(lambda: s.count(path) == n + 1)
-        assert s.requests[path][-1]["body"]["contexts"] == [int(b)]
+        assert s.requests[path][-1]["body"]["contexts"] == [b]
     else:
         s.page.wait_for_timeout(1000)
         assert s.count(path) == n, "the SOL answer was asked again for a context it has"
     n = s.count(path)
-    s.page.select_option("#infer-scaling-ctx", a)
+    hold_context(a)
     s.page.wait_for_timeout(1000)
     back = bodies()[n:]
     assert not any(x.get("sol_only") for x in back), "the SOL answer was asked again"
     assert len(back) == (1 if measured else 0), back
     if measured:
-        assert back[0]["contexts"] == [int(a)]
+        assert back[0]["contexts"] == [a]
     s.assert_clean()
 
 

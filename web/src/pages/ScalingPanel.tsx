@@ -42,10 +42,11 @@ const BATCH_PAR_DEGREE = 8;
 
 const DEFAULT_SWEEP_GPU = "B200";
 
-/** The panel's context dropdown and GPU-count ladder, as the backend declares
- *  them (`sweep_grid.SCALING_CONTEXTS` / `SCALING_DEGREES` via
- *  `/inference/defaults`) — the same values `warm --sweeps` pre-computes. */
-type ScalingGrid = { contexts: number[]; degrees: number[] };
+/** The GPU-count ladder KV storage may be read at, as the backend declares
+ *  it (`sweep_grid.SCALING_DEGREES` via `/inference/defaults`) — the same
+ *  values `warm --sweeps` pre-computes. The contexts are not declared here:
+ *  they are the ones the cloud priced, read off its own answer. */
+type ScalingGrid = { degrees: number[] };
 
 type Phase = MeasuredPhase & {
   t_sol_s?: number | null;
@@ -161,18 +162,32 @@ type LegendSelected = Record<string, boolean>;
 
 export type ScalingApply = { gpu?: string; seq?: number; batch?: number; par?: Parallel };
 
-/** Degrees whose note reads exactly the same are one row: the sentence is
- *  said once, with every degree it holds for. Nothing here shortens or
- *  re-words the backend's text (§2.7) — rows group by equality alone. */
-function byNote(rows: { x: number; lines: string[] }[]): { xs: number[]; lines: string[] }[] {
-  const out = new Map<string, { xs: number[]; lines: string[] }>();
+/** One note of a ladder as the layout said it: which mode it is about and
+ *  the degrees of that mode it holds for. */
+type LadderRow = { mode: string; xs: number[]; lines: string[] };
+/** A sentence said once, with every mode and degree it holds for. */
+type LadderGroup = { modes: { mode: string; xs: number[] }[]; lines: string[] };
+
+/** Notes whose sentence reads exactly the same are one row: the sentence is
+ *  said once, with every mode and degree it holds for. Nothing here shortens
+ *  or re-words the backend's text (§2.7) — rows group by equality alone. */
+function byNote(rows: LadderRow[]): LadderGroup[] {
+  const out = new Map<string, { modes: Map<string, number[]>; lines: string[] }>();
   for (const r of rows) {
     const key = r.lines.join("\u0000");
-    const at = out.get(key);
-    if (at) at.xs.push(r.x);
-    else out.set(key, { xs: [r.x], lines: r.lines });
+    let at = out.get(key);
+    if (!at) {
+      at = { modes: new Map(), lines: r.lines };
+      out.set(key, at);
+    }
+    at.modes.set(r.mode, [...(at.modes.get(r.mode) || []), ...r.xs]);
   }
-  return [...out.values()].map((g) => ({ ...g, xs: [...g.xs].sort((a, b) => a - b) }));
+  return [...out.values()].map((g) => ({
+    lines: g.lines,
+    modes: [...g.modes.entries()].map(([mode, xs]) => ({
+      mode, xs: [...new Set(xs)].sort((a, b) => a - b),
+    })),
+  }));
 }
 
 /** How a run of degrees reads: the ends of the ladder past two of them. */
@@ -181,41 +196,91 @@ function degreeRange(unit: string, xs: number[]): string {
   return xs.map((x) => `${unit}${x}`).join(", ");
 }
 
-/** What the layout said about the degrees the chart does not draw: each
- *  refused degree with its reason, the degrees drawn that replicate, and the
- *  bound past which nothing was enumerated.
+/** The axis a mode's ladder counts in: three of the four modes scale the
+ *  expert axis, so a degree of theirs is an EP degree. */
+function ladderUnit(mode: string): string {
+  return mode === "tp_tp" ? "TP" : "EP";
+}
+
+/** A mode's degrees, named so a reader knows whose ladder refused: the mode
+ *  then its degrees, except where the ladder's own unit already names the
+ *  mode (TP's) and the prefix would read twice. */
+function modeDegrees(mode: string, xs: number[]): string {
+  const unit = ladderUnit(mode);
+  const label = MODE_LABEL[mode as ParSweepMode] ?? mode;
+  const ds = degreeRange(unit, xs);
+  return label === unit ? ds : `${label} ${ds}`;
+}
+
+/** What the layout said about the deployments the cloud does not contain —
+ *  for every parallel mode at once, since the cloud spans them all: a mode
+ *  no layout of this model admits, each refused degree with its reason, the
+ *  degrees drawn that replicate an axis, cards no point could be priced on,
+ *  and the bound past which nothing was enumerated.
  *
  *  Collapsed by default to one line that counts them and names the degrees:
  *  the reasons are a paragraph apiece and a ladder refuses six of them at a
  *  time, which buried the charts under a wall of amber. The detail is one
  *  click away and unabridged. */
-function LadderNotes({ blob, unit }: { blob: ParModeBlob; unit: string }) {
-  const refused = byNote((blob.ladder?.refused || []).map(
-    (r) => ({ x: r.x, lines: [r.reason] })));
-  const cap = blob.ladder?.beyond_cap;
-  const seen = new Map<number, string[]>();
-  for (const s of blob.series || []) {
-    for (const p of s.points || []) {
-      if (p.warnings?.length) seen.set(p.x, p.warnings);
+function LadderNotes({ byMode }: { byMode: Record<string, ParModeBlob> | null }) {
+  const refusedRows: LadderRow[] = [];
+  const replicatedRows: LadderRow[] = [];
+  const unavailable: { mode: string; reason: string }[] = [];
+  const unpriced: { gpu: string; error: string }[] = [];
+  const caps = new Set<number>();
+  for (const [mode, blob] of Object.entries(byMode || {})) {
+    // An EP mode of a model the estimate says routes no tokens to experts is
+    // not a deployment this model has — its ladder's notes are about an axis
+    // that does not exist here, so they are not the reader's news.
+    if (mode !== "tp_tp" && blob.moe_enabled === false) continue;
+    if (blob.unavailable) unavailable.push({ mode, reason: blob.unavailable });
+    for (const r of blob.ladder?.refused || []) {
+      refusedRows.push({ mode, xs: [r.x], lines: [r.reason] });
     }
+    const seen = new Map<number, string[]>();
+    for (const s of blob.series || []) {
+      for (const p of s.points || []) {
+        if (p.warnings?.length) seen.set(p.x, p.warnings);
+      }
+      // A card none of whose points could be priced (it lists no peak for the
+      // format a step computes in) draws no line: say why, naming the card.
+      if ((s.points || []).length && (s.points || []).every((p) => p.error)) {
+        unpriced.push({ gpu: s.gpu_sku || "", error: s.points?.[0]?.error || "" });
+      }
+    }
+    for (const [x, lines] of seen) replicatedRows.push({ mode, xs: [x], lines });
+    const cap = blob.ladder?.beyond_cap?.cap;
+    if (cap) caps.add(cap);
   }
-  const replicated = byNote([...seen.entries()].map(([x, lines]) => ({ x, lines })));
-  // A card none of whose points could be priced (it lists no peak for the
-  // format a step computes in) draws no line: say why. The reason names the card.
-  const unpriced = (blob.series || []).filter((s) =>
-    (s.points || []).length > 0 && (s.points || []).every((p) => p.error));
+  const refused = byNote(refusedRows);
+  const replicated = byNote(replicatedRows);
+  // One card is said once however many modes could not price it.
+  const cards = [...new Map(unpriced.map((u) => [`${u.gpu}\u0000${u.error}`, u])).values()];
   const counted = (n: number, what: string) => `${n} ${what}${n === 1 ? "" : "s"}`;
-  const degrees = (groups: { xs: number[] }[], said: (n: number) => string) => {
-    const xs = groups.flatMap((g) => g.xs).sort((a, b) => a - b);
-    return xs.length
-      ? `${counted(xs.length, "degree")} ${said(xs.length)} (${degreeRange(unit, xs)})` : "";
+  const pairs = (groups: LadderGroup[]) =>
+    groups.flatMap((g) => g.modes.flatMap((m) => m.xs)).length;
+  const degrees = (groups: LadderGroup[], said: (n: number) => string) => {
+    const n = pairs(groups);
+    if (!n) return "";
+    const per = new Map<string, number[]>();
+    for (const g of groups) {
+      for (const m of g.modes) per.set(m.mode, [...(per.get(m.mode) || []), ...m.xs]);
+    }
+    const named = [...per.entries()].map(([mode, xs]) =>
+      modeDegrees(mode, [...new Set(xs)].sort((a, b) => a - b))).join(", ");
+    return `${counted(n, "degree")} ${said(n)} (${named})`;
   };
   const headline = [
-    unpriced.length ? `${counted(unpriced.length, "card")} not drawn` : "",
+    unavailable.length
+      ? `${counted(unavailable.length, "mode")} ${unavailable.length === 1 ? "does" : "do"}`
+        + ` not apply (${unavailable.map((u) =>
+          MODE_LABEL[u.mode as ParSweepMode] ?? u.mode).join(", ")})`
+      : "",
+    cards.length ? `${counted(cards.length, "card")} not drawn` : "",
     degrees(refused, () => "did not hold"),
     degrees(replicated, (n) => `replicate${n === 1 ? "s" : ""} an axis`),
   ].filter(Boolean).join(" · ");
-  if (!headline && !cap) return null;
+  if (!headline && !caps.size) return null;
   return (
     <div className="mt-2 text-11 text-gray-500 space-y-0.5">
       {headline ? (
@@ -224,30 +289,43 @@ function LadderNotes({ blob, unit }: { blob: ParModeBlob; unit: string }) {
             {headline} — show why
           </summary>
           <div className="mt-1 space-y-1 pl-4">
-            {unpriced.map((s) => (
-              <div key={`unpriced-${s.gpu_sku}`} data-ladder="unpriced" data-gpu={s.gpu_sku}>
-                {s.gpu_sku} not drawn: {s.points?.[0]?.error}
+            {unavailable.map((u) => (
+              <div key={`unavailable-${u.mode}`} data-ladder="unavailable" data-mode={u.mode}>
+                {MODE_LABEL[u.mode as ParSweepMode] ?? u.mode} does not apply to this
+                model — {u.reason}
+              </div>
+            ))}
+            {cards.map((u) => (
+              <div key={`unpriced-${u.gpu}`} data-ladder="unpriced" data-gpu={u.gpu}>
+                {u.gpu} not drawn: {u.error}
               </div>
             ))}
             {refused.map((g) => (
-              <div key={`refused-${g.xs.join(",")}`} data-ladder="refused"
-                data-x={g.xs[0]} data-xs={g.xs.join(",")}>
-                {g.xs.map((x) => `${unit}${x}`).join(", ")}: this deployment does not
-                hold — {g.lines.join(" ")}
+              <div key={`refused-${g.lines.join("")}`} data-ladder="refused"
+                data-x={g.modes[0]?.xs[0]}
+                data-xs={g.modes.flatMap((m) => m.xs).join(",")}
+                data-modes={g.modes.map((m) => m.mode).join(",")}>
+                {g.modes.map((m) => modeDegrees(m.mode, m.xs)).join(" · ")}: this deployment
+                does not hold — {g.lines.join(" ")}
               </div>
             ))}
             {replicated.map((g) => (
-              <div key={`replicated-${g.xs.join(",")}`} data-ladder="replicated"
-                data-x={g.xs[0]} data-xs={g.xs.join(",")} className="text-amber-700">
-                {g.xs.map((x) => `${unit}${x}`).join(", ")}: {g.lines.join(" ")}
+              <div key={`replicated-${g.lines.join("")}`} data-ladder="replicated"
+                data-x={g.modes[0]?.xs[0]}
+                data-xs={g.modes.flatMap((m) => m.xs).join(",")}
+                data-modes={g.modes.map((m) => m.mode).join(",")}
+                className="text-amber-700">
+                {g.modes.map((m) => modeDegrees(m.mode, m.xs)).join(" · ")}: {g.lines.join(" ")}
               </div>
             ))}
           </div>
         </details>
       ) : null}
-      {cap ? (
-        <div data-ladder="beyond-cap">Not swept past {cap.cap} GPUs (cap {cap.cap}).</div>
-      ) : null}
+      {[...caps].sort((a, b) => a - b).map((cap) => (
+        <div key={`cap-${cap}`} data-ladder="beyond-cap">
+          Not swept past {cap} GPUs (cap {cap}).
+        </div>
+      ))}
     </div>
   );
 }
@@ -273,16 +351,18 @@ function legendSelEqual(a: LegendSelected | undefined, b: LegendSelected): boole
   return true;
 }
 
-/** GPU counts the parallel sweep marked feasible on this SKU at context
- *  `ctx` (max-decode batch > 0), within the backend's ladder. Empty when the
- *  sweep has not arrived, or this GPU has no series. */
-function feasibleDegrees(blob: ParModeBlob | null | undefined, gpuSku: string, ladder: number[], ctx: number): number[] {
+/** GPU counts the parallel sweep marked feasible on this SKU at the contexts
+ *  on screen (max-decode batch > 0), within the backend's ladder — every
+ *  context the sweep priced when the reader holds none. Empty when the sweep
+ *  has not arrived, or this GPU has no series. */
+function feasibleDegrees(blob: ParModeBlob | null | undefined, gpuSku: string, ladder: number[], ctxs: number[]): number[] {
   if (!blob?.series?.length) return [];
   const match = blob.series.find((s) => s.gpu_sku === gpuSku);
   if (!match) return [];
+  const at = (p: ParPoint) => !ctxs.length || (p.context != null && ctxs.includes(p.context));
   const xs = new Set<number>();
   for (const p of match.points || []) {
-    if (p.context === ctx && p.feasible && ladder.includes(p.x)) xs.add(p.x);
+    if (at(p) && p.feasible && ladder.includes(p.x)) xs.add(p.x);
   }
   return [...xs].sort((a, b) => a - b);
 }
@@ -292,14 +372,14 @@ function feasibleDegrees(blob: ParModeBlob | null | undefined, gpuSku: string, l
  *  backend's reason at the largest degree it tried, and a card the sweep
  *  did not price is said as such — never the whole ladder offered blind. */
 function degreeOptions(
-  blob: ParModeBlob | null | undefined, gpuSku: string, ladder: number[], ctx: number,
+  blob: ParModeBlob | null | undefined, gpuSku: string, ladder: number[], ctxs: number[],
 ): { options: number[]; refused: string | null } {
   const match = blob?.series?.find((s) => s.gpu_sku === gpuSku);
-  if (!match) return { options: [], refused: `the Parallelism sweep did not price ${gpuSku}` };
-  const options = feasibleDegrees(blob, gpuSku, ladder, ctx);
+  if (!match) return { options: [], refused: `the parallel sweep did not price ${gpuSku}` };
+  const options = feasibleDegrees(blob, gpuSku, ladder, ctxs);
   if (options.length) return { options, refused: null };
-  const last = [...(match.points || [])].reverse()
-    .find((p) => p.context === ctx && (p.reason || p.error));
+  const at = (p: ParPoint) => !ctxs.length || (p.context != null && ctxs.includes(p.context));
+  const last = [...(match.points || [])].reverse().find((p) => at(p) && (p.reason || p.error));
   return { options, refused: last?.reason || last?.error || "" };
 }
 
@@ -332,20 +412,25 @@ function fmtT(s: number): string {
 type MeasuredNote = { text: string; failed?: boolean };
 
 function MeasuredCheck({
-  id, checked, onChange, note,
+  id, checked, onChange, note, disabled,
 }: {
   id: string;
   checked: boolean;
   onChange: (v: boolean) => void;
   note?: MeasuredNote | null;
+  /** Why a measured track cannot be read here; the box is off while it is
+   *  said, so no chart claims a measurement nobody asked for. */
+  disabled?: string;
 }) {
   return (
-    <span className="inline-flex items-center gap-2">
-      <label className="inline-flex items-center gap-1.5 text-sm text-gray-700 cursor-pointer whitespace-nowrap">
+    <span className="inline-flex items-center gap-2" title={disabled || undefined}>
+      <label className={"inline-flex items-center gap-1.5 text-sm whitespace-nowrap "
+        + (disabled ? "text-gray-400 cursor-default" : "text-gray-700 cursor-pointer")}>
         <input
           id={id}
           type="checkbox"
           className="accent-gray-700"
+          disabled={!!disabled}
           checked={checked}
           onChange={(e) => onChange(e.target.checked)}
         />
@@ -623,157 +708,106 @@ function SweepChart({
   );
 }
 
-/** What the parallel-sweep panel says instead of its curves: a wait, or
- *  (`failed`) why the sweep did not load. `progress` is how far the server's
- *  work got, while its 503s say so. */
-type SweepStatus = { text: string; failed?: boolean; progress?: { done: number; total: number } };
+/** What a sweep of this panel says instead of its curves, and which of
+ *  three things the reader is looking at:
+ *
+ *  - `computing`: the server is doing this work now. `progress` is how far
+ *    it got, while its 503s say so, and the cold-start sentence belongs
+ *    here and nowhere else.
+ *  - `waiting`: an input this sweep needs is still arriving. Nothing for
+ *    the reader to do; an answer is coming.
+ *  - `verdict`: there will be no answer until the reader acts (no model
+ *    picked, no GPU count fits, the sweep failed).
+ *
+ *  A box whose answer is still coming draws a skeleton; a verdict is said
+ *  in a line. Every status says which it is, so neither is guessed from
+ *  its wording. */
+type SweepStatus = {
+  text: string;
+  kind: "computing" | "waiting" | "verdict";
+  failed?: boolean;
+  progress?: { done: number; total: number };
+};
 
-/** Which deployments this model admits: the context every chart below is
- *  read at, each parallel mode's ladder, and the degrees the layout refused
- *  with their reasons. It draws no curve — every throughput of the panel,
- *  prefill and decode alike, is a view of the one cloud
- *  (`ThroughputSection`), so nothing here is a second producer of a
- *  number. */
-function ParallelSection({
-  ctx,
-  onCtx,
-  contexts,
-  byMode,
-  status,
-  hideEp,
-}: {
-  ctx: number;
-  onCtx: (n: number) => void;
-  contexts: number[];
-  byMode: Record<string, ParModeBlob> | null;
-  status: SweepStatus | null;
-  hideEp: boolean;
-}) {
-  const [mode, setMode] = useState<ParSweepMode>("dp_ep");
+/** What each sweep of the panel computes, said where the reader waits for
+ *  it: this names the request the panel posted, it states no new fact. */
+const CLOUD_WORK = "the deployment sweep — every card × context × parallel mode";
+const KV_WORK = "the KV storage sweep — one request's cache at every context";
 
-  const disabledReason = (m: ParSweepMode): string => {
-    if (m !== "tp_tp") {
-      const blob = byMode?.[m];
-      if (hideEp || (blob != null && !blob.moe_enabled)) return "Not MoE — no EP axis";
-      if (blob?.unavailable) return blob.unavailable;
-    } else if (byMode?.[m]?.unavailable) {
-      return byMode[m].unavailable as string;
-    }
-    return "";
-  };
+/** Why the first visit for a model is the slow one; said beside whichever
+ *  sweep is computing, never as a figure the server has not given. */
+const COLD_NOTE = "First visit for a model computes them all — nothing is cached"
+  + " yet, so this takes minutes.";
 
-  // Keep the active tab on an applicable mode: a model/GPU switch can disable
-  // the current one (non-MoE hides EP modes, an unshardable layout collapses
-  // a mode), in which case fall through to the first enabled tab.
-  useEffect(() => {
-    if (!disabledReason(mode)) return;
-    const next = PAR_SWEEP_MODES.find((m) => !disabledReason(m));
-    if (next && next !== mode) setMode(next);
-  }, [byMode, hideEp, mode]);
+/** The status of a sweep the server is computing, with however far it got. */
+function computingStatus(work: string, progress?: { done: number; total: number }): SweepStatus {
+  return { text: `Computing ${work}`, kind: "computing", ...(progress ? { progress } : {}) };
+}
 
-  const blob = byMode?.[mode] || null;
+/** An answer is still coming — this sweep waits on an input, not on the
+ *  reader. Its box draws the shape of the answer meanwhile. */
+function waitingStatus(text: string): SweepStatus {
+  return { text, kind: "waiting" };
+}
 
-  let content: ReactNode;
-  if (status?.failed) {
-    content = <div className="text-xs text-red-500 text-center py-6">{status.text}</div>;
-  } else if (!blob) {
-    content = status
-      ? <div className="py-6 flex justify-center text-xs text-gray-400"><ComputeProgress compact label={status.text} progress={status.progress} /></div>
-      : <div className="text-xs text-red-500 text-center py-6">{MODE_LABEL[mode]}: sweep load failed</div>;
-  } else if (blob.unavailable) {
-    // Every layout of this mode was invalid for this model (e.g. CP over a
-    // recurrent mixer) — say so, don't misreport it as OOM. The tab
-    // is normally disabled in this state; this is the fallback panel.
-    content = (
-      <div className="text-xs text-gray-400 text-center py-6" title={blob.unavailable}>
-        {MODE_LABEL[mode]} does not apply to this model.
-      </div>
-    );
-  } else {
-    // The sweep prices every context; this section reads the one on screen.
-    const atCtx = (pts: ParPoint[] | undefined) => (pts || []).filter((p) => p.context === ctx);
-    const allPts = (blob.series || []).flatMap((s) => atCtx(s.points));
-    if (!allPts.some((p) => p.feasible)) {
-      // Still computing: the cells that landed so far fit nothing, the rest
-      // may — not a verdict yet.
-      content = status
-        ? <div className="py-6 flex justify-center"><ComputeProgress compact label={status.text} progress={status.progress} /></div>
-        : (
-          <div className="text-xs text-amber-700 text-center py-8">
-            No GPU × degree fits (weights over budget).
-          </div>
-        );
-    } else {
-      content = null;
-    }
-    // One context for every point: if its request runs past the model's
-    // published context, every throughput below extrapolates — said here.
-    const past = allPts.some((p) => p.beyond_max_context);
-    const limit = maxContextOf(allPts);
-    const pastNote = past ? (
-      <div data-context-limit className="mb-2 text-11 text-amber-700">
-        ctx {fmtSeqLabel(ctx)} is past the model's published max context
-        {limit ? ` (${limit.toLocaleString("en-US")} tokens)` : ""}; these deployments
-        extrapolate beyond what the model serves.
-      </div>
-    ) : null;
-    content = <>{pastNote}{content}<LadderNotes blob={blob} unit={mode === "tp_tp" ? "TP" : "EP"} /></>;
-  }
-  // Drawn from the cells that landed while the rest compute: a small note
-  // in the corner says so, not a bar over the chart.
-  if (blob && status && !status.failed) {
-    content = (
-      <>
-        <div data-sweep-partial className="flex justify-end mb-1 text-11 text-gray-400">
-          <ComputeProgress compact label="computing" progress={status.progress} unit="cells" />
-        </div>
-        {content}
-      </>
-    );
-  }
+/** There will be no answer until the reader acts; `failed` where a request
+ *  is what did not answer. */
+function verdictStatus(text: string, failed?: boolean): SweepStatus {
+  return { text, kind: "verdict", ...(failed ? { failed: true } : {}) };
+}
 
+/** Whether what this box will hold is still on its way. */
+function stillComing(status: SweepStatus | null): boolean {
+  return !!status && status.kind !== "verdict";
+}
+
+/** The panel's one status line: whichever sweep is being waited on, the
+ *  server's own count while it reports one, and the cold-start sentence
+ *  while the work is the server's. One line for the whole panel — neither
+ *  block prints its own copy of a sentence this one already says. */
+function PanelStatus({ status }: { status: SweepStatus }) {
   return (
-    <div className="mb-6">
-      <div className={`${PICK_ROW} mb-3`}>
-        <div className="text-sm font-medium text-gray-800 mr-1">Parallelism</div>
-        <OnePick
-          id="infer-scaling-ctx"
-          label="Context"
-          disabled={!contexts.length}
-          value={ctx}
-          onChange={(e) => onCtx(Number(e.target.value))}
-        >
-          {contexts.map((c) => <option key={c} value={c}>{fmtSeqLabel(c)}</option>)}
-        </OnePick>
-        <div className={SEGMENTED}>
-          {PAR_SWEEP_MODES.map((m) => {
-            const reason = disabledReason(m);
-            const active = m === mode;
-            return (
-              <button
-                key={m}
-                id={`infer-scaling-mode-${m}`}
-                type="button"
-                disabled={!!reason}
-                title={reason || undefined}
-                onClick={() => setMode(m)}
-                className={
-                  SEGMENT +
-                  (reason
-                    ? "text-gray-300 cursor-not-allowed"
-                    : active
-                      ? "bg-white shadow-sm text-gray-900 font-medium"
-                      : "text-gray-500 hover:text-gray-800")
-                }
-              >
-                {MODE_LABEL[m]}
-              </button>
-            );
-          })}
-        </div>
-      </div>
-      {content}
+    <div
+      data-panel-status
+      className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border
+        border-gray-100 bg-gray-50 px-2.5 py-1.5 text-11 text-gray-500"
+    >
+      {status.progress
+        ? <ComputeProgress compact label={status.text} progress={status.progress} unit="cells" />
+        : <span className={status.failed ? "text-red-500" : ""}>{status.text}</span>}
+      {status.kind === "computing" ? <span className="text-gray-400">{COLD_NOTE}</span> : null}
     </div>
+  );
+}
+
+/** The box a chart will occupy while its answer is computed: the axis frame
+ *  it will have, three of its gridlines and a sheen across the plot area, at
+ *  the height the chart itself is given — so the answer lands without moving
+ *  the page, and nothing here reads as a number. */
+function ChartSkeleton({ height }: { height: number }) {
+  return (
+    <div data-chart-skeleton aria-hidden className="pl-12 pr-4 pt-3 pb-8" style={{ height }}>
+      <div className="relative h-full border-l border-b border-gray-200">
+        {[25, 50, 75].map((p) => (
+          <div key={p} className="absolute inset-x-0 border-t border-gray-100"
+            style={{ top: `${p}%` }} />
+        ))}
+        <div className="skeleton absolute inset-x-2 bottom-1 top-6 rounded" />
+      </div>
+    </div>
+  );
+}
+
+/** The controls' row while the cloud has not answered: the pickers it will
+ *  hold are the cloud's own dimensions, so their boxes stand in for them
+ *  rather than this page naming dimensions it has not been told about. */
+function ControlsSkeleton() {
+  return (
+    <span className="flex items-center gap-1.5" data-controls-skeleton aria-hidden>
+      {[0, 1, 2].map((i) => (
+        <span key={i} className="skeleton h-8 w-24 rounded-lg" />
+      ))}
+    </span>
   );
 }
 
@@ -1278,16 +1312,17 @@ type CloudView = {
  *  storage default where it serves. */
 const CLOUD_BATCH_DEGREE = BATCH_PAR_DEGREE;
 
-/** What the cloud serves at a context, read once per (sweep, context): the
- *  max-batch lines per card × mode along the GPU count (`baseRequest`).
- *  Every form's defaults are read off it, and no view's request depends on
- *  that view's own answer — a default read off the answer it shapes never
- *  settles. */
+/** What the cloud serves, read once per sweep: the max-batch lines per card
+ *  × mode along the GPU count (`baseRequest`). Every form's defaults — the
+ *  context among them, since this section's hold is the panel's one context
+ *  control — are read off it, and this request is a function of the sweep
+ *  alone, so no view's request depends on that view's own answer: a default
+ *  read off the answer it shapes never settles. */
 type CloudBase = { served: Map<string, Map<string, number[]>>; view: CloudView };
 
-function baseRequest(sweepBody: Record<string, unknown>, ctx: number) {
+function baseRequest(sweepBody: Record<string, unknown>) {
   return {
-    sweep: sweepBody, fix: { context: [ctx], batch_key: ["max"] },
+    sweep: sweepBody, fix: { batch_key: ["max"] },
     group_by: ["gpu_sku", "mode"], form: "line", x: "num_gpus",
   };
 }
@@ -1304,14 +1339,28 @@ function cloudBase(view: CloudView): CloudBase {
   return { served, view };
 }
 
+/** The context the panel opens on where the reader holds none: the routine
+ *  4K request, which every card serves, else the shortest context the cloud
+ *  priced. The hold IS the panel's context control, so this is the panel's
+ *  default context — read off what the cloud serves, so a context this
+ *  model was not priced at is never held. */
+const DEFAULT_HOLD_CONTEXT = 4096;
+
+function defaultContext(base: CloudBase): number | null {
+  const cs = (base.view.values?.context || []).map(Number)
+    .filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
+  if (!cs.length) return null;
+  return cs.includes(DEFAULT_HOLD_CONTEXT) ? DEFAULT_HOLD_CONTEXT : cs[0];
+}
+
 /** A form's holds where the reader has set none, read off what the cloud
  *  serves (`CloudBase`), never off another section's pickers: a value the
  *  cloud does not have would draw an empty chart with a false reason.
- *  Pareto and vs GPUs hold the section's context (Pareto also Plan's card,
+ *  Pareto and vs GPUs hold the default context (Pareto also Plan's card,
  *  so one card's layouts stand against each other); the forms whose X is
  *  the context do not hold it, and pin a card, a mode and a GPU count that
  *  serve instead. */
-function formDefaults(form: FormKey, ctx: number, planGpu: string,
+function formDefaults(form: FormKey, ctx: number | null, planGpu: string,
                       base: CloudBase): Holds {
   const modeServing = (modes: Map<string, number[]> | undefined) =>
     PAR_SWEEP_MODES.find((m) => modes?.has(m)) ?? [...(modes?.keys() || [])][0];
@@ -1321,15 +1370,16 @@ function formDefaults(form: FormKey, ctx: number, planGpu: string,
   // One card's layouts against each other — every mode its own line (the
   // lines default reads `cardsHeld === 1`), which is what the frontier is
   // asked for. Other cards are added back by clearing the GPU hold.
+  const atCtx = ctx == null ? {} : { context: [ctx] };
   if (form === "frontier") {
     const gpu = planOr();
-    return { context: [ctx], ...(gpu ? { gpu_sku: [gpu] } : {}) };
+    return { ...atCtx, ...(gpu ? { gpu_sku: [gpu] } : {}) };
   }
   if (form === "num_gpus") {
     const any = new Map<string, number[]>();
     for (const modes of base.served.values()) for (const [m, ns] of modes) any.set(m, ns);
     const mode = modeServing(any);
-    return { context: [ctx], batch_key: ["max"], ...(mode ? { mode: [mode] } : {}) };
+    return { ...atCtx, batch_key: ["max"], ...(mode ? { mode: [mode] } : {}) };
   }
   const gpu = planOr();
   const modes = gpu ? base.served.get(gpu) : undefined;
@@ -1346,6 +1396,19 @@ function formDefaults(form: FormKey, ctx: number, planGpu: string,
   };
 }
 
+/** Which CLOUD a sweep body is of: everything about it except which answer
+ *  of that cloud was asked for — the contexts a measured read narrows to,
+ *  and `sol_only`. Those two pick the answer, not the deployments it is
+ *  about, so a reader's holds (and the controls they are set on) survive
+ *  the measured answer landing on the very same points. */
+function cloudOf(sweepBody: Record<string, unknown> | null): string {
+  if (!sweepBody) return "";
+  const rest = { ...sweepBody };
+  delete rest.contexts;
+  delete rest.sol_only;
+  return JSON.stringify(rest);
+}
+
 async function postView(body: unknown, signal: AbortSignal): Promise<CloudView> {
   return fetchJson<CloudView>("/inference/parallel-sweep/frontier", {
     method: "POST",
@@ -1359,12 +1422,12 @@ async function postView(body: unknown, signal: AbortSignal): Promise<CloudView> 
  *  pair of axes is the comparison. */
 const SUBTITLE: Record<CloudPhase, Record<"frontier" | "line", string>> = {
   decode: {
-    frontier: "Every layout of the Parallelism sweep at every per-GPU decode batch, kept to the held values; each line keeps the points no other point of it beats on both axes, up and to the right is better — faster for one request AND more tokens per GPU.",
-    line: "Decode tokens/s per GPU, every layout of the Parallelism sweep kept to the held values; where several points of a line share an X, the line keeps the best (the hover names it). One GPU is the first point of every mode's line.",
+    frontier: "Every layout of the parallel sweep at every per-GPU decode batch, kept to the held values; each line keeps the points no other point of it beats on both axes, up and to the right is better — faster for one request AND more tokens per GPU.",
+    line: "Decode tokens/s per GPU, every layout of the parallel sweep kept to the held values; where several points of a line share an X, the line keeps the best (the hover names it). One GPU is the first point of every mode's line.",
   },
   prefill: {
-    frontier: "Every layout of the Parallelism sweep, kept to the held values, at one request: how fast that request's prompt is read (its tokens over its time to first token) against what each GPU contributes. The knob along a line is the deployment — more GPUs cut the time to first token and cost per-GPU efficiency — so up and to the right is better, as decode's is.",
-    line: "Prefill tokens/s per GPU at one request, every layout of the Parallelism sweep kept to the held values; where several points of a line share an X, the line keeps the best (the hover names it). One GPU is the first point of every mode's line.",
+    frontier: "Every layout of the parallel sweep, kept to the held values, at one request: how fast that request's prompt is read (its tokens over its time to first token) against what each GPU contributes. The knob along a line is the deployment — more GPUs cut the time to first token and cost per-GPU efficiency — so up and to the right is better, as decode's is.",
+    line: "Prefill tokens/s per GPU at one request, every layout of the parallel sweep kept to the held values; where several points of a line share an X, the line keeps the best (the hover names it). One GPU is the first point of every mode's line.",
   },
 };
 
@@ -1388,31 +1451,47 @@ const AXIS_TITLE: Record<CloudPhase, { x: string; y: string }> = {
  *  point carrying both phases). The phase and form switches pick the view;
  *  the holds and the lines are shared across both and survive a switch. A
  *  hold or the lines the reader has not set take the form's default, read
- *  off what the cloud serves at the section's context (`formDefaults`). A
- *  (phase, form) pair the cloud cannot answer is disabled with the cloud's
- *  own reason (`view.forms`) — never a rule this page keeps. A click
- *  applies the point. */
+ *  off what the cloud serves (`formDefaults`). A (phase, form) pair the
+ *  cloud cannot answer is disabled with the cloud's own reason
+ *  (`view.forms`) — never a rule this page keeps. A click applies the point.
+ *
+ *  The Context hold is the panel's ONE context control: the sweep prices
+ *  every routine context in one request, the holds pick which of them is on
+ *  screen, and whoever else needs "the context the reader is looking at" —
+ *  the measured answer, KV storage's GPU counts — reads it from here
+ *  (`onHeldContexts`) rather than keeping a second picker.
+ *
+ *  While the sweep is still being computed the section keeps its shape: the
+ *  title, the switches and the controls' row stand (disabled, since there is
+ *  nothing yet to switch between), and the chart's box is a skeleton of the
+ *  size the chart will be. */
 function ThroughputSection({
-  ctx,
   sweepBody,
+  byMode,
   gpus,
   planGpu,
   showMeasured,
   onShowMeasured,
   measuredNote,
+  onHeldContexts,
   onApply,
 }: {
-  ctx: number;
   /** The parallel sweep's body whose answer every view reads: the SOL one,
    *  or — with Measured ticked — the measured one the panel also posts, so
-   *  the prefill track it folds is on these very points. */
-  sweepBody: Record<string, unknown>;
+   *  the prefill track it folds is on these very points. Null until that
+   *  sweep has answered: the section then draws its skeleton and asks for
+   *  no view. */
+  sweepBody: Record<string, unknown> | null;
+  /** The sweep's per-mode answer, for what the layout refused (`LadderNotes`). */
+  byMode: Record<string, ParModeBlob> | null;
   gpus: string[];
   /** Plan's card: the one a form holds first, if the cloud serves it. */
   planGpu: string;
   showMeasured: boolean;
   onShowMeasured: (v: boolean) => void;
   measuredNote: MeasuredNote | null;
+  /** The contexts this section holds, for the panel's other readers of it. */
+  onHeldContexts: (ctxs: number[]) => void;
   onApply?: (p: ScalingApply) => void;
 }) {
   const [phase, setPhase] = useState<CloudPhase>("decode");
@@ -1425,27 +1504,36 @@ function ThroughputSection({
   // (frozen on the way open, so the row and the drawer never show one
   // dimension twice).
   const [drawer, setDrawer] = useState<CloudDim[] | null>(null);
-  const [baseAnswer, setBaseAnswer] = useState<{ key: string; base: CloudBase } | null>(null);
+  const [baseAnswer, setBaseAnswer] = useState<
+    { key: string; cloud: string; base: CloudBase } | null>(null);
   const [answer, setAnswer] = useState<{ key: string; view: CloudView } | null>(null);
   const [failed, setFailed] = useState("");
   const [applied, setApplied] = useState("");
-  const sweepKey = JSON.stringify(sweepBody);
-  // A new sweep holds nothing the reader picked: its cloud may not have it.
+  // A new CLOUD holds nothing the reader picked: it may not have it. The
+  // same cloud's measured answer is not a new cloud (`cloudOf`).
+  const sweepKey = cloudOf(sweepBody);
   useEffect(() => { setPicked({}); setPickedLines(null); setDrawer(null); }, [sweepKey]);
-  // What the cloud serves at this context: asked once per (sweep, context).
-  const baseKey = JSON.stringify(baseRequest(sweepBody, ctx));
-  const base = baseAnswer?.key === baseKey ? baseAnswer.base : null;
+  // What the cloud serves: asked once per sweep.
+  const baseKey = sweepBody ? JSON.stringify(baseRequest(sweepBody)) : "";
+  const fresh = baseKey && baseAnswer?.key === baseKey ? baseAnswer.base : null;
+  // While the next probe of the SAME cloud is in flight the last answer
+  // stands: ticking Measured asks for the same deployments with their
+  // measured values folded in, and the controls — and what they hold —
+  // must not empty under the reader's hand and come back. Only the REQUEST
+  // below waits for the fresh answer; everything on screen reads this one.
+  const base = fresh ?? (sweepKey && baseAnswer?.cloud === sweepKey ? baseAnswer.base : null);
   useEffect(() => {
+    if (!baseKey) return;
     const ctrl = new AbortController();
     setFailed("");
     postView(JSON.parse(baseKey), ctrl.signal)
-      .then((v) => setBaseAnswer({ key: baseKey, base: cloudBase(v) }))
+      .then((v) => setBaseAnswer({ key: baseKey, cloud: sweepKey, base: cloudBase(v) }))
       .catch((e) => {
         if (isAbort(e)) return;
         setFailed(e instanceof Error ? e.message : String(e));
       });
     return () => ctrl.abort();
-  }, [baseKey]);
+  }, [baseKey, sweepKey]);
   // Which (phase, form) pairs this cloud answers, as the cloud says. The
   // chosen form falls through to the first the phase can answer — decided
   // here, while the request is built, so a switch asks one view and not two.
@@ -1453,10 +1541,30 @@ function ThroughputSection({
   const refusedFor = (f: FormKey): string => refusals?.[phase]?.[f] || "";
   const drawnForm: FormKey = !refusals || !refusedFor(form)
     ? form : (FORMS.map((f) => f.form).find((f) => !refusedFor(f)) ?? form);
-  const fix: Holds = base ? formDefaults(drawnForm, ctx, planGpu, base) : {};
+  const fix: Holds = base ? formDefaults(drawnForm, defaultContext(base), planGpu, base) : {};
   for (const [d, vs] of Object.entries(picked) as [CloudDim, CloudValue[]][]) {
     if (vs.length) fix[d] = vs; else delete fix[d];
   }
+  // The panel's one context answer: what this section holds. Published once
+  // the cloud has answered — before that the hold is not a fact yet, and a
+  // reader of it (the measured sweep, KV storage's GPU counts) waits.
+  const heldCtxKey = base ? JSON.stringify((fix.context || []).map(Number)) : "";
+  useEffect(() => {
+    if (!heldCtxKey) return;
+    onHeldContexts(JSON.parse(heldCtxKey) as number[]);
+  }, [heldCtxKey, onHeldContexts]);
+  // A measurement is keyed to the context it ran at, so the measured answer
+  // is read at ONE context: the held one. Where the hold is not a single
+  // context (the forms whose X is the context), Measured says so rather than
+  // the panel inventing a context — the way a form the cloud cannot answer
+  // disables itself.
+  const measuredReason = !base
+    ? "Waiting for the deployment sweep."
+    : (fix.context?.length ?? 0) === 1
+      ? ""
+      : "Hold one context to read measured rows: a measurement is keyed to the"
+        + " context it ran at.";
+  const measuredOn = showMeasured && !measuredReason;
   // The values each control offers: the last answer's, so a control does
   // not empty while the next view is in flight; before the first answer,
   // what the cloud serves at this context (`base`), so the first paint is
@@ -1474,7 +1582,7 @@ function ThroughputSection({
   // No view is asked before its defaults are known: the request is one
   // function of the sweep, the context, the phase, the form and the
   // reader's picks.
-  const reqBody = base
+  const reqBody = fresh
     ? JSON.stringify({ sweep: sweepBody, phase, fix, group_by: by,
                        ...formView(drawnForm) }) : "";
   const view = reqBody && answer?.key === reqBody ? answer.view : null;
@@ -1528,18 +1636,23 @@ function ThroughputSection({
     onApply?.({ gpu: p.gpu_sku, seq: p.context, batch, par: parallelOf(p.parallel) });
   };
   const dims = cloudDims;
-  // The title says every held value — the context among them, which the
-  // Parallelism dropdown above no longer drives once the reader holds one.
+  // The title says every held value, the context among them — this section's
+  // holds are the whole of what is on screen.
   const held = dims.filter((d) => fix[d]?.length)
     .map((d) => (fix[d] as CloudValue[]).map((v) => cloudLabel(d, v)).join(", ")).join(" · ");
-  const specK = Number(sweepBody.speculative_draft_tokens) || 0;
+  const specK = Number(sweepBody?.speculative_draft_tokens) || 0;
   const specNote = phase === "decode" && specK > 0
-    ? ` Speculative decoding, K = ${specK} at α = ${sweepBody.acceptance_rate}: ${sweepBody.speculative_draft
+    ? ` Speculative decoding, K = ${specK} at α = ${sweepBody?.acceptance_rate}: ${sweepBody?.speculative_draft
       ? "each step runs the K MTP draft forwards and the verify over K + 1 positions"
       : "each step is the verify over K + 1 positions alone (no draft forward on the GPU)"}, keeping 1 + α·K tokens per request.`
     : "";
   const drawn = groups.flatMap((s) => s.points);
   const past = drawn.some((p) => p.beyond_max_context);
+  // Nothing to switch between until the cloud has answered: the switches
+  // stand where they will be, greyed, rather than vanishing and shoving the
+  // chart up when the answer lands.
+  const pending = !base && !failed;
+  const waiting = pending ? "Waiting for the deployment sweep." : "";
   const segment = (active: boolean, reason: string) => SEGMENT + (reason
     ? "text-gray-300 cursor-not-allowed"
     : active
@@ -1581,7 +1694,7 @@ function ThroughputSection({
           // A phase no point of this cloud prices is not a view of it; the
           // cloud says so for every form, so its Pareto's reason stands for
           // the phase.
-          const reason = refusals?.[ph]?.frontier || "";
+          const reason = refusals?.[ph]?.frontier || waiting;
           return (
             <button
               key={ph}
@@ -1599,7 +1712,7 @@ function ThroughputSection({
       </div>
       <div className={SEGMENTED}>
         {FORMS.map(({ form: f, label }) => {
-          const reason = refusedFor(f);
+          const reason = refusedFor(f) || waiting;
           return (
             <button
               key={f}
@@ -1619,39 +1732,45 @@ function ThroughputSection({
   );
   const controls = (
     <div className={PICK_ROW}>
-      {rowDims.map(hold)}
-      {drawerDims.length || fixedDims.length ? (
-        <FiltersPick
-          id="infer-throughput-filters"
-          dims={drawerDims}
-          fixed={fixedDims}
-          values={lastValues}
-          picked={fix}
-          onPick={(d, vs) => setPicked((f) => ({ ...f, [d]: vs }))}
-          open={drawer !== null}
-          onOpen={(v) => setDrawer(v ? drawerDims : null)}
-        />
-      ) : null}
-      {lineOptions.length ? (
-        <MultiPick
-          id="infer-throughput-lines"
-          label="Lines"
-          emptyText="GPU only"
-          options={lineOptions}
-          picked={lineDims}
-          text={(d) => HOLD_LABEL[d as CloudDim] ?? String(d)}
-          onChange={(ds) => setPickedLines(ds as CloudDim[])}
-        />
-      ) : null}
-      <span title="Prefill only: a decode rung of the cloud keys no measurement, so decode is SOL.">
-        <MeasuredCheck id="infer-throughput-measured" checked={showMeasured}
-          onChange={onShowMeasured} note={showMeasured ? measuredNote : null} />
+      {pending ? <ControlsSkeleton /> : (
+        <>
+          {rowDims.map(hold)}
+          {drawerDims.length || fixedDims.length ? (
+            <FiltersPick
+              id="infer-throughput-filters"
+              dims={drawerDims}
+              fixed={fixedDims}
+              values={lastValues}
+              picked={fix}
+              onPick={(d, vs) => setPicked((f) => ({ ...f, [d]: vs }))}
+              open={drawer !== null}
+              onOpen={(v) => setDrawer(v ? drawerDims : null)}
+            />
+          ) : null}
+          {lineOptions.length ? (
+            <MultiPick
+              id="infer-throughput-lines"
+              label="Lines"
+              emptyText="GPU only"
+              options={lineOptions}
+              picked={lineDims}
+              text={(d) => HOLD_LABEL[d as CloudDim] ?? String(d)}
+              onChange={(ds) => setPickedLines(ds as CloudDim[])}
+            />
+          ) : null}
+        </>
+      )}
+      <span title={measuredReason
+        || "Prefill only: a decode rung of the cloud keys no measurement, so decode is SOL."}>
+        <MeasuredCheck id="infer-throughput-measured" checked={measuredOn}
+          disabled={measuredReason} onChange={onShowMeasured}
+          note={measuredOn ? measuredNote : null} />
       </span>
       {applied ? <span className="text-11 text-green-600">{applied}</span> : null}
     </div>
   );
   const subtitle = SUBTITLE[phase][drawnForm === "frontier" ? "frontier" : "line"]
-    + (phase === "prefill" ? PREFILL_SCHEDULE_NOTE : "") + specNote + ` SOL${showMeasured ? ", measured beside it where every op of the step is measured" : " only"}.`
+    + (phase === "prefill" ? PREFILL_SCHEDULE_NOTE : "") + specNote + ` SOL${measuredOn ? ", measured beside it where every op of the step is measured" : " only"}.`
     + (onApply ? " Click a point to apply it." : "");
   const empty = failed ? `view load failed: ${failed}` : view ? "No layout serves these held values on these GPUs." : "Loading…";
   const pastNote = past ? (
@@ -1685,20 +1804,25 @@ function ThroughputSection({
     const v = field ? (p as unknown as Record<string, unknown>)[field] : null;
     return typeof v === "number" && Number.isFinite(v) ? v : NaN;
   };
+  // Only the chart area below the header changes with the view: the header
+  // is rendered once, outside these branches. A header re-created inside a
+  // branch is a header REMOUNTED whenever the branch changes — which, with
+  // a skeleton for a view in flight, is every time a reader holds a value:
+  // the popover under their hand would close and the control move.
   let chart: ReactNode;
-  if (!axes) {
-    chart = (
-      <div>
-        {header}
-        <div className="text-xs text-gray-400 text-center py-6">{empty}</div>
-      </div>
-    );
+  // Being computed, or a view of it in flight: the box the chart will fill,
+  // at the height it will have. A sentence in white space is not a chart,
+  // and a box that appears when the answer does moves the page.
+  if (pending || (!failed && !view)) {
+    chart = <ChartSkeleton height={drawnForm === "frontier" ? 420 : 300} />;
+  } else if (!axes) {
+    chart = <div className="text-xs text-gray-400 text-center py-6">{empty}</div>;
   } else if (drawnForm === "frontier") {
     const series: FrontierSeries<ParFrontierPt>[] = groups.map((s, i) => {
       const st = style(s.group, i);
       return {
         key: st.key, label: st.label, color: st.color, points: s.points,
-        ...(showMeasured
+        ...(measuredOn
           ? { measured: s.points.filter((p) => isComplete(covOf(p))) } : {}),
         ...(cards.size > 1 && (roundOf.get(String(s.group.gpu_sku)) ?? 0) > 0
           ? { symbol: SYMBOLS[(roundOf.get(String(s.group.gpu_sku)) ?? 0) % SYMBOLS.length] } : {}),
@@ -1709,12 +1833,11 @@ function ThroughputSection({
     });
     chart = (
       <>
-        {header}
         <FrontierChart<ParFrontierPt>
           bare
           title=""
           series={series}
-          axes={{ sol: axes.sol, measured: showMeasured ? axes.measured : null,
+          axes={{ sol: axes.sol, measured: measuredOn ? axes.measured : null,
                   partial: null }}
           xTitle={AXIS_TITLE[phase].x}
           yTitle={AXIS_TITLE[phase].y}
@@ -1730,7 +1853,7 @@ function ThroughputSection({
   } else {
     const x = drawnForm;
     const [, gpuField] = axes.sol;
-    const measField = showMeasured ? axes.measured?.[1] : undefined;
+    const measField = measuredOn ? axes.measured?.[1] : undefined;
     const tField = phase === "decode" ? "tpot_s" : "prefill_t_s";
     const bField = phase === "decode" ? "batch" : "prefill_batch";
     const series: LineSeries[] = groups.flatMap((s, i) => {
@@ -1776,7 +1899,6 @@ function ThroughputSection({
     };
     chart = (
       <div>
-        {header}
         {series.length ? (
           <SweepChart
             title={`${phase === "decode" ? "Decode" : "Prefill"} vs ${xName[x]}`}
@@ -1793,8 +1915,12 @@ function ThroughputSection({
     );
   }
   return (
-    <div id="infer-throughput" className="mb-6">
-      {chart}{pastNote}{showMeasured ? <MeasuredRule /> : null}
+    // No bottom margin of its own: the chart inside carries one, and the
+    // rule under it is KV storage's — the panel is one card, not three
+    // stacked fragments with a band of nothing between them.
+    <div id="infer-throughput">
+      {header}{chart}{pastNote}{measuredOn ? <MeasuredRule /> : null}
+      <LadderNotes byMode={byMode} />
     </div>
   );
 }
@@ -1937,6 +2063,21 @@ function kvStoredHover(est: SweepEst | undefined): string {
   return parts.join(" · ");
 }
 
+/** The two KV charts' boxes while that sweep is computed: the same pair of
+ *  cells, each the size its chart will be. */
+function KvSkeleton() {
+  return (
+    <div className="flex gap-4 flex-wrap" data-kv-skeleton>
+      {[0, 1].map((i) => (
+        <div key={i} className="flex-1 min-w-[280px]">
+          <div className="skeleton h-3 w-36 rounded mb-1" />
+          <ChartSkeleton height={260} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function KvStorageSection({ rows }: { rows: SweepEst[] | null }) {
   const kvPts: KvPoint[] = [];
   const reqPts: KvPoint[] = [];
@@ -2018,9 +2159,20 @@ export function ScalingPanel(props: {
   const [ovGpu, setOvGpu] = useState(DEFAULT_SWEEP_GPU);
   const [ovPar, setOvPar] = useState<ParSweepMode>("dp_ep");
   const [ovDegree, setOvDegree] = useState(BATCH_PAR_DEGREE);
-  const [ctx, setCtx] = useState(4096);
-  // Speculative decoding for every sweep of the panel (Parallelism, its
-  // Pareto frontier, Context × Batch): a preset's K drafts verified per step
+  // The contexts on screen, as the one control for them says: the Throughput
+  // section's Context hold (`onHeldContexts`). Null until that section has a
+  // cloud to hold anything of — a reader of it waits rather than assume one.
+  // Empty is an answer too: the forms whose X is the context hold none.
+  const [heldCtxs, setHeldCtxs] = useState<number[] | null>(null);
+  const onHeldContexts = useCallback((next: number[]) => {
+    setHeldCtxs((prev) => (prev && prev.length === next.length
+      && prev.every((v, i) => v === next[i]) ? prev : next));
+  }, []);
+  // Measurements are keyed to the context they ran at, so the measured answer
+  // is asked for ONE context: the held one, where exactly one is held.
+  const measuredCtx = heldCtxs?.length === 1 ? heldCtxs[0] : null;
+  // Speculative decoding for every sweep of the panel (the deployment cloud
+  // and Context × Batch): a preset's K drafts verified per step
   // at acceptance α. "none" sends neither field, so the default bodies (and
   // their warm cache keys) are plain decode. `countDraft` adds the draft's
   // own forwards, priced off the model's MTP stack (`speculative_draft`);
@@ -2030,7 +2182,7 @@ export function ScalingPanel(props: {
   const [countDraft, setCountDraft] = useState(false);
   const [draftAvail, setDraftAvail] = useState<{ key: string; available: boolean; reason: string | null } | null>(null);
   const [showParMeas, setShowParMeas] = useState(false);
-  const [status, setStatus] = useState<SweepStatus | null>({ text: "Pick a model and GPU." });
+  const [status, setStatus] = useState<SweepStatus | null>(verdictStatus("Pick a model and GPU."));
   // The (batch × context) sweep as the backend returned it: KV storage's
   // one source. Its throughputs are not read here — prefill and decode
   // alike are views of the parallel sweep's one cloud.
@@ -2039,7 +2191,7 @@ export function ScalingPanel(props: {
     () => (batchResults ? sweepSeqResults({ results_by_batch: batchResults }) : null),
     [batchResults],
   );
-  const [parStatus, setParStatus] = useState<SweepStatus | null>({ text: "Loading…" });
+  const [parStatus, setParStatus] = useState<SweepStatus | null>(computingStatus(CLOUD_WORK));
   const [parMeasNote, setParMeasNote] = useState<MeasuredNote | null>(null);
   const [byMode, setByMode] = useState<Record<string, ParModeBlob> | null>(null);
   // The parallel sweep's last answer for this model, for the GPU counts the
@@ -2104,34 +2256,44 @@ export function ScalingPanel(props: {
   // Asked to count the draft before this model's answer is known: the sweeps
   // wait, rather than post a verify-only sweep first and the drafted one after.
   const draftHold = spec.K > 0 && countDraft && !draft ? "Checking whether this model has a draft graph…" : "";
-  const sweepHold = rhoHold || draftHold || (props.calibration?.state === "loading" ? "Reading your calibration rows…" : "");
+  // What holds BOTH sweeps of the panel, and which kind of hold it is: an
+  // invalid ρ needs the reader (a verdict), the two lookups are on their
+  // way (a wait). Said once, on the panel's one status line.
+  const sweepHold: SweepStatus | null = rhoHold ? verdictStatus(rhoHold)
+    : draftHold ? waitingStatus(draftHold)
+      : props.calibration?.state === "loading"
+        ? waitingStatus("Reading your calibration rows…") : null;
+  const holdKey = sweepHold?.text || "";
   const lapsed = (e: unknown) => {
     if (calibrateMine && e instanceof ApiError && e.status === 401) props.onSessionLapsed?.();
   };
   const [grid, setGrid] = useState<ScalingGrid | null>(null);
   const [gridError, setGridError] = useState("");
   const degreeModes = degreeAnswer?.model === props.modelId.trim() ? degreeAnswer.byMode : null;
-  // The cards Context × Batch offers: the ones the Parallelism sweep priced,
+  // The cards Context × Batch offers: the ones the parallel sweep priced,
   // whose GPU counts it knows — none until it has answered.
   const swept = new Set(Object.values(degreeModes || {})
     .flatMap((m) => (m.series || []).map((s) => s.gpu_sku || "")));
   const sweptGpus = props.gpus.filter((g) => swept.has(skuOf(g)));
   const skuOpts = sweptGpus.map(skuOf).filter(Boolean);
+  const ctxKey = JSON.stringify(heldCtxs ?? []);
   const { options: batchDegrees, refused: noDegreeFits } = useMemo(
-    () => degreeOptions(degreeModes?.[ovPar], ovGpu, grid?.degrees || [], ctx),
-    [degreeModes, ovPar, ovGpu, grid, ctx],
+    () => degreeOptions(degreeModes?.[ovPar], ovGpu, grid?.degrees || [],
+                        JSON.parse(ctxKey) as number[]),
+    [degreeModes, ovPar, ovGpu, grid, ctxKey],
   );
-  // The GPU counts are not known yet: this model has no parallel answer, and
-  // its parallel sweep can run (a GPU to run it on) and has not failed.
-  const degreesPending = degreeModes === null && !!props.modelId.trim() && !!props.gpuSku
-    && !parStatus?.failed;
+  // The GPU counts are not known yet: this model has no parallel answer, or
+  // no context is on screen yet to read the counts at — and its parallel
+  // sweep can run (a GPU to run it on) and has not failed.
+  const degreesPending = (degreeModes === null || heldCtxs === null)
+    && !!props.modelId.trim() && !!props.gpuSku && !parStatus?.failed;
   const batchDegree = snapDegree(ovDegree, batchDegrees);
 
   useEffect(() => {
-    fetchJson<{ scaling_contexts?: number[]; scaling_degrees?: number[] }>("/inference/defaults")
+    fetchJson<{ scaling_degrees?: number[] }>("/inference/defaults")
       .then((d) => {
-        if (Array.isArray(d.scaling_contexts) && Array.isArray(d.scaling_degrees)) {
-          setGrid({ contexts: d.scaling_contexts, degrees: d.scaling_degrees });
+        if (Array.isArray(d.scaling_degrees)) {
+          setGrid({ degrees: d.scaling_degrees });
         } else {
           setGridError("Scaling grid missing from /inference/defaults");
         }
@@ -2155,25 +2317,25 @@ export function ScalingPanel(props: {
     const gpu = ovGpu;
     if (!id || !gpu) {
       { shownBody.current = ""; setBatchResults(null); }
-      setStatus({ text: "Pick a model and GPU." });
+      setStatus(verdictStatus("Pick a model and GPU."));
       return;
     }
     if (sweepHold) {
       ++seq.current;
-      setStatus({ text: sweepHold });
+      setStatus(sweepHold);
       return;
     }
     if (!grid) {
       // A held request still supersedes the one whose cleanup just aborted it.
       ++seq.current;
-      setStatus({ text: gridError || "Drawing…" });
+      setStatus(gridError ? verdictStatus(gridError, true) : computingStatus(KV_WORK));
       return;
     }
     if (degreesPending) {
       // A sweep at a guessed GPU count is a sweep nobody chose: wait for the
       // counts this card serves.
       ++seq.current;
-      setStatus({ text: "Waiting for the GPU counts this card serves…" });
+      setStatus(waitingStatus("Waiting for the GPU counts this card serves…"));
       return;
     }
     if (noDegreeFits !== null) {
@@ -2181,7 +2343,8 @@ export function ScalingPanel(props: {
       // model in this layout: say so, with its reason, and draw nothing.
       ++seq.current;
       { shownBody.current = ""; setBatchResults(null); }
-      setStatus({ text: `No GPU count fits ${MODE_LABEL[ovPar]} on ${gpu}${noDegreeFits ? `: ${noDegreeFits}` : "."}` });
+      setStatus(verdictStatus(
+        `No GPU count fits ${MODE_LABEL[ovPar]} on ${gpu}${noDegreeFits ? `: ${noDegreeFits}` : "."}`));
       return;
     }
     const body = {
@@ -2191,7 +2354,7 @@ export function ScalingPanel(props: {
       // The rungs this section still draws: one request (prefill) and the
       // ceiling (KV storage); its decode is the Decode section's.
       batch_grid: SCALING_PANEL_BATCH_GRID.map((p) => ({ ...p })),
-      // One output length per panel: Plan's, as the Parallelism sweep's.
+      // One output length per panel: Plan's, as the parallel sweep's.
       avg_output_tokens: props.outTok ?? SWEEP_OUTPUT_TOKENS,
       parallel_preset: { mode: ovPar, degree: batchDegree, ...(rho ? { ep_load_factor: rho } : {}) },
       ...precisionBody(props.precision),
@@ -2228,9 +2391,9 @@ export function ScalingPanel(props: {
       shownBody.current = bodyKey;
       return () => ctrl.abort();
     }
-    setStatus({ text: "Drawing…" });
+    setStatus(computingStatus(KV_WORK));
     fetchSweepCached<SweepResp>(path, sol, { signal: ctrl.signal },
-      (info) => { if (my === seq.current) setStatus({ text: stillComputingNote(info), progress: info.progress }); })
+      (info) => { if (my === seq.current) setStatus(computingStatus(KV_WORK, info.progress)); })
       .then((resp) => {
         if (my !== seq.current) return;
         if (show(resp)) {
@@ -2238,15 +2401,15 @@ export function ScalingPanel(props: {
           return;
         }
         { shownBody.current = ""; setBatchResults(null); }
-        setStatus({ text: missing.message, failed: true });
+        setStatus(verdictStatus(missing.message, true));
       })
       .catch((e) => {
         if (my !== seq.current || isAbort(e)) return;
         { shownBody.current = ""; setBatchResults(null); }
-        setStatus({ text: e instanceof Error ? e.message : String(e), failed: true });
+        setStatus(verdictStatus(e instanceof Error ? e.message : String(e), true));
       });
     return () => ctrl.abort();
-  }, [props.modelId, ovGpu, ovPar, batchDegree, noDegreeFits, degreesPending, grid, gridError, props.precision, props.frac, props.commLatencyUs, props.launchFloorUs, props.outTok, props.selectionMode, props.framework, props.kvBlock, rho, sweepHold, specBody, calibrateMine]);
+  }, [props.modelId, ovGpu, ovPar, batchDegree, noDegreeFits, degreesPending, grid, gridError, props.precision, props.frac, props.commLatencyUs, props.launchFloorUs, props.outTok, props.selectionMode, props.framework, props.kvBlock, rho, holdKey, specBody, calibrateMine]);
 
   useEffect(() => {
     setParMeasNote(null);
@@ -2258,12 +2421,13 @@ export function ScalingPanel(props: {
     }
     if (sweepHold) {
       ++parSeq.current;
-      setParStatus({ text: sweepHold });
+      setParStatus(sweepHold);
       return;
     }
-    // The SOL answer prices every context (the Decode cloud's, the Prefill
-    // chart's), so the context dropdown re-asks nothing; the measured answer
-    // is read live, so it asks only for the context on screen.
+
+    // The SOL answer prices every context, so holding another one re-asks
+    // nothing; the measured answer is read live, so it asks only for the
+    // context the Throughput section holds (`measuredCtx`).
     const base = {
       model_id: id,
       gpu_sku: props.gpuSku,
@@ -2281,9 +2445,11 @@ export function ScalingPanel(props: {
       ...(calibrateMine ? { calibrate_with_mine: true } : {}),
     };
     const all = { ...base, contexts: SWEEP_SEQ_LENS };
-    const body = { ...base, contexts: [ctx] };
-    const wantMeasured = showParMeas && !isTheory(body);
-    const bodyKey = JSON.stringify(all) + (wantMeasured ? `|measured|${ctx}` : "");
+    const body = { ...base, contexts: measuredCtx == null ? [] : [measuredCtx] };
+    // No context held is not a context to read measurements at: the box says
+    // so (`measuredReason`) and nothing is asked.
+    const wantMeasured = showParMeas && measuredCtx != null && !isTheory(body);
+    const bodyKey = JSON.stringify(all) + (wantMeasured ? `|measured|${measuredCtx}` : "");
     if (bodyKey === shownParBody.current) return;
     const path = "/inference/estimate-parallel-sweep";
     const sol = solOnly(all);
@@ -2331,7 +2497,7 @@ export function ScalingPanel(props: {
     // The curves on screen are the previous inputs'; drop them so a slow
     // sweep never shows them under the new model or GPU.
     { shownParBody.current = ""; setByMode(null); }
-    setParStatus({ text: "Loading…" });
+    setParStatus(computingStatus(CLOUD_WORK));
     setParMeasNote(null);
     fetchSweepCached<ParResp>(path, sol, { signal: ctrl.signal },
       (info) => {
@@ -2342,7 +2508,7 @@ export function ScalingPanel(props: {
           const part = info.partial.head as ParResp;
           setByMode(part.by_mode || (part.mode ? { [part.mode]: part } : {}));
         }
-        setParStatus({ text: stillComputingNote(info), progress: info.progress });
+        setParStatus(computingStatus(CLOUD_WORK, info.progress));
       })
       .then((resp) => {
         if (my !== parSeq.current) return;
@@ -2352,11 +2518,22 @@ export function ScalingPanel(props: {
       .catch((e) => {
         if (my !== parSeq.current || isAbort(e)) return;
         { shownParBody.current = ""; setByMode(null); }
-        setParStatus({ text: `sweep load failed: ${e instanceof Error ? e.message : String(e)}`, failed: true });
+        setParStatus(verdictStatus(
+          `sweep load failed: ${e instanceof Error ? e.message : String(e)}`, true));
       });
     return () => ctrl.abort();
-  }, [props.modelId, props.gpuSku, ctx, props.precision, props.frac, props.commLatencyUs, props.launchFloorUs, props.outTok, props.selectionMode, props.framework, props.kvBlock, rho, sweepHold, specBody, calibrateMine, showParMeas]);
+  }, [props.modelId, props.gpuSku, measuredCtx, props.precision, props.frac, props.commLatencyUs, props.launchFloorUs, props.outTok, props.selectionMode, props.framework, props.kvBlock, rho, holdKey, specBody, calibrateMine, showParMeas]);
 
+  // The panel's status line, under its header: the deployment sweep's — the
+  // one every chart of the Throughput block waits on, and the one that
+  // carries what holds BOTH sweeps (an invalid ρ, calibration rows still
+  // being read).
+  const line = parStatus;
+  // KV storage's own status sits with KV storage, where its charts are —
+  // but never when it would repeat the sentence already on the line above.
+  // The same hold, printed by each block in its own empty space, is what
+  // made this panel read as two broken sections.
+  const kvNote = status && status.text !== line?.text ? status : null;
   return (
     <section id="infer-scaling" className="card p-4 sm:p-6 mb-6">
       <div className="flex items-center justify-between flex-wrap gap-3 mb-3">
@@ -2393,22 +2570,23 @@ export function ScalingPanel(props: {
           ) : null}
         </div>
       </div>
-      <ParallelSection
-        ctx={ctx}
-        onCtx={setCtx}
-        contexts={grid?.contexts || []}
+      {line ? <PanelStatus status={line} /> : null}
+      <ThroughputSection
+        sweepBody={byMode && parBody && !parStatus ? parBody : null}
+        // What the layout refused, from the cells that have landed: the
+        // server's own assembly of a sweep still computing already says so,
+        // and these notes only ever grow as the rest arrive.
         byMode={byMode}
-        status={parStatus}
-        hideEp={hideEp}
+        onApply={props.onApply}
+        planGpu={props.gpuSku}
+        showMeasured={showParMeas}
+        onShowMeasured={setShowParMeas}
+        measuredNote={parMeasNote}
+        onHeldContexts={onHeldContexts}
+        gpus={(Object.values(byMode || {}).find((m) => m.series?.length)?.series || [])
+          .map((s) => s.gpu_sku || "")}
       />
-      {byMode && parBody && !parStatus ? (
-        <ThroughputSection ctx={ctx} sweepBody={parBody} onApply={props.onApply}
-          planGpu={props.gpuSku}
-          showMeasured={showParMeas} onShowMeasured={setShowParMeas}
-          measuredNote={parMeasNote}
-          gpus={(Object.values(byMode).find((m) => m.series?.length)?.series || []).map((s) => s.gpu_sku || "")} />
-      ) : null}
-      <div>
+      <div className="border-t border-gray-100 pt-4">
         <div className={`${PICK_ROW} mb-3`}>
           <div className="text-sm font-medium text-gray-800 mr-1">KV storage</div>
           <OnePick
@@ -2435,23 +2613,39 @@ export function ScalingPanel(props: {
           <OnePick
             id="infer-scaling-ngpu"
             label="GPUs"
-            disabled={!grid}
-            value={batchDegree}
+            // No counts to offer yet (the ladder or the sweep that filters it
+            // has not answered) or none that serve: a dash and no dropdown,
+            // never an empty box over a value nobody chose.
+            disabled={!grid || !batchDegrees.length}
+            title={!grid ? "Reading the GPU-count ladder"
+              : degreesPending ? "Waiting for the GPU counts this card serves"
+                : noDegreeFits !== null
+                  ? `No GPU count fits ${MODE_LABEL[ovPar]} on ${ovGpu}`
+                  : undefined}
+            value={batchDegrees.length ? batchDegree : ""}
             onChange={(e) => setOvDegree(Number(e.target.value))}
           >
-            {batchDegrees.map((n) => <option key={n} value={n}>{n}</option>)}
+            {batchDegrees.length
+              ? batchDegrees.map((n) => <option key={n} value={n}>{n}</option>)
+              : <option value="">—</option>}
           </OnePick>
         </div>
-        {status ? (
-          // Reserve the row's height so the sections above keep their
-          // position while this (independent) sweep is still loading —
-          // otherwise the two sweeps finishing out of order make the page jump.
-          <div className="text-xs text-gray-400 text-center py-4 mb-2">
-            {status.progress
-              ? <ComputeProgress compact label={status.text} progress={status.progress} />
-              : status.text}
+        {kvNote ? (
+          <div data-kv-note
+            className={`mb-2 text-11 ${kvNote.failed ? "text-red-500"
+              : kvNote.kind === "verdict" ? "text-amber-700" : "text-gray-500"}`}>
+            {kvNote.progress
+              ? <ComputeProgress compact label={kvNote.text} progress={kvNote.progress} unit="cells" />
+              : kvNote.text}
           </div>
-        ) : <KvStorageSection rows={kvRows} />}
+        ) : null}
+        {!status ? <KvStorageSection rows={kvRows} />
+          // Its answer is still coming — being computed, or waiting on the
+          // sweep that says which GPU counts serve: the boxes the two
+          // charts will fill, at their height, so the sections above keep
+          // their position while this (independent) sweep lands. A verdict
+          // draws no box: its line above is the whole answer.
+          : stillComing(status) ? <KvSkeleton /> : null}
       </div>
     </section>
   );
