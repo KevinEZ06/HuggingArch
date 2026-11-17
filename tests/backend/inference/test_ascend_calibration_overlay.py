@@ -9,7 +9,7 @@ round trip end to end, on rows measured on a real 910C die:
     sweep -> jobs -> run on the device -> CSV -> overlay -> a row's measured
     column
 
-The corpus is `tests/golden/ascend_vllm_ascend.csv`, 327 rows measured on
+The corpus is `tests/golden/ascend_vllm_ascend.csv`, 789 rows measured on
 one die of an Atlas A3 node inside the
 `quay.io/ascend/vllm-ascend:v0.30.0-a3` container (the release the binding
 is audited at), through the harness's own `kernel_bench run`.
@@ -67,11 +67,31 @@ def _estimate(rows=None):
 class TestTheCorpusIsWhatTheDeviceMeasured(unittest.TestCase):
 
     def test_every_row_is_an_ascend_row_from_the_audited_release(self):
+        """Every row was measured on this card, by a library this binding
+        dispatches to.
+
+        `framework` is not "which deployment did this" — it is which
+        LIBRARY'S provider measured the launch. On an NPU an unquantised
+        bf16 linear runs torch's own `F.linear`, which dispatches to
+        `aclnnMatmul_MatMulV3Common_MatMulV3` (`vllm_ascend/ops/
+        linear.py:49-54`; read off the Ascend profiler, not assumed), so
+        the binding declares `library: torch` for it and the 462 rows it
+        produced are named `torch`. Asserting one fixed name would have
+        said those rows came from somewhere else.
+
+        Derived from the declarations rather than listed here: a second
+        list would be free to drift from the binding, which is the whole
+        failure mode these rows exist to rule out.
+        """
+        from backend.inference.framework_bindings import get_binding
+        binding = get_binding("vllm_ascend")
+        declared = {entry.library for entry in binding.kernel_dispatches}
+        self.assertIn("vllm_ascend", declared)
         rows = _rows()
         self.assertTrue(rows)
         for r in rows:
             self.assertEqual(r["gpu"], NPU, r["op"])
-            self.assertEqual(r["framework"], "vllm_ascend", r["op"])
+            self.assertIn(r["framework"], declared, r["op"])
 
     def test_no_row_was_timed_on_the_host_clock(self):
         # `wall_clock` is what a CPU fallback records. One such row in an
@@ -108,7 +128,7 @@ class TestTheCorpusSpansMoreThanOneShape(unittest.TestCase):
     def test_it_has_not_shrunk(self):
         # A row count is the one thing a re-measurement can quietly lose:
         # a run that measures fewer cells still writes a valid CSV.
-        self.assertGreaterEqual(len(_rows()), 327)
+        self.assertGreaterEqual(len(_rows()), 789)
 
     def test_it_holds_both_phases(self):
         phases = {r["phase"] for r in _rows()}
