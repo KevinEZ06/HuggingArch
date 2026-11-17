@@ -370,6 +370,25 @@ def _among(fact: Optional[str], allowed: Tuple[str, ...]) -> bool:
     return not allowed or (fact is not None and fact.lower() in allowed)
 
 
+def _canonical_dtype(fact: Optional[str]) -> Optional[str]:
+    """A dtype token as the conditions spell theirs.
+
+    `DispatchCondition.of` puts a condition's own values through
+    `canonical(...).lower()`, and `ResolvedLaunch` does the same to the
+    launch side (commit 0016). A slot read straight out of a
+    `dtype_env` — the output slot is one — is still in the corpus spelling,
+    so it has to take the same route or `int8` would be compared against
+    the stored `i8` and never match. That is the same defect 0016 fixed
+    for `activation_dtype`, one slot over.
+    """
+    if fact is None:
+        return None
+    try:
+        return canonical(fact).lower()
+    except UnknownDtype:
+        return None
+
+
 @dataclass(frozen=True)
 class DispatchCondition:
     """When a framework runs a bound kernel, as its source decides it.
@@ -422,10 +441,18 @@ class DispatchCondition:
     min_compute_capability: Optional[Tuple[int, int]] = None
     below_compute_capability: Optional[Tuple[int, int]] = None
     unquantized_bf16_launch: Optional[bool] = None
+    #: The dtype a kernel WRITES, when that is what decides which kernel it
+    #: is. A quantise cell's activation slot is the WIDE input it reads
+    #: (`bf16`); `int8` is what it writes. `activation_dtype` names the
+    #: input, so a condition saying `activation_dtype: [int8]` for a
+    #: quantise kernel names the wrong slot and can never hold — which is
+    #: what kept the two measured `quantise_activation` rows unread.
+    output_dtype: Tuple[str, ...] = ()
     graph: GraphCondition = field(default_factory=GraphCondition)
     server_flag_value: ServerOption = True
 
-    KEYS = frozenset({"server_flag", "activation_dtype", "device",
+    KEYS = frozenset({"server_flag", "activation_dtype", "output_dtype",
+                      "device",
                       "kv_block_size", "tensor_parallel",
                       "min_compute_capability", "below_compute_capability",
                       "unquantized_bf16_launch",
@@ -458,7 +485,7 @@ class DispatchCondition:
     #: They are neither card nor request facts and are never guessed from a
     #: checkpoint id.
     LAUNCH_KEYS: ClassVar[FrozenSet[str]] = frozenset(
-        {"unquantized_bf16_launch"})
+        {"unquantized_bf16_launch", "output_dtype"})
 
     def holds_for(self, deployment: ServingDeployment,
                   launch: Optional["ResolvedLaunch"] = None) -> bool:
@@ -468,11 +495,20 @@ class DispatchCondition:
         launch, not the request's model dtype."""
         activation = (deployment.activation_dtype if launch is None
                       else launch.activation_dtype)
+        # The output slot, read off the launch's own dtype environment. A
+        # deployment has no output dtype — it is a property of one launch —
+        # so a condition naming it is unsatisfiable without a launch, the
+        # same way `unquantized_bf16_launch` is. That is the intended
+        # answer: guessing it from the request would be the second
+        # derivation this module exists to avoid.
+        output = (None if launch is None
+                  else launch.dtype_env.get("output"))
         return (self.holds_for_card(deployment)
                 and (self.server_flag is None
                 or deployment.flag(*self.server_flag)
                     == self.server_flag_value)
                 and _among(activation, self.activation_dtype)
+                and _among(_canonical_dtype(output), self.output_dtype)
                 and (self.unquantized_bf16_launch is None
                      or (launch is not None
                          and launch.unquantized_bf16
@@ -514,6 +550,7 @@ class DispatchCondition:
                            ("head_dim", self.graph.head_dim),
                            ("phase", self.graph.phase),
                            ("activation_dtype", self.activation_dtype),
+                           ("output_dtype", self.output_dtype),
                            ("kv_block_size", self.kv_block_size),
                            ("tensor_parallel", self.tensor_parallel),
                            ("device", self.device)):
@@ -680,6 +717,8 @@ class DispatchCondition:
             server_flag=flag,
             activation_dtype=tuple(canonical(n).lower()
                                    for n in names("activation_dtype")),
+            output_dtype=tuple(canonical(n).lower()
+                               for n in names("output_dtype")),
             kv_block_size=integers("kv_block_size"),
             tensor_parallel=integers("tensor_parallel"),
             device=tuple(n.lower() for n in names("device")),

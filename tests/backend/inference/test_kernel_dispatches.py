@@ -549,3 +549,70 @@ def test_an_int8_launch_reaches_the_ascend_w8a8_dispatch():
     assert [e.impl_id for e in active] == ["npu_quant_matmul_w8a8"], (
         f"an INT8 linear launch should reach exactly the W8A8 kernel; "
         f"active: {[e.impl_id for e in active]}")
+
+
+def test_a_condition_naming_the_output_slot_reads_the_output_slot():
+    """A quantise kernel is decided by what it WRITES, not what it reads.
+
+    Every `activation_dtype` condition asks about the operand a kernel
+    consumes. A quantiser's whole job is to consume a wide tensor and
+    produce a narrow one, so its int8 lives in the OUTPUT slot — and a
+    condition saying `activation_dtype: [int8]` asks "is the thing this
+    kernel reads already int8", which is never true of a quantiser. The
+    dispatch then resolved `no_active` and the measured rows went unread.
+
+    `output_dtype` is the launch's own fact, supplied per row after
+    `precision_launches` has materialized the walk — the same provenance
+    `unquantized_bf16_launch` has, which is why it belongs in LAUNCH_KEYS.
+    """
+    from backend.inference.framework_bindings import ResolvedLaunch
+    binding = get_binding("vllm_ascend")
+    deployment = ServingDeployment.at(gpu_sku="Ascend-910C-A3",
+                                      activation_dtype="bf16")
+    launch = ResolvedLaunch.from_dtype_env_json(json.dumps({
+        "activation": "bf16", "activation_granularity": "per-token",
+        "metadata": "fp32", "output": "int8"}))
+    entries = [e for e in binding.kernel_dispatches
+               if e.op == "quantise_activation"]
+    active = [e for e in entries
+              if any(w.holds_for(deployment, launch) for w in (e.whens or ()))]
+    assert [e.impl_id for e in active] == ["npu_dynamic_quant_int8"], (
+        f"a cast whose OUTPUT is int8 should reach the quantise kernel; "
+        f"active: {[e.impl_id for e in active]}")
+
+
+def test_an_output_dtype_condition_cannot_hold_without_a_launch():
+    """No launch, no output slot — and no guess.
+
+    A deployment has no output dtype; it is a property of one launch. The
+    condition must be unsatisfiable there rather than falling back to the
+    request's model dtype, which would be the second derivation this
+    module exists to remove.
+    """
+    from backend.inference.framework_bindings import ResolvedLaunch
+    binding = get_binding("vllm_ascend")
+    deployment = ServingDeployment.at(gpu_sku="Ascend-910C-A3",
+                                      activation_dtype="bf16")
+    entries = [e for e in binding.kernel_dispatches
+               if e.op == "quantise_activation"]
+    active = [e for e in entries
+              if any(w.holds_for(deployment, None) for w in (e.whens or ()))]
+    assert active == []
+
+
+def test_the_output_slot_is_compared_in_the_condition_vocabulary():
+    """`int8` in a cell and `i8` in a condition are the same dtype.
+
+    The launch side canonicalises (0016); a slot read straight from a
+    `dtype_env` does not. Comparing them raw is the same defect one slot
+    over, so the output slot takes the same route.
+    """
+    from backend.inference.framework_bindings import (
+        DispatchCondition, ResolvedLaunch)
+    deployment = ServingDeployment.at(gpu_sku="Ascend-910C-A3",
+                                      activation_dtype="bf16")
+    cond = DispatchCondition.parse({"output_dtype": ["int8"]}, "test")
+    for spelling in ("int8", "I8", " i8 "):
+        launch = ResolvedLaunch.from_dtype_env_json(json.dumps({
+            "activation": "bf16", "output": spelling}))
+        assert cond.holds_for(deployment, launch), spelling
