@@ -66,10 +66,27 @@ class DeviceBackend:
         """A timing event. `elapsed_time` between two is milliseconds."""
         return self.module.Event(enable_timing=True)
 
-    def properties(self, index: int = 0) -> Any:
+    def device_count(self) -> int:
+        return int(self.module.device_count())
+
+    def current_device(self) -> int:
+        fn = getattr(self.module, "current_device", None)
+        return int(fn()) if fn is not None else 0
+
+    def set_device(self, index: int) -> None:
+        """Bind this process to `index`. A collective rank calls this
+        before it puts tensors on the device; without it every rank
+        lands on die 0 and the group is the identity of one buffer."""
+        self.module.set_device(int(index))
+
+    def properties(self, index: Optional[int] = None) -> Any:
+        if index is None:
+            index = self.current_device()
         return self.module.get_device_properties(index)
 
-    def device_name(self, index: int = 0) -> Optional[str]:
+    def device_name(self, index: Optional[int] = None) -> Optional[str]:
+        if index is None:
+            index = self.current_device()
         try:
             return self.module.get_device_name(index)
         except Exception:
@@ -96,7 +113,7 @@ class DeviceBackend:
         a constant here would be a second statement of a fact the driver
         already makes, free to drift from it.
         """
-        props = self.properties(0)
+        props = self.properties()
         value = (getattr(props, "L2_cache_size", 0)
                  or getattr(props, "l2_cache_size", 0))
         return int(value) or None

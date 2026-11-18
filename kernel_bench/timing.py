@@ -38,6 +38,7 @@ def time_callable(
     flush_l2: bool = True,
     budget_s: float = TIME_BUDGET_S,
     device: Optional[DeviceBackend] = None,
+    align: Optional[Callable[[], None]] = None,
 ) -> LatencyStats:
     """Time `call`, reducing per-launch samples to p50/p95/mean microseconds.
     One sample per iteration so p95 surfaces tail / clock-throttle, not just a
@@ -73,7 +74,13 @@ def time_callable(
 
     p95 now also carries the spread of the two sweeps (a stalled host thread
     inside either window moves the difference, both ways), not only the
-    launch's own tail."""
+    launch's own tail.
+
+    `align`, when given, runs once at the start of every sample — before
+    the three windows, not inside them. A collective group uses it for
+    `dist.barrier(); device.synchronize()` so ranks do not drift from one
+    sample into the next; a single process leaves it None and the clock
+    is unchanged."""
     import torch
     dev = device if device is not None else detect_backend()
     if dev is None:
@@ -82,6 +89,8 @@ def time_callable(
             call()
         us = []
         for _ in range(iters):
+            if align is not None:
+                align()
             t0 = time.perf_counter()
             call()
             us.append((time.perf_counter() - t0) * 1e6)
@@ -220,6 +229,8 @@ def time_callable(
     # between samples lands on all of them rather than on the difference.
     samples = []
     for _ in range(iters):
+        if align is not None:
+            align()
         if sweep is None:
             samples.append((window(call),))
         else:

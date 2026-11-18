@@ -530,10 +530,7 @@ def run_jobs(
             # accumulates across every failing job and eventually takes the
             # context down — the failure then surfaces at some unrelated later
             # launch, pointing the stack at a kernel that never ran.
-            if env.cuda_available:
-                import torch
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+            _release_device(env)
             return
         # Is this the cell the row will be billed for? A shape or a dtype
         # the operands do not have is a measurement of something else, and
@@ -546,10 +543,7 @@ def run_jobs(
                     f"{inv.op} {inv.dims}: built cell disagrees with the row "
                     f"({'; '.join(wrong)}); job skipped")
                 log(f"FAIL cell {inv.op}: {'; '.join(wrong)}")
-                if env.cuda_available:
-                    import torch
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
+                _release_device(env)
                 return
         # Reference is built SEPARATELY from inputs: the fp32 eager oracle is
         # O(S²) for attention (materializes the full score matrix) and ~2× the
@@ -574,9 +568,7 @@ def run_jobs(
                 _stop_if_context_lost(env, e, f"{inv.op} {inv.dims}: the reference")
                 log(f"no-xcheck {inv.op} {inv.dims}: reference build failed "
                     f"({type(e).__name__}) — measuring without cross-check")
-                if env.cuda_available:
-                    import torch
-                    torch.cuda.empty_cache()
+                _release_device(env)
 
         # A kernel that quantizes the weight itself gets the canonical weight
         # placed on ITS grid first — see kernel_bench/quant.py. Both the kernel
@@ -733,10 +725,7 @@ def run_jobs(
                         # stop anyone measuring it again.
                         err = xrel = xcos = xtyp = xwor = None
                         xchk = "no_reference"
-                        if env.cuda_available:
-                            import torch
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
+                        _release_device(env)
                         log(f"no-xcheck {label}: the check itself ran out of "
                             f"memory — measuring without it")
                     if trace is None or not trace.observed:
@@ -892,13 +881,7 @@ def run_jobs(
                 # surfaces here rather than detonating at an unrelated call
                 # later (its traceback then names a kernel that never ran), and
                 # drop the partial allocation instead of carrying it forward.
-                if env.cuda_available:
-                    import torch
-                    try:
-                        torch.cuda.synchronize()
-                    except Exception:
-                        pass                              # already latched
-                    torch.cuda.empty_cache()
+                _release_device(env)
             finally:
                 # Except when the context is lost: the run stops HERE, and the
                 # supervisor reads this provider off the sidecar as the crash.
@@ -909,14 +892,12 @@ def run_jobs(
         # caching allocator doesn't accumulate reserved-but-free blocks across a
         # long sweep — fragmentation there turns later big-MoE shapes into false
         # OOMs (real on a 24GB part; avoidable when it's just leftover cache).
-        if env.cuda_available:
-            import torch
-            # `eff_cache` holds a per-grid weight copy AND its reference, so it
-            # is part of this shape's footprint, not bookkeeping — dropping only
-            # `inputs`/`ref_out` would leave the largest tensors alive.
-            inputs = ref_out = None
-            eff_cache.clear()
-            torch.cuda.empty_cache()
+        # `eff_cache` holds a per-grid weight copy AND its reference, so it
+        # is part of this shape's footprint, not bookkeeping — dropping only
+        # `inputs`/`ref_out` would leave the largest tensors alive.
+        inputs = ref_out = None
+        eff_cache.clear()
+        _release_device(env)
     # Across runs: what Kernel Bench's shared rows already measure
     # (`--skip-existing`), one lookup for every job's physical op through the
     # estimates' own client (`backend.measure.lookup.covered`). With no
@@ -1181,6 +1162,34 @@ def _band_for(dtype: str, *, role: str = "dtype") -> Band:
             f"a fallback") from None
 
 
+def _device_backend(env: Optional[Env]):
+    """The accelerator this env computes on, or None on a host-only box."""
+    if env is None or not env.accelerated:
+        return None
+    from .device import NoDeviceBackend, backend_named
+    try:
+        return backend_named(env.device)
+    except NoDeviceBackend:
+        return None
+
+
+def _release_device(env: Optional[Env]) -> None:
+    """Drop the caching allocator's hold on this process's device.
+
+    Named once: the CUDA-only `empty_cache` sites left an NPU OOM's
+    tensors resident, so the next job in a multi-die sweep inherited
+    the leak. `DeviceBackend.empty_cache` is the same call on both.
+    """
+    backend = _device_backend(env)
+    if backend is None:
+        return
+    try:
+        backend.synchronize()
+    except Exception:
+        pass
+    backend.empty_cache()
+
+
 def _fits_after_release(env: Env, error: BaseException) -> bool:
     """Release what this process is holding and say whether the card looks
     able to take the allocation that failed after all.
@@ -1205,15 +1214,18 @@ def _fits_after_release(env: Env, error: BaseException) -> bool:
     disabled the path. Only an allocation failure that does not say its
     size falls back to that line.
     """
-    if not env.cuda_available:
+    backend = _device_backend(env)
+    if backend is None:
         return False
-    import torch
     try:
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        free, total = torch.cuda.mem_get_info()
+        backend.synchronize()
+        backend.empty_cache()
+        info = backend.mem_get_info()
     except Exception:
         return False
+    if info is None:
+        return False
+    free, total = info
     asked = _requested_bytes(error)
     if asked is not None:
         return free >= asked
@@ -1258,7 +1270,7 @@ def _is_out_of_memory(error: BaseException, env: Optional[Env] = None) -> bool:
     subclass counts and another library's unrelated `OutOfMemoryError` does
     not.
     """
-    if env is not None and not env.cuda_available:
+    if env is not None and not env.accelerated:
         return False
     chain = []
     seen = set()
@@ -1269,7 +1281,12 @@ def _is_out_of_memory(error: BaseException, env: Optional[Env] = None) -> bool:
         cursor = cursor.__cause__ or cursor.__context__
     try:
         import torch
-        oom_types: tuple = (torch.cuda.OutOfMemoryError,)
+        oom_types = []
+        for ns in (getattr(torch, "cuda", None), getattr(torch, "npu", None)):
+            typed = getattr(ns, "OutOfMemoryError", None) if ns is not None else None
+            if typed is not None:
+                oom_types.append(typed)
+        oom_types = tuple(oom_types)
     except Exception:
         oom_types = ()
     # Allocation failures a library reports in its own words rather than as

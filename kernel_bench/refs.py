@@ -5259,6 +5259,40 @@ register_ref("conv2d", RefSpec(_conv2d_inputs, _conv2d_reference))
 # The bare collectives: one contiguous payload over a group
 # ---------------------------------------------------------------------------
 
+def _collective_rank_seeds(inv: Invocation, ranks: int):
+    """The draw each rank of this cell uses, or None on an unkeyed smoke.
+
+    Owned by `Invocation.seed_for_rank`. This module reads the method; it
+    does not mix `seed + rank` itself, so two ranks cannot disagree about
+    what the others held.
+    """
+    try:
+        return tuple(inv.seed_for_rank(r) for r in range(ranks))
+    except ValueError:
+        return None
+
+
+def _collective_payload(signature: str, n_elems: int, ranks: int, rank: int,
+                        dtype, device: str, seed: int):
+    """This rank's buffer at `seed`, on `device`.
+
+    The cell's payload is always `n_comm_elems` (eval's T). all-gather's
+    T is the gathered buffer, so this rank only draws its send shard of
+    T/N and places it; the other collectives draw the whole T.
+    """
+    import torch
+    gen = torch.Generator("cpu").manual_seed(int(seed))
+    dt = dtype if dtype is not None else torch.float32
+    if signature == "all_gather" and ranks > 1 and n_elems % ranks == 0:
+        chunk = n_elems // ranks
+        shard = torch.randn(chunk, dtype=torch.float32, generator=gen)
+        payload = torch.zeros(n_elems, dtype=torch.float32)
+        payload[int(rank) * chunk:(int(rank) + 1) * chunk] = shard
+        return payload.to(dtype=dt, device=device)
+    payload = torch.randn(n_elems, dtype=torch.float32, generator=gen)
+    return payload.to(dtype=dt, device=device)
+
+
 def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
     """One payload buffer, the group that moves it, and the group's spacing.
 
@@ -5269,20 +5303,85 @@ def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]
     provider reads, the way `allreduce_fused_rmsnorm` already passes its
     group.
 
-    No oracle. On one process every one of these collectives is the
-    identity, so an oracle here would agree with a provider that never
-    communicated — which is exactly how a fused all-reduce once
-    cross-checked green without a fabric. A provider that brings
-    `n_comm_ranks` processes brings its own comparison.
+    This rank's payload is drawn at `Invocation.rank_seed`, not at the
+    cell-level `gen`. Two ranks of one all-reduce holding the same
+    buffer would reduce as the identity; the oracle reconstructs every
+    rank from `rank_seeds` and reduces them, so a kernel that never
+    communicated cannot agree.
     """
     import torch
     dims = _dims(inv)
+    ranks = int(dims["n_comm_ranks"])
+    shape = _shape(inv, "payload")
+    n_elems = 1
+    for extent in shape:
+        n_elems *= int(extent)
+    dt = _dtype(inv.dtype)
+    rank = int(inv.rank)
+    seeds = _collective_rank_seeds(inv, ranks)
+    if seeds is None:
+        payload = torch.randn(*shape, dtype=dt, device=device, generator=gen)
+    else:
+        payload = _collective_payload(
+            inv.signature, n_elems, ranks, rank, dt, device, seeds[rank])
+        if payload.shape != shape:
+            payload = payload.reshape(*shape)
     return {
-        "payload": torch.randn(*_shape(inv, "payload"),
-                               dtype=_dtype(inv.dtype), device=device, generator=gen),
-        "n_comm_ranks": int(dims["n_comm_ranks"]),
+        "payload": payload,
+        "n_comm_ranks": ranks,
         "n_comm_stride": int(dims["n_comm_stride"]),
+        "rank": rank,
+        "signature": inv.signature,
+        "rank_seeds": seeds,
+        "payload_dtype": inv.dtype,
     }
+
+
+def _collective_reference(inputs: Dict[str, Any]):
+    """The collective's result on this rank, reconstructed from every
+    rank's seed.
+
+    Without `rank_seeds` (an unkeyed smoke cell) there is nothing to
+    reconstruct and the payload is returned unchanged — identity, which
+    is what a single process computes.
+    """
+    import torch
+    payload = inputs["payload"]
+    ranks = int(inputs["n_comm_ranks"])
+    rank = int(inputs.get("rank", 0) or 0)
+    signature = str(inputs.get("signature") or "")
+    seeds = inputs.get("rank_seeds")
+    if not seeds or ranks < 2:
+        return payload
+    dt = payload.dtype
+    n_elems = int(payload.numel())
+    device = payload.device
+    payloads = [
+        _collective_payload(signature, n_elems, ranks, r, torch.float32,
+                            "cpu", seeds[r]).reshape(-1)
+        for r in range(ranks)
+    ]
+    stacked = torch.stack(payloads, dim=0)
+    if signature == "all_reduce":
+        out = stacked.sum(dim=0)
+    elif signature == "all_gather":
+        chunk = n_elems // ranks
+        out = torch.cat([p[r * chunk:(r + 1) * chunk]
+                         for r, p in enumerate(payloads)], dim=0)
+    elif signature == "reduce_scatter":
+        chunk = n_elems // ranks
+        reduced = stacked.sum(dim=0)
+        out = reduced[rank * chunk:(rank + 1) * chunk]
+    elif signature == "all_to_all":
+        chunk = n_elems // ranks
+        out = torch.cat([payloads[peer][rank * chunk:(rank + 1) * chunk]
+                         for peer in range(ranks)], dim=0)
+    elif signature == "send_recv":
+        peer = rank ^ 1 if ranks == 2 else (rank + 1) % ranks
+        out = payloads[peer]
+    else:
+        out = stacked.sum(dim=0)
+    return out.to(dtype=dt, device=device)
 
 
 # Which signatures those are is the catalog's own declaration — the
@@ -5290,7 +5389,8 @@ def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]
 # rather than restated as a list of collective names here.
 for _sig in all_signatures():
     if _sig.shape_projection == "collective":
-        register_ref(_sig.name, RefSpec(_collective_inputs, None))
+        register_ref(_sig.name, RefSpec(_collective_inputs,
+                                        _collective_reference))
 del _sig
 
 

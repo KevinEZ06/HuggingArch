@@ -8,7 +8,7 @@ roofline numerators (flops / access_bytes) needed to emit a CSV row.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional, Tuple
 
 from backend.arch.eval.routed import RoutedLaunch
@@ -95,6 +95,12 @@ class Invocation:
     # numerators bill the state's read and write-back, so only a kernel that
     # takes the state is this cell (`OpSignature.carries_state`).
     carries_state: bool = False
+    # This process's rank in the measurement group. 0 is a single process.
+    # A collective oracle reads this so each rank's payload is a different,
+    # reconstructable draw; `refs` must not mix `rank` into the seed
+    # privately, because then the same cell on two ranks would disagree
+    # about which numbers the other ranks held.
+    rank: int = 0
 
     # --- provenance carried through to the CSV identity ---
     model: str = ""
@@ -134,6 +140,33 @@ class Invocation:
                 f"`bench plan` to state the key")
         payload = b"\x1f".join(f.encode("utf-8") for f in self.physical_key)
         return int.from_bytes(blake2b(payload, digest_size=8).digest(), "big")
+
+    def seed_for_rank(self, rank: int) -> int:
+        """The draw this cell uses on `rank`.
+
+        Mixes the physical key with the rank so two ranks of one all-reduce
+        do not hold the same buffer (a silent identity reduction) while
+        remaining reconstructable: the oracle on any rank calls this for
+        every rank and reduces what it would have drawn. GEMM cells keep
+        `input_seed`; only a collective fill reads this.
+        """
+        from hashlib import blake2b
+        if self.physical_key is None:
+            raise ValueError(
+                f"{self.op} [{self.node_spec_id}]: this job carries no "
+                f"measurement key, so its inputs have no seed; re-run "
+                f"`bench plan` to state the key")
+        payload = b"\x1f".join(f.encode("utf-8") for f in self.physical_key)
+        payload += b"\x1frank=" + str(int(rank)).encode("utf-8")
+        return int.from_bytes(blake2b(payload, digest_size=8).digest(), "big")
+
+    @property
+    def rank_seed(self) -> int:
+        return self.seed_for_rank(self.rank)
+
+    def at_rank(self, rank: int) -> "Invocation":
+        """The same cell as seen from `rank`. Frozen, so a copy."""
+        return replace(self, rank=int(rank))
 
     @property
     def weight_granularity(self) -> Optional[str]:
@@ -340,4 +373,5 @@ class Invocation:
             kernel_params=dict(job.get("kernel_params") or {}),
             routed=job.get("routed"),
             carries_state=bool(job.get("carries_state", False)),
+            rank=int(job.get("rank", 0) or 0),
         )

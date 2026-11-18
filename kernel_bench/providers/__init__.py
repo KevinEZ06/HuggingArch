@@ -930,6 +930,16 @@ class Provider:
     # magnitude over the band; modelling the scale too takes it to exactly 0.
     # See `quant.SCALE_ENCODINGS`.
     weight_scale: str = "exact"
+    # The process-group axis this kernel reduces over, as the cell states
+    # it (`n_comm_ranks` for every collective in the catalog). None is a
+    # single process — the harness default. A signature whose shape
+    # projection is `collective` and that is not disabled must name it:
+    # otherwise a kernel that needs N ranks registers as the identity of
+    # one buffer. Declared here, not inferred from the signature, because
+    # the axis is an execution form of THIS kernel (HCCL on N dies) and
+    # a fused collective that is still disabled names the same axis
+    # without running.
+    world: Optional[str] = None
     # Why this kernel is registered but serves nothing. A kernel that measures
     # WRONG is disabled here rather than deleted: an empty gate leaves its cells
     # showing as a GAP in the coverage report, while deleting the registration
@@ -1013,6 +1023,10 @@ class Provider:
         if self.disabled_reason:
             yield "disabled"
             return                 # a disabled kernel's scope is not the point
+        if self.world:
+            v = int(inv.dims.get(self.world, 0) or 0)
+            if v < 2:
+                yield f"world:{self.world}={v} needs a group"
         cell = inv.weight_granularity
         if cell is not None and cell not in self.weight_granularities:
             yield _not_served("weight_granularity", cell,
@@ -1048,6 +1062,8 @@ class Provider:
         if self.serves is None:
             return None
         out = self.serves.describe()
+        if self.world:
+            out["world"] = self.world
         if self.disabled_reason:
             out["disabled_reason"] = self.disabled_reason
         if self.unreached_reason:
@@ -1361,7 +1377,39 @@ def register(p: Provider) -> None:
     _check_formats(p)
     _check_operand_enum(p)
     _check_closed_world(p)
+    _check_execution_world(p)
     _PROVIDERS.append(p)
+
+
+def _check_execution_world(p: Provider) -> None:
+    """A collective kernel names the axis it reduces over.
+
+    `world` is the process-group size as the cell states it. If the
+    kernel names one, it must be a structural axis of the signature —
+    inventing an axis here would be a second statement of the group.
+    A signature whose shape projection is `collective` and that is not
+    disabled must declare it: otherwise a kernel that needs N ranks
+    registers as the identity of one buffer. A disabled kernel may
+    still name it, so the reason it is off is the process model, not a
+    missing form.
+    """
+    from backend.inference.op_signatures import get_signature
+    sig = get_signature(p.signature)
+    if sig is None:
+        return
+    if p.world:
+        if p.world not in sig.structural_axes:
+            raise ValueError(
+                f"{p.library}:{p.kernel_impl} world={p.world!r} is not a "
+                f"structural axis of {sig.name!r} "
+                f"({list(sig.structural_axes)})")
+        return
+    if p.disabled_reason:
+        return
+    if sig.shape_projection == "collective":
+        raise ValueError(
+            f"{p.library}:{p.kernel_impl} serves collective {sig.name!r} "
+            f"and must declare `world` (the axis of the process group)")
 
 
 def _check_closed_world(p: Provider) -> None:

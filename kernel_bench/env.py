@@ -9,6 +9,7 @@ it, never what was requested.
 """
 from __future__ import annotations
 
+import os
 import re
 import importlib
 from dataclasses import dataclass, field
@@ -70,6 +71,13 @@ class Env:
     #: `dependency_manifest` groups an env's `# Providers:` line by) and no
     #: others.
     library: Optional[str] = None
+    #: This process's rank in the measurement group, and that group's
+    #: size. 0 and 1 is a single process — the harness default. A
+    #: collective rankworker fills them from `LOCAL_RANK` / `WORLD_SIZE`
+    #: (the same names `torchrun` writes) so `Env` is where a kernel
+    #: asks "which die am I", not a second copy of those variables.
+    local_rank: int = 0
+    world_size: int = 1
 
     def __post_init__(self) -> None:
         """A device outside the sheet's vocabulary is refused here.
@@ -275,12 +283,13 @@ def detect_env() -> Env:
         backend = detect_backend()
         if backend is not None:
             device = backend.name
-            device_name = backend.device_name(0)
+            here = backend.current_device()
+            device_name = backend.device_name(here)
             if device_name:
                 gpu_sku, peak_bw_gbps = _resolve_peaks(device_name)
             if device == "cuda":
                 try:
-                    major, minor = torch.cuda.get_device_capability(0)
+                    major, minor = torch.cuda.get_device_capability(here)
                     sm = f"sm_{major}{minor}"    # (8,9) → "sm_89"
                 except Exception:
                     sm = None
@@ -314,7 +323,19 @@ def detect_env() -> Env:
         kmd_version=kernel_mode_driver(_read_text(_NVRM_PROC)),
         umd_version=loaded_user_mode_driver(_read_text(_SELF_MAPS)),
         libs=libs,
+        local_rank=_env_int("LOCAL_RANK", 0),
+        world_size=_env_int("WORLD_SIZE", 1),
     )
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 def _resolve_peaks(device_name: str):

@@ -1057,5 +1057,6 @@ for _op in ("all_reduce", "all_gather", "reduce_scatter", "all_to_all"):
         kernel_impl=f"hccl_{_op}", import_name="torch_npu",
         build=_hccl_build(_op),
         serves=KernelSignature(signature=_op, activation=_ASCEND_FLOAT),
+        world="n_comm_ranks",
         disabled_reason=_SINGLE_PROCESS,
     ))
