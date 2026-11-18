@@ -21,7 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.arch.loader import SpecLoader
 from backend.arch.eval.analysis import pair_stored
-from backend.arch.eval.program import Program
+from backend.arch.eval.program import Program, TiedRead
 from backend.arch.eval.traffic import derive
 from backend.arch.eval.transforms import Deployment
 
@@ -51,7 +51,7 @@ class TestTheHeadNamesItsEmbedding(unittest.TestCase):
                 self.assertFalse(head.owns_weight)
                 self.assertTrue(partner.owns_weight)
                 self.assertEqual(program.read_aliases,
-                                 {head.uid: {partner.uid: 1}})
+                                 {head.uid: {partner.uid: TiedRead(1, split=False)}})
 
     def test_the_tied_head_streams_the_embedding_table(self):
         """gemma-2 ties without a `tie_word_embeddings` key in its config:

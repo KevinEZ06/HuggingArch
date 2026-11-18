@@ -491,6 +491,18 @@ class Representation:
         the file (`Analysis.checkpoint_tensors`) ask for this."""
         return self if self.intent is None else replace(self, intent=None)
 
+    def split_at_load(self, held: TensorFormat) -> "Representation":
+        """A piece split out of this tensor at load
+        (`SpecIRNode.split_at_load`), held at `held`
+        (`ResolvedPrecision.load_split_format`): the same saved tensor, run
+        at that format. Itself where the tensor is already held there — a
+        BF16 `kv_b_proj` splits into BF16 pieces with nothing converted."""
+        resident = self.resident
+        if (resident.scheme is None and not resident.metadata
+                and resident.logical_dtype == held.logical_dtype):
+            return self
+        return replace(self, intent=held)
+
     @property
     def is_converted(self) -> bool:
         return (self.intent is not None
@@ -551,6 +563,11 @@ class Representations:
                   "(`Analysis.tensors()` gives one per layer segment, with "
                   "that segment's copies) or every format (`formats`).")
         return self.segments[0]
+
+    def split_at_load(self, held: TensorFormat) -> "Representations":
+        """`Representation.split_at_load`, segment for segment."""
+        return Representations.of(
+            *(segment.split_at_load(held) for segment in self.segments))
 
     def as_saved(self) -> "Representations":
         """These representations as the FILE has them

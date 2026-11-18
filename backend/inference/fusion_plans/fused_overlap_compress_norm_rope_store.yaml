@@ -48,7 +48,7 @@
 # {,Full}Kernel` stores, two launches — `fused_compress_norm_rope_store` is
 # the second. The shift → concat regroup is what only the overlap form has,
 # so the pattern itself tells the two apart; the larger pattern is tried
-# first (`_pattern_specificity`), and the tail plan never sees an overlap
+# first (`match_order`), and the tail plan never sees an overlap
 # compressor's tail.
 
 fused_op: fused_overlap_compress_norm_rope_store

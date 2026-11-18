@@ -54,6 +54,20 @@
 #
 # `feeds` fixes which norm is the query's: the two have the same op and no
 # edge between them; only the attention operands they become tell them apart.
+#
+# The query norm's cast. Where a quantised GEMM reads the normed q (the
+# q-LoRA a-norm before an FP8 `q_b_proj`), the graft stands a
+# `quantise_activation` on it, and this launch takes it in as the optional
+# `quant` member — the rule `fused_add_rmsnorm` and the activation
+# epilogues state: a cast that is its tensor's one reader goes into the
+# launch that writes the tensor. vLLM writes q wide here and quantises it in
+# the reading linear except on DeepSeek-V4.1's MXFP8 path
+# (`fused_q_kv_rmsnorm_quant`, whose required cast and padded scale tile make
+# it the larger plan, tried first); the plain launch taking the cast is the
+# better form the graph models. It is also what keeps the pair whole: the
+# bare-norm `fused_rmsnorm_quant` (norm + cast) has as many required nodes
+# as this pattern, and the optional member makes this one the larger in
+# `match_order`, so the pair is claimed before the bare norm could split it.
 
 fused_op: fused_q_kv_rmsnorm
 
@@ -61,8 +75,9 @@ naive_pattern:
   nodes:
     q_norm:  { op: rmsnorm, inputs: [external.q],  feeds: q }
     kv_norm: { op: rmsnorm, inputs: [external.kv], feeds: k }
+    quant:   { op: quantise_activation, inputs: [q_norm.out], optional: true }
   io_mapping:
     q:         external.q
     kv:        external.kv
-    output: q_norm.out
+    output: quant.out
     kv_out: kv_norm.out

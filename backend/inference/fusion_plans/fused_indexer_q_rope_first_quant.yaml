@@ -32,7 +32,8 @@
 #   sglang runs the rotation and the quant apart there). Attention CP is not
 #   assumed.
 # vLLM (audited at v0.32.0): not bound — its DSA query preparation is a
-#   different boundary (`fused_q`, which also ropes the main q_pe).
+#   larger launch (`fused_q`, which also ropes the main q_pe), the plan
+#   `fused_dsa_q_rope_quant`.
 
 fused_op: fused_indexer_q_rope_first_quant
 

@@ -1473,7 +1473,7 @@ class Framework:
     materialization that vLLM actually performs" — which is exactly the error
     applying plans from the registry directly would reintroduce.
 
-    Order is the binding's, already sorted by `_pattern_specificity` at load
+    Order is the binding's, already sorted by `match_order` at load
     time so a generic scheme cannot preempt a larger pattern that contains it.
     """
 

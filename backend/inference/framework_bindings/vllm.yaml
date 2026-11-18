@@ -23,8 +23,10 @@
 # (`<path>[:<line>[-<line>]]`), and each links to `audited_at.commit` on
 # GitHub (`audited_at.repo`).
 #
-# Ordering: the loader sorts `op_implementations` by pattern size so larger
-# patterns match first; yaml order only breaks ties. Where two patterns share
+# Ordering: the loader sorts `op_implementations` by `match_order` — required
+# pattern nodes, then all pattern nodes, then the plan's name — so larger
+# patterns match first; yaml order only orders one fused op's own
+# implementations. Where two patterns share
 # nodes the larger is the launch vLLM takes when its condition holds
 # (`fused_gdn_post_conv_prep` over `fused_recurrent_gated_delta_rule`'s gate
 # chain).
@@ -1049,8 +1051,10 @@ op_implementations:
   #   `flashinfer-python==0.7.0.post1`; utils/flashinfer.py:87-106). A
   #   deployment that changes any of them runs the plain launch.
   # Where any clause fails the pair falls to the plain `fused_q_kv_rmsnorm`
-  # below: the two plans share one pattern and differ only in the output
-  # contract, so the loader tries this one first and its `when:` decides.
+  # below, whose cast on q is an optional member: this plan's is required,
+  # so it is the larger and the loader tries it first, and its `when:`
+  # decides. (The plain launch taking the cast is the better form the graph
+  # prices; vLLM's plain launch writes q wide — see that plan.)
   fused_q_kv_rmsnorm_quant:
     source_anchor: "vllm.models.deepseek_v41.common.ops.query_quant.fused_q_kv_rmsnorm_quant (vllm/models/deepseek_v41/common/ops/query_quant.py:90), from DeepseekV4Attention._split_qkv_and_norm (vllm/models/deepseek_v41/attention.py:782)"
     when:
@@ -1092,12 +1096,19 @@ op_implementations:
     when:
       architectures: [DeepseekV32ForCausalLM, GlmMoeDsaForCausalLM]
       device: [cuda]
-  # DSA query preparation (`fused_q`, models/deepseek_v32/common/kernels.py
-  # :888, from attention.py:412) is not bound: the launch also reads and
-  # writes the scaled indexer head weights, which the DSA spec carries
-  # inside `indexer_logits` with no node, and on the fp8-query path
-  # (attention.py:238-239, FlashInfer sparse) it also packs [ql_nope; q_pe] —
-  # a backend / KV-format choice no `when:` key states.
+  # DSA query preparation on indexer layers: the main q_pe rotation and the
+  # indexer query's leading-channel rotation + FP8 quant (+ the head-weight
+  # scaling, which this spec keeps inside `indexer_logits`) in one launch,
+  # `fused_q` (models/deepseek_v32/common/kernels.py:953), from
+  # `DeepseekV32Attention.forward` (deepseek_v32/attention.py:433), every
+  # indexer layer, both phases. The kernel takes either rope layout
+  # (`INDEX_ROPE_INTERLEAVE`, kernels.py:902) and checks no dtype or
+  # capability; ROCm calls it too (deepseek_v32/amd/rocm.py:268), so nothing
+  # narrows it. The fp8-query pack of [ql_nope; q_pe] (attention.py:446) is
+  # a backend / KV-format choice no `when:` key states; the BF16-query path
+  # is billed (see the plan).
+  fused_dsa_q_rope_quant:
+    source_anchor: "vllm.models.deepseek_v32.common.kernels.fused_q (vllm/models/deepseek_v32/common/kernels.py:953, kernel vllm/models/deepseek_v32/common/kernels.py:732), from DeepseekV32Attention.forward (vllm/models/deepseek_v32/attention.py:433)"
   # The MTP entry, enorm + hnorm + concat in one launch: `fused_eh_norm`
   # (models/deepseek_v32/common/kernels.py:1150, from deepseek_v32/nvidia/mtp.py:127
   # with a vocabulary-parallel table; at TP 1 vLLM also folds the gather in,
@@ -1204,8 +1215,9 @@ op_implementations:
   fused_qk_rope_partial:
     source_anchor: "vllm._custom_ops.rotary_embedding (vllm/_custom_ops.py:210), from RotaryEmbedding.forward_cuda (vllm/model_executor/layers/rotary_embedding/base.py:244) on the whole q / k"
   # MLA: the query's rope tail rotated in place through a view, the decoupled
-  # rope key whole (model_executor/layers/mla.py:227-230). Listed last: it
-  # ties in size with the 5-node plans above and must not take their nodes.
+  # rope key whole (model_executor/layers/mla.py:227-230). It ties in size
+  # with other 5-node plans; `fused_dsa_q_rope_quant`, which holds the same
+  # main q tail, has an optional cast and so is tried first (`match_order`).
   # Not DeepSeek-V4.1, for the reason at `fused_qk_rope` (its q tail and
   # latent-KV rope are not one rotary call: models/deepseek_v41/attention.py
   # :1011-1129, and :1084 on SM10x).
@@ -1304,3 +1316,19 @@ op_implementations:
       - architectures: [KimiK3ForConditionalGeneration]
         device: [cuda]
         roles: { gated: [attention] }
+  # A bare RMSNorm (no residual add) whose one reader is the activation cast
+  # of a quantised GEMM, in one launch: `RMSNormQuantFusionPass`'s bare-norm
+  # patterns (compilation/passes/fusion/rms_quant_fusion.py:772; per-group
+  # FP8 `RMSNormGroupQuantPattern` :463, registered :828-835 →
+  # `rms_norm_per_block_quant`; per-token :810, static :802), on from -O1
+  # (config/vllm.py:271, :292) with the `quant_fp8` custom op that a
+  # block-FP8 checkpoint enables (:1733-1748) — and, with the custom ops
+  # off, Inductor fusing the quant into the norm's epilogue (:149-156).
+  # DeepSeek-V3 / Kimi-K2's MLA `q_a_layernorm` → `q_b_proj`
+  # (model_executor/layers/mla.py:190, :221). Plans that write the same norm
+  # and can take its cast (`fused_add_rmsnorm`, `fused_q_kv_rmsnorm`) are
+  # larger in `match_order` and claim it first. Classes whose forward runs
+  # eager, and non-FP8 activation formats, are fused here beyond what the
+  # audited vLLM does — assumptions stated in the plan.
+  fused_rmsnorm_quant:
+    source_anchor: "vllm.compilation.passes.fusion.rms_quant_fusion.RMSNormGroupQuantPattern (vllm/compilation/passes/fusion/rms_quant_fusion.py:463, registered vllm/compilation/passes/fusion/rms_quant_fusion.py:828-835), from RMSNormQuantFusionPass (vllm/compilation/passes/fusion/rms_quant_fusion.py:772)"

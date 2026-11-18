@@ -170,6 +170,43 @@ Ling-2.6-1T: per-channel scales over the view's rows), and the validator
 walked the authored graph behind a flag (`checkpoint(as_stored=)`) to see the
 file — one walk, two meanings.
 
+A shared `module:` address is the declaration of a split at load, and the
+only one (`SpecIRNode.split_at_load`, set by `_tie_shared_modules` and by
+nothing else): each sibling at the address runs a piece the framework builds
+as a weight of its own when it loads the checkpoint, and the piece is what
+the GEMM streams. `tied_weight:` is the other tie and means the other thing:
+the reader names a layer whose tensor it streams whole and as stored (a tied
+LM head) — one tensor, two readers, no copy. The address form is held to its
+meaning at load: the readers' declared weights must partition the stored
+tensor (`Program.read_aliases` refuses pieces that do not sum to it), so a
+GEMM running the whole tensor cannot be written as a shared `module:`. No
+component field states the split besides the address — a second statement
+of the same fact is a second place for it to drift.
+
+Both frameworks dequantise `kv_b_proj` into the model's dtype to build
+W_UK / W_UV and run them through `torch.bmm` (vLLM `split_kv_b_proj`,
+sglang `block_quant_dequant`), so an FP8 `kv_b_proj` is read as BF16 pieces
+with no scales and no activation cast in front of either GEMM. What a piece
+is held at is the deployment's answer (`ResolvedPrecision.load_split_format`,
+today the served format), bound once into what a leaf streams
+(`traffic.Streamed`, with the tie's own `TiedRead.split`) and applied in one
+place (`Streamed.as_held`) that the bytes, the conversion, the row's dtypes,
+the weights its row names and the promotion all read; the stored tensor
+stays the file's format in `tensors()`. The row names a piece by the stored
+tensor's name, the piece's dtype and the rank-local rows of the stored
+layout it covers — its elements times its dtype are the bytes billed.
+
+Not modelled, by decision, each to be its own item:
+- The pieces' residency. Both frameworks keep the stored `kv_b_proj`
+  resident beside W_UK / W_UV (the expanded MLA prefill runs it; vLLM frees
+  it only on its CPU AMX path), about 2 GB on DeepSeek-V3. Capacity counts
+  the stored tensor only, before and after: the walk of one form does not
+  know the other form's pieces, and residency is the same in every phase.
+- The framework × scheme launches the default path is not
+  (`load_split_format` lists them): sglang's per-tensor `bmm_fp8` for a
+  per-channel FP8 `kv_b_proj`, ROCm aiter, DeepGEMM BMM. They enter as the
+  framework's input to the walk, not as a second answer outside it.
+
 ## Source of truth: compute vs naming
 
 A spec describes two things that frequently diverge:

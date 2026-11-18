@@ -1,0 +1,70 @@
+# RMSNorm that writes its output already quantised — the norm with no
+# residual add in front of it, read by a quantised GEMM.
+#
+# Naive subgraph:
+#   rmsnorm: z = rmsnorm(x, weight)
+#   quant:   z_q, scales = quantise_activation(z)    # the graft's cast
+#
+# The cast exists only where a quantised GEMM reads the normed row
+# (`inference.materialize_cast`), and the launch takes it only when it is
+# the row's one reader (`fusion.Fusion._closed`): a consumer that wants the
+# row wide keeps the norm and the cast apart. Typical site: MLA's
+# `q_a_layernorm`, whose row only the query up-projection (and, under DSA,
+# the indexer's `wq_b` through the same cast) reads.
+#
+# This is the residual-free half of the rule `fused_add_rmsnorm` states for
+# its optional `quant` member, and it is a plan of its own because the cast
+# is what makes it a launch: without one a bare `rmsnorm` is a single node
+# and there is nothing to fuse. So `quant` is REQUIRED here.
+#
+# Plans that also hold this norm are tried first by their shape
+# (`framework_bindings.match_order`), not by file order: a launch that
+# writes the norm and can take its cast — `fused_add_rmsnorm` (add, norm,
+# optional cast), `fused_q_kv_rmsnorm` (two norms, optional cast on q) — has
+# as many required nodes as this pattern and one more node in all, so an
+# add + norm + cast chain is the add's launch and a q/kv a-norm pair stays
+# one launch with q's cast in it. This plan sees only the norms no other
+# launch writes.
+#
+# vLLM (audited at v0.32.0): `RMSNormQuantFusionPass`
+# (compilation/passes/fusion/rms_quant_fusion.py:772) registers the bare-norm
+# patterns beside the fused-add ones — static FP8 (:802), dynamic per-token
+# FP8 (:810) and per-group FP8 for groups of 128 and 64 (`RMSNormGroupQuantPattern`
+# :463, registered :828-835) — rewriting the pair into one launch
+# (`rms_norm_static_fp8_quant` / `rms_norm_dynamic_per_token_quant` /
+# `rms_norm_per_block_quant`, :189-205). The pass runs when `fuse_norm_quant`
+# (on from -O1, the default being -O2, config/vllm.py:427, :271, :292) and
+# `enable_norm_fusion` hold (:149-156); a block-FP8 checkpoint turns the
+# `quant_fp8` custom op on (:1733-1748), which is what makes it hold for
+# DeepSeek-V3 / R1 / Kimi-K2. Their MLA calls `q_a_layernorm` then `q_b_proj`
+# in the compiled forward (model_executor/layers/mla.py:190, :221).
+#
+# Declared assumptions — where the graph fuses more than the audited
+# frameworks do, it keeps the better form, with no `architectures` gate and
+# no narrowing by format:
+#   (a) The vLLM fusion is an Inductor pass, so it reaches only compiled
+#       forwards. Model classes whose attention runs eager — DeepSeek-V3.2 /
+#       GLM-5 (`DeepseekV32Attention`), DeepSeek-V4.1, Kimi-K3 — quantise the
+#       normed row in a launch of its own there; the plan still takes the
+#       cast for them.
+#   (b) The audited pass registers the bare-norm patterns for FP8 only
+#       (static, per-token, per-group 128 / 64); there is none for NVFP4 or
+#       MXFP4. The plan takes the cast whatever activation format it
+#       writes.
+# sglang (audited at v0.5.22) does not fuse a block-FP8 (per-group) quant
+# into a bare norm: its only norm + quant fold is a static per-tensor FP8
+# scale (`RMSNorm.fuse_input_quant`, srt/layers/layernorm.py:505-509, taken in
+# `forward_cuda` :551-560), and the per-token / per-group quant is a launch
+# of its own. The binding prices the better form all the same, as
+# `fused_add_rmsnorm`'s optional cast does: taking the cast into its one
+# writer is the graph's rule, not a per-framework fact.
+
+fused_op: fused_rmsnorm_quant
+
+naive_pattern:
+  nodes:
+    rmsnorm: { op: rmsnorm,             inputs: [external.x] }
+    quant:   { op: quantise_activation, inputs: [rmsnorm.out] }
+  io_mapping:
+    x:      external.x
+    output: quant.out

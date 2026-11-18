@@ -302,18 +302,26 @@ Plans overlap by construction: Kimi-K3's whole-mixer kernel contains the short
 convolution, the gated norm and the recurrence, each of which is also a plan of
 its own. Three rules settle it, in this order.
 
-Bindings are sorted by pattern size at load (required nodes; an `optional` node
-does not make a pattern larger), so the larger plan is tried first and
-the kernel a framework really launches wins over its parts. During the rewrite a
+Bindings are sorted by pattern size at load (`framework_bindings.match_order`,
+the one key every caller that applies several plans uses): required nodes
+first, since an `optional` node does not make a pattern larger, then all
+nodes, optional members included, so of two plans with one required core the
+one that can take more in goes first — `fused_add_rmsnorm` (add, norm,
+optional cast) before the bare `fused_rmsnorm_quant` (norm, cast). The larger
+plan is tried first and the kernel a framework really launches wins over its
+parts. During the rewrite a
 candidate whose nodes include one already absorbed is skipped, which keeps every
 node in exactly one launch. And where the larger plan's condition does not hold —
 Kimi-K3 under sglang at an attention-TP other than 8 — its members are free and
 the smaller plans match as before.
 
-The weak spot is equal-size plans: specificity cannot order them, so file order
-decides, and a pattern that happens to fit two different places in a graph is kept
-apart only by a larger plan claiming one of them first. Where that matters, say it
-with a condition or a `feeds` role rather than relying on the order.
+The weak spot is plans equal on both counts: size cannot order them, so the
+plan's name does — the same in every process and every caller, but no more
+meaningful than file order was — and a pattern that happens to fit two
+different places in a graph is kept apart only by a larger plan claiming one
+of them first. Where that matters, say it in the pattern — a condition, a
+`feeds` role, or the optional cast member a launch that writes the tensor can
+take — rather than relying on the order.
 
 ### Activation epilogues follow their consumer
 

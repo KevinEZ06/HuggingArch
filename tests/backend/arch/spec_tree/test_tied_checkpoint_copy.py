@@ -22,7 +22,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.arch.eval import capacity
 from backend.arch.eval.dim import value_of
-from backend.arch.eval.program import Program
+from backend.arch.eval.program import Program, TiedRead
 from backend.arch.eval.transforms import Deployment
 from backend.arch.loader import SpecLoader
 from backend.arch.schema.model import TiedWeightSpec
@@ -118,7 +118,7 @@ class TestTheCopyIsTheFilesNotTheModels(unittest.TestCase):
         head = next(n for n in program.nodes() if n.tied_to is not None)
         self.assertTrue(head.stores_checkpoint_copy)
         self.assertEqual(program.read_aliases,
-                         {head.uid: {head.tied_to_uid: 1}})
+                         {head.uid: {head.tied_to_uid: TiedRead(1, split=False)}})
 
 
 class TestTheDeclarationMatchesTheCheckpoint(unittest.TestCase):

@@ -143,7 +143,7 @@ from backend.arch.eval.fusion import (
 from backend.inference.fusion_plans import FUSION_SCHEMES
 from backend.inference.framework_bindings import (
     FRAMEWORK_BINDINGS,
-    _pattern_specificity,
+    match_order,
 )
 
 
@@ -163,9 +163,7 @@ def shipped_fusion_plans():
     names = set()
     for binding in FRAMEWORK_BINDINGS.values():
         names.update(binding.fused_ops())
-    # The name settles a tie, so the order is the same in every process
-    # rather than the set's.
-    ordered = sorted(names, key=lambda n: (-_pattern_specificity(n), n))
+    ordered = sorted(names, key=match_order)
     return [Fusion.named(n, FUSION_SCHEMES) for n in ordered]
 
 

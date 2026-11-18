@@ -20,8 +20,10 @@
 # `kernels/jit/csrc/**` the JIT sources, `kernels/aot/python/sgl_kernel` the
 # AOT wheel.
 #
-# Ordering: the loader sorts `op_implementations` by pattern size so larger
-# patterns match first; yaml order only breaks ties. Where two patterns share
+# Ordering: the loader sorts `op_implementations` by `match_order` — required
+# pattern nodes, then all pattern nodes, then the plan's name — so larger
+# patterns match first; yaml order only orders one fused op's own
+# implementations. Where two patterns share
 # nodes the larger is the launch sglang takes when its condition holds
 # (`fused_qk_norm_rope` over `fused_q_kv_rmsnorm`'s norm pair).
 
@@ -987,7 +989,7 @@ op_implementations:
   # It is bound ahead of the seam plans for a second reason: the exit's first
   # three ops are a flatten, an unscaled RMS and an external-weight GEMM, the
   # same shape as a pre-mix projection, and this 9-node pattern claims them
-  # first (`_pattern_specificity`).
+  # first (`match_order`).
   # Residual, stated: sglang's NextN draft runs the same reduce as torch ops
   # (srt/models/deepseek_v4_nextn.py:114-127), so a draft block's head is
   # billed as one launch where sglang makes several. It is a launch-count
@@ -1090,3 +1092,14 @@ op_implementations:
     when:
       architectures: [DeepseekV4ForCausalLM, Glm5NextForConditionalGeneration]
       device: [cuda]
+  # A bare RMSNorm whose one reader is a quantised GEMM's activation cast.
+  # sglang does NOT fuse this under block FP8: its norm runs on its own
+  # (`RMSNorm.forward_cuda`, srt/layers/layernorm.py:511) and the per-token /
+  # per-group quant is a launch of its own; the only norm + quant fold it has
+  # is a static per-tensor FP8 scale (`fuse_input_quant` :505-509, taken at
+  # :551-560). Bound as the better form the graph prices, following
+  # `fused_add_rmsnorm`'s optional cast: a cast that is its tensor's one
+  # reader goes into the launch that writes the tensor — the graph's rule,
+  # not a per-framework fact.
+  fused_rmsnorm_quant:
+    source_anchor: "Not an sglang kernel under block FP8: sglang.srt.layers.layernorm.RMSNorm.forward_cuda (python/sglang/srt/layers/layernorm.py:511) runs the norm alone and the per-group quant is a separate launch (its only norm + quant fold is the static per-tensor FP8 path, python/sglang/srt/layers/layernorm.py:551-560); priced as the better form, after fused_add_rmsnorm's optional cast"

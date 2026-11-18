@@ -672,6 +672,57 @@ def test_a_shared_copy_runs_once_per_tensor_it_copies():
     assert shared[0]["count_per_step"] == moe_layers == 26
 
 
+@pytest.mark.parametrize("model_id, preset", [
+    # An FP8 block-128 checkpoint: the stored `kv_b_proj` is FP8, and the
+    # pieces both frameworks split out of it at load are BF16.
+    ("deepseek-ai/DeepSeek-V3", None),
+    # A BF16 checkpoint a weight rule puts in FP8: the stored tensor is
+    # held FP8, and the split pieces are dequantised all the same.
+    ("deepseek-ai/DeepSeek-V2-Lite", "w_fp8_kv_fp8"),
+])
+def test_a_weight_split_out_at_load_takes_no_activation_cast(model_id, preset):
+    """Absorbed MLA runs `kv_b_proj` as two per-head GEMMs on W_UK / W_UV,
+    which vLLM (`split_kv_b_proj`) and sglang (`block_quant_dequant`) build
+    at load by dequantising the stored tensor to the model's dtype and run
+    through `torch.bmm`. So their operand is not quantised: no cast is
+    grafted in front of either, their rows are BF16 × BF16, and the stored
+    tensor they were split from is still held as the deployment holds it
+    (FP8). Asked of the tie (`TiedRead.split`), not of op names."""
+    from backend.arch.precision_profile import PrecisionProfile
+    from backend.inference.pipeline import analyze
+
+    result = analyze(
+        resolve_snapshot(model_id), parallel=ParallelConfig(),
+        framework_binding=get_binding("vllm"), batch_size=8,
+        avg_input_tokens=64, avg_output_tokens=1, phase="decode",
+        precision=(None if preset is None
+                   else PrecisionProfile.from_request({"preset": preset})),
+        breakdown=True)
+    program = result.analysis.program
+    split = {reader for reader, ties in program.read_aliases.items()
+             if any(tie.split for tie in ties.values())}
+    assert split, "an absorbed MLA decode runs the split pieces"
+    for node in result.pre_program.nodes():
+        if node.op != "quantise_activation":
+            continue
+        readers = {reader.uid for reader in result.pre_program.nodes()
+                   if any(ref.src is node
+                          for ref in (reader.inputs_obj or ()))}
+        assert not readers & split, node.display_path
+    rows = {row["uid"]: row for row in result.per_op_timing}
+    # The timed ones: an aux stack (MTP) is walked but not in the step rows.
+    timed = split & set(rows)
+    assert timed
+    for uid in timed:
+        row = rows[uid]
+        assert (row["act_dtype"], row["weight_dtype"]) == ("BF16", "BF16")
+        assert not row["convert_bytes_per_rank"]
+        assert not row["metadata_bytes_per_rank"]
+        (stored,) = result.analysis.tensors_of(
+            program.by_uid(uid).tied_to_uid)
+        assert stored.rep.resident.storage_dtype == "F8_E4M3"
+
+
 def test_the_exchange_after_the_dispatch_moves_the_narrow_copy():
     """DP-attention puts an all-to-all between the dispatch and the experts.
     It moves the tensor it reads — the dispatch's rows of the quantised

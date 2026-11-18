@@ -62,3 +62,39 @@ def test_the_weight_operand_is_named_with_its_shape_and_dtype(decode_rows):
     assert [(w["shape"], w["dtype"]) for w in o_proj["weights"]] == [
         ([3072, 3072], "F8_E4M3")]
     assert o_proj["weights"][0]["name"].endswith("o_proj.weight")
+
+
+MLA = "deepseek-ai/DeepSeek-V2-Lite"
+
+
+def test_a_split_piece_is_named_as_the_piece_it_streams():
+    """Absorbed MLA's `q_absorbed_nope` streams W_UK, the piece split out
+    of `kv_b_proj` at load and dequantised to BF16 (vLLM `split_kv_b_proj`):
+    its row names that piece — the stored tensor's name, the rows of it the
+    piece covers, BF16 — and the row's `weight_dtype` and weight bytes are
+    that same tensor's. The preset stores `kv_b_proj` FP8, so a row that
+    named the stored tensor would disagree with its own bytes. The shape is
+    worked out here from the checkpoint config (heads × qk_nope rows of
+    kv_lora columns), not from the walk."""
+    config = snapshot_config(MLA)
+    est = estimate_capacity(
+        config=config, model_id=MLA,
+        resolved=resolve_snapshot(MLA), gpu_sku="H100-SXM",
+        parallel=ParallelConfig(), num_gpus=1, gpu_memory_fraction=0.9,
+        avg_input_tokens=1024, avg_output_tokens=64,
+        prefill_batch_size=2, decode_batch_size=2,
+        selection_mode="theoretical_only", measurement_scope=None,
+        precision={"preset": "w_fp8_kv_fp8"})
+    rows = [r for r in est["per_op_timing_decode"]
+            if r.get("display_path") == "self_attn.q_absorbed_nope"]
+    assert rows
+    piece = [config["num_attention_heads"] * config["qk_nope_head_dim"],
+             config["kv_lora_rank"]]
+    for row in rows:
+        (weight,) = row["weights"]
+        assert weight["name"].endswith("kv_b_proj.weight")
+        assert (weight["shape"], weight["dtype"]) == (piece, "BF16")
+        assert row["weight_dtype"] == weight["dtype"]
+        assert row["weight_read_bytes_per_rank"] == (
+            piece[0] * piece[1] * 2 * row["count_per_step"])
+        assert not row["metadata_bytes_per_rank"]

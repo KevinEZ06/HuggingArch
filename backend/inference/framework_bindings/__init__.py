@@ -105,39 +105,42 @@ from backend.inference.comm_cost import CollectiveRung
 _logger = logging.getLogger(__name__)
 
 
-def _pattern_specificity(op_name: str) -> int:
-    """Larger = more specific = should match before more-generic
-    schemes that could consume a substructure of it.
+def match_order(op_name: str) -> Tuple[int, int, str]:
+    """The order plans are tried in, most specific first — the one sort key
+    every caller that applies several plans to one graph uses (the binding
+    loader, `playground.module_bench`), so two of them cannot try the same
+    plans in different orders.
 
-    The matcher iterates `op_implementations` in order and consumes
-    matched nodes; if a generic scheme runs first it can preempt a
-    larger pattern that contains it as a substructure (e.g. the
-    parallel-form `merged_column_parallel_linear` matching the
-    gate+up linears inside `gated_act_ffn` before the larger pattern
-    gets a chance). Sorting by descending specificity at load time
-    makes the right thing happen without any author discipline.
+    The matcher consumes matched nodes; if a generic scheme runs first it
+    can preempt a larger pattern that contains it as a substructure (the
+    parallel-form `merged_column_parallel_linear` taking the gate+up
+    linears inside `gated_act_ffn`). Sorting on the pattern itself makes
+    the right thing happen without any author discipline:
 
-    Specificity scale:
-      * Explicit-nodes form: number of required pattern nodes (each a
-        required op slot; more nodes = a structurally larger commit). An
-        `optional` node is not one: a plan that MAY also take the
-        activation cast after its sink (`silu_and_mul`) is no larger than
-        its plain pattern, and counting the cast let `fused_add_rmsnorm`
-        preempt the `allreduce_fused_rmsnorm` that contains it.
-      * Parallel form: 0 (matches N>=2 anonymous siblings of one op
-        — the most generic shape we have).
-      * Unknown / missing scheme: 0 (defensive — bindings can't
-        reference unknown schemes anyway, the load-time check above
-        catches that).
+      1. Required pattern nodes, descending. An `optional` node is not
+         one: a plan that MAY take the activation cast after its sink
+         (`silu_and_mul`) is no larger than its plain pattern, and counting
+         the cast let `fused_add_rmsnorm` preempt the
+         `allreduce_fused_rmsnorm` that contains it.
+      2. All pattern nodes, optional members included, descending: of two
+         plans with the same required core, the one that can take more in
+         goes first. `fused_add_rmsnorm` (add, norm, optional cast) is
+         tried before `fused_rmsnorm_quant` (norm, cast), so an add + norm
+         + cast chain is the add's launch and the bare-norm plan sees only
+         the norms no add precedes.
+      3. The plan's name: an order that is the same in every process and
+         every caller, not a file's or a set's.
+
+    A parallel-form pattern (N >= 2 anonymous siblings of one op, the most
+    generic shape) and an unknown scheme rank as size 0 on both counts.
     """
     scheme = FUSION_SCHEMES.get(op_name)
-    if scheme is None:
-        return 0
-    pattern = scheme.naive_pattern
+    pattern = None if scheme is None else scheme.naive_pattern
     if pattern is None or pattern.is_parallel():
-        return 0
-    return sum(1 for node in pattern.expanded_nodes().values()
-               if not node.optional)
+        return (0, 0, op_name)
+    nodes = pattern.expanded_nodes().values()
+    return (-sum(1 for node in nodes if not node.optional),
+            -len(nodes), op_name)
 
 
 @dataclass(frozen=True)
@@ -2076,13 +2079,12 @@ def _load_framework_bindings_dir(
                 yaml_position[id(impls[-1])] = impl_index
                 impl_index += 1
         _reject_overlapping_implementations(fname, tuple(impls))
-        # Sort by specificity (descending) so specific patterns try
-        # first; yaml declaration order is the tiebreak inside one
-        # specificity bucket so author intent within ties is preserved.
+        # Most specific first (`match_order`); yaml order only orders the
+        # implementations of ONE fused op among themselves.
         _reject_shared_patterns(fname, list(dict.fromkeys(
             op for op, _impl in impls)))
         impls.sort(key=lambda entry: (
-            -_pattern_specificity(entry[0]),
+            match_order(entry[0]),
             yaml_position[id(entry)],
         ))
         collectives, anchors = _collectives(data.get("collectives") or {}, fname)

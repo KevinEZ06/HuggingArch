@@ -1449,7 +1449,26 @@ def _tie_shared_modules(nodes) -> List[SpecIRNode]:
     weight-holding siblings at one address are ONE stored tensor: the
     parameter stored there (an identity source), which the others run and
     read as a tied head reads its table (absorbed MLA's per-head GEMMs at
-    `kv_b_proj`). An address with no such parameter, or two, is refused."""
+    `kv_b_proj`). An address with no such parameter, or two, is refused.
+
+    A shared `module:` address IS the declaration of a split at load, and
+    nothing else declares one: each reader runs a piece of the stored tensor
+    in a layout of its own (its declared weight), a weight the framework
+    builds when it loads the checkpoint (vLLM `split_kv_b_proj`, sglang
+    `w_kc` / `w_vc`), not the stored tensor itself. The tie records it
+    (`SpecIRNode.split_at_load`), and a reader streams the piece at the
+    format the deployment holds pieces at
+    (`ResolvedPrecision.load_split_format`).
+
+    That is what distinguishes it from `tied_weight:` (a tied LM head, an
+    MTP head reading the LM head): there the reader names another LAYER
+    whose tensor it streams whole and as stored — one tensor, two readers,
+    no copy. Here siblings name one checkpoint ADDRESS and split it. The
+    two are not interchangeable, and the address form is held to its one
+    meaning: the readers' declared weights must partition the stored
+    tensor (`Program.read_aliases` refuses pieces that do not sum to it),
+    so a GEMM that runs the whole tensor cannot hide behind a shared
+    `module:` — it is a `tied_weight:`."""
     tied: List[SpecIRNode] = []
     for parent in nodes:
         at: Dict[str, List[SpecIRNode]] = {}
@@ -1469,6 +1488,7 @@ def _tie_shared_modules(nodes) -> List[SpecIRNode]:
             for node in sharing:
                 if node is not owner and node.tied_to_uid is None:
                     node.tied_to, node.tied_to_uid = owner.name, owner.uid
+                    node.split_at_load = True
                     tied.append(node)
     return tied
 

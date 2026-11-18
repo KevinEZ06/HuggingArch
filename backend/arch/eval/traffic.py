@@ -107,7 +107,6 @@ from .cache import (Edges,
                     covered_context_source as _covered_source,
                     is_view as _is_view,
                     materialized as _materialized)
-from .formats import segments_of
 from .tensor_rows import pair_stored
 from .dim import (algebra, Dim, ceil_div, exact, exact_div, expr_of, minimum,
                   ratio, same_law, value_of, names_of, where)
@@ -1476,13 +1475,14 @@ def derive(analysis: Any, *,
         # what `_external_inputs` is for). Looking only at members would
         # lose gpt-oss's expert bias and every fused sink the moment a
         # framework's fusion plan applies.
-        own, borrowed = streamed_sources(
+        streamed = streamed_sources(
             node, uid, members=(origins.get(uid) or (uid,)),
-            read_aliases=read_aliases, borrowed_by=borrowed_by)
+            read_aliases=read_aliases, borrowed_by=borrowed_by,
+            precision=precision)
         (weight_bytes, metadata_bytes, borrowed_bytes, borrowed_metadata,
          weight_elems, borrowed_elems, table) = _weight_traffic(
-            node, uid, own=own, storage=storage, formats=formats,
-            borrowed=borrowed, table_reads=table_reads)
+            node, uid, streamed=streamed, storage=storage, formats=formats,
+            table_reads=table_reads)
 
         # A VIEW moves nothing. `transpose`, `view_split`, `view_merge`,
         # `slice` and `broadcast` all declare `is_view_op`, and the declaration
@@ -1555,7 +1555,8 @@ def derive(analysis: Any, *,
         multiplies = multiplies_weight(program, origins.get(uid) or (uid,))
         wanted = precision.conversion(
             node.role, program.stack_of(node),
-            read_representations(formats, own, uid) if multiplies else ())
+            read_representations(formats, streamed, uid)
+            if multiplies else ())
         operand = edge_reads[0] if edge_reads else None
         # The operand a kernel multiplies a quantised cached tensor with,
         # quantised to what its reader declares (`cache.paired_records`):
@@ -1686,14 +1687,16 @@ def derive(analysis: Any, *,
 
 
 
-def read_representations(formats: Layer[Any], own: Mapping[int, Any],
+def read_representations(formats: Layer[Any], streamed: "Streamed",
                          uid: int) -> Tuple[Any, ...]:
     """The stored representations a leaf's matmul format is read from: its
     own and the tensors it streams through a tie (`streamed_sources`'s
-    `own`), and the leaf itself. One answer for every consumer that asks
-    what a reader eats — the conversion `derive` prices and the fusion
-    condition `readers_eat` (`reader_format`)."""
-    return segments_of(formats.values, *dict.fromkeys((*own, uid)))
+    `own`, each as the leaf holds it — `Streamed.held`), and the leaf
+    itself. One answer for every consumer that asks what a reader eats —
+    the conversion `derive` prices and the fusion condition `readers_eat`
+    (`reader_format`)."""
+    return streamed.segments(formats.values,
+                             tuple(dict.fromkeys((*streamed.own, uid))))
 
 
 def reader_format(analysis: Any, node: Identified) -> Optional[Any]:
@@ -1702,24 +1705,20 @@ def reader_format(analysis: Any, node: Identified) -> Optional[Any]:
     `derive` prices its conversion from; None when it takes the edge as it
     arrives."""
     program = analysis.program
-    own, _borrowed = streamed_sources(
+    precision = analysis.resolved_precision
+    streamed = streamed_sources(
         node, node.uid, members=(node.uid,),
         read_aliases=program.read_aliases or {},
-        borrowed_by=_borrowed_sources(program))
-    return analysis.resolved_precision.required_format(
+        borrowed_by=_borrowed_sources(program), precision=precision)
+    return precision.required_format(
         node.role, program.stack_of(node),
-        read_representations(analysis.formats, own, node.uid))
+        read_representations(analysis.formats, streamed, node.uid))
 
 
-def streamed_sources(node: Identified, uid: int, *, members, read_aliases,
-                     borrowed_by) -> Tuple[Dict[int, Any], Tuple[int, ...]]:
-    """`(own, borrowed)` — every stored-tensor node whose bytes this leaf
-    moves, the reader's own and the ones threaded into it.
-
-    `members` are the walked leaves this row stands for: a fused node's
-    origins, else itself. The caller says, because the two callers hold the
-    rewrite differently (the traffic walk has the origins map; the access
-    projection is handed a fused program whose nodes carry their own).
+@dataclass(frozen=True)
+class Streamed:
+    """Every stored-tensor node whose bytes one leaf moves, and how it holds
+    each (`streamed_sources`).
 
     `own` is what the leaf (or, fused, each of its origins) stores, plus
     whatever each of those aliases (`Program.read_aliases`: a tied LM head
@@ -1727,6 +1726,57 @@ def streamed_sources(node: Identified, uid: int, *, members, read_aliases,
     for a tie to part of a tensor). `borrowed` is the parameters threaded in
     along a dataflow edge (`_borrowed_sources`: `F.linear(x, W)`, a bias
     `add`, a sink softmax) — the source's tensor, read once by this reader.
+    `split` is the `own` sources the leaf reads through a tie that is a
+    split at load (`program.TiedRead.split`): it streams the piece split
+    out of that tensor, held at the deployment's format for one
+    (`ResolvedPrecision.load_split_format`), not the tensor as stored.
+    `precision` is the resolution that format is asked of, bound here once.
+    """
+
+    own: Mapping[int, Any]
+    borrowed: Tuple[int, ...]
+    split: FrozenSet[int]
+    precision: Any
+
+    def as_held(self, source: int, rep: Any) -> Any:
+        """A `Representation` (or a tensor's `Representations`) of
+        `source`'s as this leaf streams it: the piece split out at load where its tie is a split, else the
+        representation itself. The one place a split read turns into a
+        format — the bytes `_weight_traffic` bills, every dtype question
+        about the leaf (`segments`) and the weights its row names
+        (`access.streamed_weights`) all come through here."""
+        if source not in self.split:
+            return rep
+        return rep.split_at_load(self.precision.load_split_format)
+
+    def held(self, walked_formats: Mapping[int, Any], source: int
+             ) -> Optional[Tuple[Any, ...]]:
+        """The `Representations` of `source`'s stored tensors as this leaf
+        streams them (`as_held`, tensor by tensor)."""
+        reps = walked_formats.get(source)
+        if reps is None:
+            return None
+        return tuple(self.as_held(source, r) for r in reps)
+
+    def segments(self, walked_formats: Mapping[int, Any],
+                 sources: Iterable[int]) -> Tuple[Any, ...]:
+        """`segments_of` over `sources`, each as this leaf streams it."""
+        return tuple(segment for source in sources
+                     for reps in (self.held(walked_formats, source) or ())
+                     for segment in reps)
+
+
+def streamed_sources(node: Identified, uid: int, *, members, read_aliases,
+                     borrowed_by, precision: Any) -> Streamed:
+    """Every stored-tensor node whose bytes this leaf moves, the reader's
+    own and the ones threaded into it (`Streamed`).
+
+    `members` are the walked leaves this row stands for: a fused node's
+    origins, else itself. The caller says, because the two callers hold the
+    rewrite differently (the traffic walk has the origins map; the access
+    projection is handed a fused program whose nodes carry their own).
+    Whether a member's tie is a split at load is the tie's own entry
+    (`Program.read_aliases`, `TiedRead.split`), so no caller states it.
 
     One owner, because two consumers ask it: `_weight_traffic` bills these
     bytes, and the access projection reads the DTYPE of the same tensors
@@ -1734,20 +1784,23 @@ def streamed_sources(node: Identified, uid: int, *, members, read_aliases,
     — a tied LM head had its bytes billed and its dtype missing.
     """
     own: Dict[int, Any] = {}
+    split: set = set()
     # An identity source reads nothing: its output IS the tensor, and the
     # consumer at the other end of the edge is what streams it.
     if not is_identity_source(node.op):
         for member in members:
             own[member] = 1
-            for source, share in read_aliases.get(member, {}).items():
-                own[source] = own.get(source, 0) + share
+            for source, tie in read_aliases.get(member, {}).items():
+                own[source] = own.get(source, 0) + tie.share
+                if tie.split:
+                    split.add(source)
     # A fused node's OWN uid is in the scan beside its origins: once a match
     # is absorbed the members are gone from `FusedProgram.nodes()` and the
     # edge to the parameter survives on the fused node's `inputs_obj`.
     borrowed = tuple(dict.fromkeys(
         src for member in (*members, uid)
         for src in borrowed_by.get(member, ())))
-    return own, borrowed
+    return Streamed(own, borrowed, frozenset(split), precision)
 
 
 def widest_format(reps: Tuple[Any, ...]) -> Optional[Any]:
@@ -1764,8 +1817,8 @@ def widest_format(reps: Tuple[Any, ...]) -> Optional[Any]:
     return max(formats, key=lambda f: dtype_bytes(f.logical_dtype))
 
 
-def streamed_formats(walked_formats: Mapping[int, Any], own: Iterable[int],
-                     borrowed: Iterable[int]) -> Tuple[Any, ...]:
+def streamed_formats(walked_formats: Mapping[int, Any], streamed: Streamed
+                     ) -> Tuple[Any, ...]:
     """The resident formats of the tensors whose dtype describes this leaf's
     matmul: the ones it OWNS, and the ones it only borrows when it owns none.
 
@@ -1784,8 +1837,8 @@ def streamed_formats(walked_formats: Mapping[int, Any], own: Iterable[int],
     answer for the row's weight dtype (`projection.access`) and for the
     weight a matmul's product is promoted by (`weight_promotion`).
     """
-    for sources in (own, borrowed):
-        reps = segments_of(walked_formats, *sources)
+    for sources in (streamed.own, streamed.borrowed):
+        reps = streamed.segments(walked_formats, sources)
         if any(rep.resident is not None for rep in reps):
             return reps
     return ()
@@ -1798,10 +1851,9 @@ def multiplies_weight(program: Any, members: Iterable[int]) -> bool:
                for member in members if program.by_uid(member) is not None)
 
 
-def weight_promotion(node: Identified, own: Iterable[int],
-                     borrowed: Iterable[int], *, multiplies: bool,
-                     formats: Mapping[int, Any], precision: Any,
-                     program: Any) -> Optional[Written]:
+def weight_promotion(node: Identified, streamed: Streamed, *,
+                     multiplies: bool, formats: Mapping[int, Any],
+                     precision: Any, program: Any) -> Optional[Written]:
     """The dtype a matmul COMPUTES in where the weight it multiplies is
     held wider than its activation, else None: the weight's.
 
@@ -1830,7 +1882,7 @@ def weight_promotion(node: Identified, own: Iterable[int],
     format is dequantised into the activation's dtype, never wider."""
     if not multiplies:
         return None
-    widest = widest_format(streamed_formats(formats, own, borrowed))
+    widest = widest_format(streamed_formats(formats, streamed))
     if widest is None or not is_unquantized(widest.logical_dtype):
         return None
     width = float(dtype_bytes(widest.logical_dtype))
@@ -1861,11 +1913,11 @@ def weight_promotions(program: Any, formats: Mapping[int, Any],
     for node in program.nodes():
         if node.children:
             continue
-        own, borrowed = streamed_sources(
+        streamed = streamed_sources(
             node, node.uid, members=(node.uid,), read_aliases=read_aliases,
-            borrowed_by=borrowed_by)
+            borrowed_by=borrowed_by, precision=precision)
         held = weight_promotion(
-            node, own, borrowed,
+            node, streamed,
             multiplies=multiplies_weight(program, (node.uid,)),
             formats=formats, precision=precision, program=program)
         if held is not None:
@@ -1977,8 +2029,8 @@ def _table_read_fractions(analysis: Any, program: Any, shapes: Layer[Any],
     return out
 
 
-def _weight_traffic(node: Identified, uid: int, *, own, storage, formats,
-                    borrowed=(), table_reads=None
+def _weight_traffic(node: Identified, uid: int, *, streamed: Streamed,
+                    storage, formats, table_reads=None
                     ) -> Tuple[Extent, Extent, Extent, Extent, Extent, Extent,
                                Optional[TableRead]]:
     """Weight + quant-metadata read bytes for one leaf.
@@ -1989,9 +2041,13 @@ def _weight_traffic(node: Identified, uid: int, *, own, storage, formats,
     keyed on the single stored copy; the read bills whoever moves it.
     Which sources those are is `streamed_sources`, asked by the caller.
 
-    Bytes come from `Representation.resident`. A serving cast is an
+    Bytes come from `Representation.resident` of each tensor as the leaf
+    holds it (`Streamed.held`): a piece split out at load is streamed at
+    the piece's format, not the stored tensor's. A serving cast is an
     intent policy on the walk, not a second width asked here.
     """
+    own, borrowed = streamed.own, streamed.borrowed
+
     def _bytes(source: int) -> Tuple[Extent, Extent, Extent]:
         w: Extent = 0
         m: Extent = 0
@@ -1999,7 +2055,7 @@ def _weight_traffic(node: Identified, uid: int, *, own, storage, formats,
         for row in pair_stored(
             source,
             storage.values.get(source),
-            formats.values.get(source),
+            streamed.held(formats.values, source),
         ):
             if row.rep is None:
                 continue

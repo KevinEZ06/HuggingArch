@@ -542,6 +542,60 @@ class ResolvedPrecision:
         return self.model_dtype == self.shipped_model_dtype
 
     @memo_property
+    def served_format(self) -> TensorFormat:
+        """The format a framework holds a weight at when it holds it at the
+        model's own served dtype (`model_dtype`), unquantised: the serving
+        downcast of a wider checkpoint (`WeightIntent._served`) and a piece
+        split out at load (`load_split_format`) are both this one format.
+        Not `chosen_by_profile`: nothing was chosen. This is what the
+        checkpoint ships as, once the framework that serves it is the one
+        reading it, so an estimate is not refused for want of a column the
+        deployment asked for (`compute_dtype_is_chosen`)."""
+        dtype = self.model_dtype
+        return TensorFormat(storage_dtype=dtype, num_bits=_bits(dtype),
+                            selected_by="served")
+
+    @property
+    def load_split_format(self) -> TensorFormat:
+        """What a weight split out of a stored tensor at load is held at
+        (`SpecIRNode.split_at_load`: absorbed MLA's W_UK / W_UV out of
+        `kv_b_proj`): the served format (`served_format`), whatever the
+        stored tensor's format or a weight rule's. The one question every
+        consumer of a split read asks, through `traffic.Streamed.as_held`;
+        the stored tensor stays what it is, and the piece is a second weight
+        beside it that its reader streams.
+
+        What the default path does, which this answers: both frameworks
+        build the pieces by dequantising the stored tensor into the
+        activation dtype and run them through `torch.bmm`. vLLM v0.32.0
+        `split_kv_b_proj` → `get_and_maybe_dequant_weights(out_dtype=
+        act_dtype)` (model_executor/layers/attention/mla_attention.py:407-
+        421, 1248-1255, 1325-1327; bmm at :1079, :1413), quantised or not;
+        sglang v0.5.22 `block_quant_dequant(..., torch.bfloat16)` for a
+        block-scaled FP8 `kv_b_proj` (srt/models/deepseek_common/
+        deepseek_weight_loader.py:662-680; bmm at attention_forward_methods/
+        forward_mla.py:583, :900-908).
+
+        Not modelled, each a launch a framework takes in place of that one:
+          * sglang, a per-channel or per-tensor FP8 `kv_b_proj` (Ling-2.6's
+            compressed-tensors FP8): requantised to one tensor scale
+            (deepseek_weight_loader.py:701) and run by `bmm_fp8` with a
+            per-tensor FP8 query (forward_mla.py:567-581, :891);
+          * vLLM on ROCm with aiter: FP8 / MXFP4 BMM on pieces requantised
+            at load (mla_attention.py:1258-1322);
+          * sglang with `SGL_USE_DEEPGEMM_BMM=1` (not the default): the
+            block-FP8 pieces kept and run by DeepGEMM
+            (deepseek_weight_loader.py:667-672).
+        Each depends on the framework, and this resolution holds none. When
+        one is modelled it enters as the framework's input to the walk — the
+        binding's answer resolved here, with the profile, before anything
+        reads a format (the move `with_launches` names below) — and changes
+        what this property returns. Not a second answer kept beside it: a
+        consumer that asks a binding after the walk would price the bytes,
+        the cast and the row's dtype from two different pieces."""
+        return self.served_format
+
+    @memo_property
     def weight_intent(self) -> Optional["WeightIntent"]:
         """The weight table asked per tensor, and — for a checkpoint no
         framework runs at its stored width — the serving downcast, which is
@@ -661,13 +715,7 @@ class WeightIntent:
             return None
         if canonical(saved.logical_dtype) != self.resolved.shipped_model_dtype:
             return None
-        served = self.resolved.model_dtype
-        # Not `chosen_by_profile`: nothing was chosen. This is what the
-        # checkpoint ships as, once the framework that serves it is the one
-        # reading it, so an estimate is not refused for want of a column the
-        # deployment asked for (`compute_dtype_is_chosen`).
-        return TensorFormat(storage_dtype=served, num_bits=_bits(served),
-                            selected_by="served")
+        return self.resolved.served_format
 
     def _from_rule(self, saved_policy: Any, stored: Any, role: Optional[str],
                    stack: Optional[str], node_dims: Optional[Mapping[str, Any]]

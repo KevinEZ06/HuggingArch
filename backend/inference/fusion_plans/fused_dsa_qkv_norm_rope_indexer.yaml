@@ -28,8 +28,9 @@
 # asks the class.
 #
 # The query rotations (main q_pe and the indexer's) are a second launch,
-# `fused_q` (kernels.py:953, from attention.py:433), which also packs the
-# MQA query and scales the indexer head weights; not planned here.
+# `fused_q` (kernels.py:953, from attention.py:433), which also quantises
+# the indexer query and scales the indexer head weights: the plan
+# `fused_dsa_q_rope_quant`.
 #
 # sglang (audited at v0.5.22) runs the two a-norms as separate launches
 # (srt/models/deepseek_common/attention_forward_methods/forward_mla.py:359-365)

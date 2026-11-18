@@ -8,13 +8,13 @@ composition root's import path)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from .dim import (as_extent, as_number, bound_or_folded, expr_of, floored,
                   ratio, same_law, value_of)
 from . import traffic as traffic_mod
 from .traffic import declared_input
-from .formats import segments_of
 from ..ops import DISPATCH_OP, is_dispatch_boundary, is_identity_source
 from .cache import main_port
 from .launch import FusedNode
@@ -669,15 +669,15 @@ def _leaf_traffic_rows(analysis: Any, *,
         cost = costs.values.get(uid)
         # The weight half of the row's dtype environment describes the
         # tensors this leaf STREAMS, which is not always the ones it owns.
-        own_srcs, borrowed_srcs = traffic_mod.streamed_sources(
+        sources = traffic_mod.streamed_sources(
             node, uid, members=_members(node), read_aliases=read_aliases,
-            borrowed_by=borrowed_by)
+            borrowed_by=borrowed_by, precision=precision)
         # The formats it multiplies by: its members' own and the tensors
         # they read through a tie, as traffic asks for its conversion.
-        reps = segments_of(walked_formats,
-                           *dict.fromkeys((*_members(node), *own_srcs)))
-        streamed = traffic_mod.streamed_formats(
-            walked_formats, own_srcs, borrowed_srcs)
+        reps = sources.segments(
+            walked_formats,
+            tuple(dict.fromkeys((*_members(node), *sources.own))))
+        streamed = traffic_mod.streamed_formats(walked_formats, sources)
         widest = traffic_mod.widest_format(streamed)
         input_format = precision.required_format(
             node.role, graph.stack_of(node), reps)
@@ -733,8 +733,9 @@ def _leaf_traffic_rows(analysis: Any, *,
             out_terms=tuple(t.out_terms),
             **dict(zip(("routed_inputs", "routed_output", "routed_extent"),
                        _routed_terms(graph, node, t), strict=True)),
-            weight_packs=weight_packs(graph, node, own_srcs, borrowed_srcs),
-            weights=streamed_weights(node, own_srcs, borrowed_srcs, held),
+            weight_packs=weight_packs(graph, node, sources.own,
+                                      sources.borrowed),
+            weights=streamed_weights(node, sources, held),
         )
     return out
 
@@ -759,14 +760,26 @@ def _held_tensors(analysis: Any) -> Dict[int, Dict[int, list]]:
     return held
 
 
-def streamed_weights(node: Any, own: Mapping[int, Any],
-                     borrowed: Sequence[int],
+def streamed_weights(node: Any, sources: "traffic_mod.Streamed",
                      held: Mapping[int, Mapping[int, list]]
                      ) -> Tuple[StreamedWeight, ...]:
     """The stored tensors `node` streams (`traffic.streamed_sources`: the
-    ones billed to it), each as `StreamedWeight`. A borrowed tensor names
-    the input edge that threads it in — the edge `_borrowed_sources` found
-    it on, by its position in the node's inputs."""
+    ones billed to it), each as `StreamedWeight`, as the leaf holds it
+    (`Streamed.as_held`). A borrowed tensor names the input edge that
+    threads it in — the edge `_borrowed_sources` found it on, by its
+    position in the node's inputs.
+
+    A tensor the leaf reads through a split at load is named by the piece
+    it streams, not by the stored tensor: that piece's dtype (the load
+    split's, BF16 for absorbed MLA's W_UK out of an FP8 `kv_b_proj`) and
+    its shape — the stored tensor's rank-local shape with its leading
+    (output-row) axis cut to the reader's share, which is the rows of the
+    stored layout the piece is. Its elements times its dtype are then the
+    bytes the row bills (`traffic._weight_traffic`: share × the rank's
+    elements, at the held format), so the name, the dtype and the bytes on
+    the row describe one tensor. The row's `shape_weight` is the same piece
+    in the layout the kernel declares (`[n_heads, out, in]`)."""
+    own, borrowed = sources.own, sources.borrowed
     arrives = {ref.src.uid: index
                for index, ref in enumerate(node.inputs_obj or ())
                if ref.src is not None and is_identity_source(ref.src.op)}
@@ -774,14 +787,30 @@ def streamed_weights(node: Any, own: Mapping[int, Any],
     for source in (*own, *(b for b in borrowed if b not in own)):
         for segments in held.get(source, {}).values():
             widest = traffic_mod.widest_format(
-                tuple(row.rep for row in segments if row.rep is not None))
+                tuple(sources.as_held(source, row.rep) for row in segments
+                      if row.rep is not None))
             tensor = segments[0].tensor
+            shape = tuple(tensor.shape)
+            if source in sources.split:
+                shape = (_piece_rows(tensor, own[source]), *shape[1:])
             out.append(StreamedWeight(
                 name=tensor.logical_name,
-                shape=tuple(tensor.shape),
+                shape=shape,
                 dtype=widest.logical_dtype if widest is not None else None,
                 input=None if source in own else arrives.get(source)))
     return tuple(out)
+
+
+def _piece_rows(tensor: Any, share: Any) -> Any:
+    """The rows of `tensor`'s leading axis a piece covering `share` of it
+    is; refused where they are not whole rows, because then the piece is
+    not a cut of that axis and no shape here describes it."""
+    rows = Fraction(str(value_of(tensor.shape[0]))) * Fraction(share)
+    if rows.denominator != 1:
+        raise ValueError(
+            f"{tensor.logical_name}: a piece of {share} of its "
+            f"{value_of(tensor.shape[0])} rows is not whole rows")
+    return int(rows)
 
 
 class ReadTerm(NamedTuple):

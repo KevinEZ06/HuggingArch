@@ -407,6 +407,14 @@ class TestPerOpTimingShape(unittest.TestCase):
             # priced over (`comm_cost.CollectiveRung`), so another card
             # reads the same ladder.
             "comm_rungs",
+            # A route exchange's fan-out (`RouteFanout`: picks, targets,
+            # placed) that `ring_factor` prices it by; None on every other
+            # collective and every compute row.
+            "comm_route_fanout",
+            # Each tensor's dtype beside its shape: one per `shape_in` input,
+            # one per `shape_outs` port, and the streamed weights no input
+            # names (`LeafAccess.weights`).
+            "input_dtypes", "port_dtypes", "weights",
         }
         from fastapi.encoders import jsonable_encoder
         from backend.inference.module_rows import served

@@ -290,31 +290,47 @@ class TestPhaseAlsoChangesTheGraph(unittest.TestCase):
                         self.assertEqual(walk.checkpoint_param_bytes(),
                                          authored.checkpoint_param_bytes())
 
-    def test_the_two_halves_read_the_stored_tensor_once(self):
-        """Each per-head GEMM at `kv_b_proj` is billed its share of the
-        stored tensor — data and FP8 block scales, tiled once over the
-        whole — so the two together read it exactly once."""
+    def test_the_two_halves_read_the_pieces_split_out_at_load(self):
+        """Each per-head GEMM at `kv_b_proj` streams the piece the framework
+        splits out of it at load — W_UK / W_UV, dequantised to the model's
+        dtype (vLLM `split_kv_b_proj`, sglang `block_quant_dequant`) — not
+        its share of the stored FP8 tensor: no block scales, two bytes an
+        element. The bytes are worked out here from the checkpoint's own
+        config, not from the walk's tensors; the stored tensor itself stays
+        the file's FP8 (`tensors()`), which is what the walk holds.
+
+        GLM-5.3 first: its `qk_nope_head_dim` (192) is not its `v_head_dim`
+        (256), so the two halves read different bytes, which a law that
+        halved the stored tensor would get wrong."""
+        import json
         from backend.arch.eval import traffic
-        for model in ("deepseek-ai__DeepSeek-V3", "zai-org__GLM-5.3"):
+        for model in ("zai-org__GLM-5.3", "deepseek-ai__DeepSeek-V3"):
             with self.subTest(model=model):
+                config = json.loads(
+                    (SNAPSHOTS / f"{model}.json").read_text())["config"]
+                heads = config["num_attention_heads"]
+                latent = config["kv_lora_rank"]
+                want = {
+                    "q_absorbed_nope":
+                        heads * config["qk_nope_head_dim"] * latent * 2,
+                    "v_absorbed": heads * latent * config["v_head_dim"] * 2,
+                }
                 an = shared_walk(Deployment(_program(model)).at(
                     batch=1, input_tokens=8).during(DECODE))
                 reads = traffic.derive(an).values
-                read = {}
+                seen = 0
                 for node in an.program.nodes():
-                    if node.tied_to == "kv_b_proj":
-                        got = read.setdefault(node.tied_to_uid, [0, 0])
-                        got[0] += reads[node.uid].weight_reads
-                        got[1] += reads[node.uid].metadata_reads
-                self.assertTrue(read)
-                for uid, (weight, metadata) in read.items():
-                    (row,) = an.tensors_of(uid)
-                    rep = row.rep.resident
-                    self.assertEqual(
-                        float(weight),
-                        float(rep.weight_bytes_for(row.tensor.elements)))
-                    self.assertEqual(float(metadata),
-                                     float(rep.metadata_bytes))
+                    if node.tied_to != "kv_b_proj":
+                        continue
+                    seen += 1
+                    self.assertEqual(int(value_of(
+                        reads[node.uid].weight_reads)), want[node.name])
+                    self.assertEqual(int(value_of(
+                        reads[node.uid].metadata_reads)), 0)
+                    (row,) = an.tensors_of(node.tied_to_uid)
+                    self.assertEqual(row.rep.resident.storage_dtype,
+                                     "F8_E4M3")
+                self.assertTrue(seen)
 
     def test_an_address_with_no_stored_parameter_is_refused(self):
         """Weight holders sharing a `module:` address are one stored tensor;
@@ -331,6 +347,24 @@ class TestPhaseAlsoChangesTheGraph(unittest.TestCase):
             "deepseek-ai__DeepSeek-V3", loader))
         with self.assertRaisesRegex(ValueError, "store at module 'kv_b_proj'"):
             Phase(DECODE).substitute(prog).nodes()
+
+    def test_a_shared_address_whose_readers_leave_part_unread_is_refused(self):
+        """A shared `module:` address declares a split at load, so its
+        readers' pieces partition the stored tensor. Moving `v_absorbed` to
+        an address of its own leaves `q_absorbed_nope` covering half of
+        `kv_b_proj`: not a split, refused before a walk prices it."""
+        from backend.arch.loader import SpecLoader
+        from backend.arch.eval.program import Program
+        from tests.snapshots import resolve_snapshot
+        # Its own loader, and NOT the shared layer (a component is edited).
+        loader = SpecLoader()
+        graph = loader.library_component("mla_attention_absorbed").graph
+        graph["v_absorbed"] = graph["v_absorbed"].model_copy(
+            update={"module": "v_absorbed"})
+        prog = Program.of(resolve_snapshot(
+            "deepseek-ai__DeepSeek-V3", loader))
+        with self.assertRaisesRegex(ValueError, "partition the stored"):
+            _ = Phase(DECODE).substitute(prog).read_aliases
 
     def test_a_drafts_decode_form_is_the_draft_the_spec_opted_into(self):
         """GLM-5.3-Flash's NoPE MLA is a draft, so its absorbed form is one

@@ -124,7 +124,10 @@ def test_each_combine_reads_the_history_of_its_layer(program, analysis,
     assert int(value_of(history[2])) == mlp
 
 
-def test_a_restarted_layer_hands_on_the_mlp_output(config, program):
+def test_a_restarted_layer_hands_on_attention_plus_mlp(config, program):
+    # The restart leaves prefix_sum = attn, so the post-MLP add runs and the
+    # layer returns attn + mlp (modeling_kimi_linear.py 995-998, 1023-1026,
+    # 1041-1044; vLLM kimi_k3/nvidia/model.py `_post_attn_norm` agrees).
     kinds, n, k = _layer_kinds(config)
     starts = [layer for layer, kind in kinds.items()
               if kind in ("block_kda_dense_first", "block_kda_moe_start")]
@@ -133,9 +136,10 @@ def test_a_restarted_layer_hands_on_the_mlp_output(config, program):
         block = _group(program, layer)
         (out,) = block.output_roots()
         ffn = "mlp" if layer == 0 else "block_sparse_moe"
-        assert out.name == ffn
-        assert not [x for x in block.nodes() if x.op == "add"
-                    and x.parent is None]
+        assert out.op == "add"
+        assert [ref.src.name for ref in out.inputs_obj] == ["self_attn", ffn]
+        assert [x for x in block.nodes() if x.op == "add"
+                and x.parent is None] == [out]
         # The MLP combine reads the history with this layer's entry in it.
         combine = _node(block, "mlp_res")
         grown = combine.inputs_obj[1].src

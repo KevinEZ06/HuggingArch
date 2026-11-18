@@ -1,0 +1,81 @@
+# DSA query preparation on indexer layers (DeepSeek-V3.2 / GLM-5.x): the
+# main MLA query's rope channels and the lightning indexer's query, rotated
+# — the indexer's on its LEADING d_qk_rope channels — and the indexer query
+# quantised to FP8, in one launch.
+#
+# Naive subgraph (mla_dsa_attention and its absorbed form):
+#
+#   q_pe    = rope(q_pe)                                  # main query tail
+#   index_q = concat(rope(slice(index_q)), slice(index_q))  # rope first
+#   index_q = quantise_activation(index_q)                # the graft's cast
+#
+# vLLM (audited at v0.32.0): `fused_q`
+# (vllm/models/deepseek_v32/common/kernels.py:953, one `_fused_q_kernel`
+# launch :1063 over (tokens, 3, heads) programs, kernel :732; the CuTe-DSL
+# form :1039 is the same boundary), called by
+# `DeepseekV32Attention.forward` (models/deepseek_v32/attention.py:433) on
+# every layer in prefill and decode alike; the ROCm path calls it too
+# (models/deepseek_v32/amd/rocm.py:268). Program 0 rotates the main q_pe
+# (written to its own buffer on the BF16-query path, :823, :1032); program 1, on
+# layers with an indexer (`has_indexer`, attention.py:339), loads each
+# indexer head, rotates its leading channels — interleaved or NeoX by
+# `INDEX_ROPE_INTERLEAVE` (:885, :902-911), so both DeepSeek-V3.2 and GLM-5.x —
+# and quantises it to FP8 E4M3 with one power-of-two scale per head
+# (`_fp8_ue8m0_quantize` :62, called :930). No Hadamard. The same program
+# folds that scale, the softmax scale and n_heads^-0.5 into the head
+# weights (:944-950, `index_weights_out`); this spec
+# carries the head-weight scaling inside `indexer_logits`, so the pattern
+# has no node for it, as in sglang's `fused_indexer_q_rope_first_quant`.
+#
+# The launch is sglang's indexer-query launch plus the main q_pe rotation,
+# so it is a plan of its own: one fused node is one launch, and binding the
+# smaller plan would bill the main rotation as a second launch vLLM does
+# not make. Layers whose indexer is shared (`skip_topk`) run the same
+# kernel with program 1 skipped — the main rotation alone, which is the
+# bare `rope` node and needs no plan.
+#
+# What this does NOT model: with a quantised MLA cache and a sparse backend
+# that takes a quantised query (`_fp8_query`, attention.py:238-239) program
+# 2 (:792) also quantises ql_nope and packs [ql_nope; q_pe] into one FP8 query
+# (`quantize_mqa`, :446). Here that concat is the MLA query's
+# (`q_concat`), claimed by `mla_q_concat_kv_insert`; which sparse backend
+# and query format serve is a deployment choice no `when:` key states, so
+# the BF16-query path is what is billed.
+#
+# `quant` is optional, as in the sibling plans: the cast stands on the
+# indexer query only where the index key is stored quantised
+# (`cache_families.yaml` `index_key.paired_operand`); an index key kept
+# BF16 grafts none, and the launch then writes the query at the edge's
+# dtype.
+#
+# `q_rope` declares `feeds: q`: it binds only a rotation whose output
+# becomes the attention score's query (`dsa_attention_score`'s `q`), so it
+# is the main query's tail whatever op the key side's rotation is spelled
+# with — the indexer query, which becomes no attention operand, and the
+# rope key, which becomes `k`, are refused by the role, not by the op. The
+# indexer slots are fixed by their slice → rope → concat chain; the concat
+# order (rope first) keeps them off Hy4's tail-rope indexer (nope first).
+
+fused_op: fused_dsa_q_rope_quant
+
+naive_pattern:
+  nodes:
+    q_rope:               { op: rope,   inputs: [external.q_pe], feeds: q }
+    index_q_rope_slice:   { op: slice,  inputs: [external.index_q] }
+    index_q_norope_slice: { op: slice,  inputs: [external.index_q] }
+    index_q_rope:         { op: rope,   inputs: [index_q_rope_slice.out] }
+    index_q_concat:       { op: concat, inputs: [index_q_rope.out, index_q_norope_slice.out] }
+    quant: { op: quantise_activation, inputs: [index_q_concat.out], optional: true }
+  io_mapping:
+    q_pe:     external.q_pe
+    index_q:  external.index_q
+    output:   quant.out
+    q_pe_out: q_rope.out
+
+# Output contract: the indexer query is written as a new FP8 buffer and the
+# rotated q_pe into a buffer of its own (`index_q_fp8`, `q_pe_out`,
+# kernels.py:1032, :1036), so every channel crosses this launch on both sides.
+# Absent the declaration the absorbed slice/concat pair would be read as a
+# re-partition nobody moved (`fusion._passed_through`) and the indexer query
+# billed for its rope channels alone.
+allocates_output: "vllm.models.deepseek_v32.common.kernels.fused_q (kernels.py:953), from DeepseekV32Attention.forward (models/deepseek_v32/attention.py:433): index_q_fp8 = torch.empty_like(index_q, dtype=fp8) and, on the BF16-query path, q_pe_out = torch.empty_like(q_pe) (kernels.py:1032, :1036)"

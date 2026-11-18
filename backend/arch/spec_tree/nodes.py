@@ -730,6 +730,16 @@ class SpecIRNode:
     #: still ships this node's own tensor, which serving skips. Set only
     #: beside `tied_to`: an inactive tie owns its weight outright.
     checkpoint_copy_src: Optional[str] = None
+    #: Whether the tie is a split at load: this node runs a piece of the
+    #: stored tensor at its `module:` that the serving framework splits out
+    #: into a weight of its own when it loads the checkpoint, not the stored
+    #: tensor itself (absorbed MLA's W_UK / W_UV out of `kv_b_proj`, vLLM
+    #: `split_kv_b_proj`, sglang `w_kc` / `w_vc`). Set by the one tie that
+    #: means it — weight holders sharing a `module:` with the parameter
+    #: stored there (`build._tie_shared_modules`); a tied LM head streams
+    #: the table it is tied to as stored. What the split piece is held at is
+    #: the deployment's answer (`ResolvedPrecision.load_split_format`).
+    split_at_load: bool = False
 
     @property
     def processor_step(self) -> Optional[str]:

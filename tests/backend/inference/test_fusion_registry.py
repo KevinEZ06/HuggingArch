@@ -66,6 +66,7 @@ class TestShippedSchemesLoad(unittest.TestCase):
                 "fused_compress_norm_rope_store",
                 "fused_compress_pool_state",
                 "fused_compress_rope_store",
+                "fused_dsa_q_rope_quant",
                 "fused_dsa_qkv_norm_rope",
                 "fused_dsa_qkv_norm_rope_indexer",
                 "fused_eh_norm",
@@ -102,6 +103,7 @@ class TestShippedSchemesLoad(unittest.TestCase):
                 "fused_recurrent_gated_delta_rule",
                 "fused_recurrent_kda",
                 "fused_recurrent_kda_per_channel",
+                "fused_rmsnorm_quant",
                 "fused_save_compress_norm",
                 "fused_save_compress_norm_decode",
                 "gated_act_ffn",
@@ -302,6 +304,8 @@ class TestShippedBindingsLoad(unittest.TestCase):
                 "merged_column_parallel_linear",
                 "qkv_parallel_linear",
                 "fused_add_rmsnorm",
+                # A bare norm writing its quantised GEMM's input.
+                "fused_rmsnorm_quant",
                 "allreduce_fused_rmsnorm",
                 "fused_qk_rope",
                 # The same rotary launch handed whole heads: partial RoPE in
@@ -364,6 +368,9 @@ class TestShippedBindingsLoad(unittest.TestCase):
                 # the indexer key in one launch.
                 "fused_dsa_qkv_norm_rope",
                 "fused_dsa_qkv_norm_rope_indexer",
+                # ... and the main q_pe rope with the indexer query's rope +
+                # FP8 quant (`fused_q`).
+                "fused_dsa_q_rope_quant",
                 # The MTP entry: enorm + hnorm + concat.
                 "fused_eh_norm",
                 # GLM-5.3-Flash's k-pool indexer compressor, and its query
@@ -579,11 +586,13 @@ class TestShippedBindingsLoad(unittest.TestCase):
                 DispatchCondition.parse(bad, "t")
 
     def test_a_quantising_launch_is_its_plain_pattern_plus_the_cast(self):
-        """The q-quantising a-norm plan is the plain one's pattern plus the
-        `quantise_activation` cast as a required member, so it is the larger
-        pattern and is tried first: its `when:` decides, and without a cast
-        on q the plain plan matches. Two bound plans over one pattern are
-        refused at load — which one matched would be yaml order."""
+        """The q-quantising a-norm plan is the plain one's pattern with the
+        `quantise_activation` cast a REQUIRED member where the plain one's is
+        optional, so it is the larger pattern and is tried first: its
+        `when:` decides, and where it does not hold the plain plan matches
+        (taking the cast, if one stands on q, as its optional member). Two
+        bound plans over one pattern are refused at load — which one matched
+        would be yaml order."""
         from backend.inference.framework_bindings import _reject_shared_patterns
         order = [op for op, _impl in get_binding("vllm").op_implementations
                  if op.startswith("fused_q_kv_rmsnorm")]
@@ -591,7 +600,15 @@ class TestShippedBindingsLoad(unittest.TestCase):
                                  "fused_q_kv_rmsnorm"])
         quant = FUSION_SCHEMES["fused_q_kv_rmsnorm_quant"].naive_pattern
         plain = FUSION_SCHEMES["fused_q_kv_rmsnorm"].naive_pattern
-        self.assertEqual(quant.ops() - plain.ops(), {"quantise_activation"})
+        self.assertEqual(quant.ops(), plain.ops())
+
+        def optional(pattern):
+            return {name: node.optional
+                    for name, node in pattern.expanded_nodes().items()}
+        self.assertEqual(optional(quant), {
+            "q_norm": False, "kv_norm": False, "quant": False})
+        self.assertEqual(optional(plain), {
+            "q_norm": False, "kv_norm": False, "quant": True})
         _reject_shared_patterns("x", ["fused_q_kv_rmsnorm",
                                       "fused_q_kv_rmsnorm_quant",
                                       "silu_and_mul"])

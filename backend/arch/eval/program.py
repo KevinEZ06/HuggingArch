@@ -50,8 +50,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from typing import (
-    Any, ClassVar, Dict, FrozenSet, Iterator, List, Mapping, Optional, Sequence,
-    Tuple, Union,
+    Any, ClassVar, Dict, FrozenSet, Iterator, List, Mapping, NamedTuple,
+    Optional, Sequence, Tuple, Union,
 )
 
 from ..ops import (DISPATCH_OP, OpSpec, ProcessorStep, is_dispatch_boundary,
@@ -1011,6 +1011,15 @@ class LookupSite:
     table: int
 
 
+class TiedRead(NamedTuple):
+    """One tie of `Program.read_aliases`: the share of the stored tensor the
+    reader's declared weight is, and whether the tie is a split at load
+    (`SpecIRNode.split_at_load`) — the reader streams a piece the framework
+    builds when it loads the checkpoint, not the stored tensor."""
+    share: Fraction
+    split: bool
+
+
 @dataclass(frozen=True)
 class Program:
     """Spec + walked graph. Immutable, shareable, and cheap to hold:
@@ -1161,22 +1170,31 @@ class Program:
             node.uid for node in self.nodes() if node.host_offload is not None)
 
     @memo_property
-    def read_aliases(self) -> Dict[int, Dict[int, Fraction]]:
+    def read_aliases(self) -> Dict[int, Dict[int, "TiedRead"]]:
         """Node uid → the uids whose STORED tensors it reads, when they are
-        not its own, each with the share its declared weight is of the one
-        stored (1 for a tied LM head; half of `kv_b_proj` for each absorbed
-        MLA GEMM at that `module:`). A tied LM head executes a full vocab
-        projection every step, but the tensor it streams is the embedding's
-        — one stored copy, two readers. Storage stays single (the
-        checkpoint's own account); the READ side bills whoever moves the
-        bytes.
+        not its own, each as a `TiedRead`: the share its declared weight is
+        of the one stored (1 for a tied LM head; W_UK's share of `kv_b_proj`
+        for absorbed MLA's `q_absorbed_nope`), and whether the tie is a
+        split at load (`SpecIRNode.split_at_load`). A tied LM head executes
+        a full vocab projection every step, but the tensor it streams is the
+        embedding's — one stored copy, two readers. Storage stays single
+        (the checkpoint's own account); the READ side bills whoever moves
+        the bytes.
 
         The fact is the tie resolved at build (`SpecIRNode.tied_to_uid`).
         Iterated, a value is the uids, in the shape `Rewrite.origins` gives
         a fused node — "my weights are those nodes'" — so traffic consults
         both through one lookup.
+
+        The pieces a stored tensor is split into at load partition it: their
+        shares sum to one. A shared `module:` address whose readers do not
+        (two GEMMs each running the whole tensor, which is a `tied_weight:`,
+        or pieces that leave part of it unread) is refused here, before any
+        walk prices it, because a split is the only thing that address
+        means (`spec_tree.build._tie_shared_modules`).
         """
-        aliases: Dict[int, Dict[int, Fraction]] = {}
+        aliases: Dict[int, Dict[int, TiedRead]] = {}
+        pieces: Dict[int, Fraction] = {}
         for node in self.nodes():
             if node.tied_to is None:
                 continue
@@ -1188,7 +1206,22 @@ class Program:
             mine, held = (
                 math.prod(ir_to_leaf(n, "", self.spec.custom_ops or {}).shape)
                 for n in (node, self.by_uid(node.tied_to_uid)))
-            aliases[node.uid] = {node.tied_to_uid: Fraction(mine, held)}
+            share = Fraction(mine, held)
+            aliases[node.uid] = {node.tied_to_uid: TiedRead(
+                share, node.split_at_load)}
+            if node.split_at_load:
+                pieces[node.tied_to_uid] = (
+                    pieces.get(node.tied_to_uid, Fraction(0)) + share)
+        for holder, total in pieces.items():
+            if total != 1:
+                stored = self.by_uid(holder)
+                raise ValueError(
+                    f"{self.spec.name}: the weights stored at module "
+                    f"{stored.module_name!r} ({stored.display_path}) are split "
+                    f"at load into pieces covering {total} of it. A shared "
+                    f"`module:` address declares that split, so its readers' "
+                    f"declared weights must partition the stored tensor; a "
+                    f"reader that runs the whole tensor is a `tied_weight:`.")
         return aliases
 
     @memo_property
