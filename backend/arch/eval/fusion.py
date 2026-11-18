@@ -52,6 +52,7 @@ from typing import (
 
 import sympy as sp
 
+from .fusion_order import refuse_tied_preemption
 from ..activation_formats import ACTIVATION_FORMATS
 from .analysis import OwnCopies
 from .cache import (Edges, cached_node_uids, is_view, main_port,
@@ -1502,7 +1503,9 @@ class Framework:
                 local_shapes: Any = None,
                 graft: Any = None) -> Tuple[Any, Rewrite]:
         rewrite = Rewrite()
-        for fusion in self.fusions:
+        for index, fusion in enumerate(self.fusions):
+            refuse_tied_preemption(self.name, self.fusions, index, program,
+                                   analysis, local_shapes, graft)
             program, step = fusion.rewrite(program, analysis, local_shapes,
                                            graft)
             rewrite = rewrite.then(step)

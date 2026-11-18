@@ -7,8 +7,7 @@ per-rank cost reads it, so it sits in eval's core rather than in the
 composition root's import path)."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from fractions import Fraction
+from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from .dim import (as_extent, as_number, bound_or_folded, expr_of, floored,
@@ -31,6 +30,18 @@ def _int(value: Any) -> int:
     missing number: an op that declares no parameters HAS none.
     """
     return 0 if value_of(value) is None else as_extent(value, rounding="floor")
+
+
+class WeightPacks(NamedTuple):
+    """The stored-tensor nodes whose matrices a leaf's kernel multiplies,
+    grouped by the weight they are packed into (`groups`), beside how the
+    leaf holds each (`streamed`, the `traffic.Streamed` they were read off)
+    — so `Analysis.weight_shards` describes a piece split out at load as
+    the piece (`Streamed.as_held`, `Streamed.piece_rows`), not as the stored
+    tensor it came from. Empty for a leaf that multiplies no matrix."""
+
+    groups: Tuple[Tuple[int, ...], ...] = ()
+    streamed: Optional["traffic_mod.Streamed"] = None
 
 
 @dataclass
@@ -77,7 +88,7 @@ class LeafAccess:
     #: The stored-tensor nodes whose matrices the leaf's kernel multiplies,
     #: grouped by the weight they are packed into (`weight_packs`) — what
     #: `Analysis.weight_shards` describes partition by partition.
-    weight_packs: Tuple[Tuple[int, ...], ...] = ()
+    weight_packs: WeightPacks = field(default_factory=WeightPacks)
     #: Every stored tensor the leaf's kernel streams, one rank's shape of it
     #: and its resident dtype, and the input it arrives on where a dataflow
     #: edge threads it in (`StreamedWeight`): the weight operands, which the
@@ -421,7 +432,7 @@ class _TrafficRow(NamedTuple):
     #: Elements behind `weight`: own plus borrowed.
     weight_elems: Any = 0
     #: `LeafAccess.weight_packs`.
-    weight_packs: Tuple[Tuple[int, ...], ...] = ()
+    weight_packs: WeightPacks = WeightPacks()
     #: The dtype whose peak column the leaf's matmul runs at
     #: (`ResolvedPrecision.compute_dtype`).
     act_dtype: Optional[str] = None
@@ -612,10 +623,10 @@ def _members(node: Any) -> Tuple[int, ...]:
     return node.origins if isinstance(node, FusedNode) else (node.uid,)
 
 
-def weight_packs(program: Any, node: Any, own: Any, borrowed: Any
-                 ) -> Tuple[Tuple[int, ...], ...]:
+def weight_packs(program: Any, node: Any,
+                 sources: "traffic_mod.Streamed") -> WeightPacks:
     """The stored-tensor nodes whose matrices a leaf's kernel multiplies,
-    grouped by the weight they are packed into.
+    grouped by the weight they are packed into (`WeightPacks`).
 
     Asked of the nodes it streams (`traffic.streamed_sources`, the answer its
     bytes are billed from) and of the walked leaves it stands for: a member
@@ -631,12 +642,13 @@ def weight_packs(program: Any, node: Any, own: Any, borrowed: Any
     gemm = tuple(member for member in members
                  if declaration_is_gemm(program.by_uid(member).declaration))
     if not gemm:
-        return ()
+        return WeightPacks()
     merged = isinstance(node, FusedNode) and node.merges_siblings
     packs = ((gemm,) if merged else tuple((member,) for member in gemm))
     others = tuple(dict.fromkeys(
-        source for source in (*own, *borrowed) if source not in members))
-    return packs + tuple((source,) for source in others)
+        source for source in (*sources.own, *sources.borrowed)
+        if source not in members))
+    return WeightPacks(packs + tuple((source,) for source in others), sources)
 
 
 def _leaf_traffic_rows(analysis: Any, *,
@@ -733,8 +745,7 @@ def _leaf_traffic_rows(analysis: Any, *,
             out_terms=tuple(t.out_terms),
             **dict(zip(("routed_inputs", "routed_output", "routed_extent"),
                        _routed_terms(graph, node, t), strict=True)),
-            weight_packs=weight_packs(graph, node, sources.own,
-                                      sources.borrowed),
+            weight_packs=weight_packs(graph, node, sources),
             weights=streamed_weights(node, sources, held),
         )
     return out
@@ -791,26 +802,13 @@ def streamed_weights(node: Any, sources: "traffic_mod.Streamed",
                       if row.rep is not None))
             tensor = segments[0].tensor
             shape = tuple(tensor.shape)
-            if source in sources.split:
-                shape = (_piece_rows(tensor, own[source]), *shape[1:])
+            shape = (sources.piece_rows(source, shape[0]), *shape[1:])
             out.append(StreamedWeight(
                 name=tensor.logical_name,
                 shape=shape,
                 dtype=widest.logical_dtype if widest is not None else None,
                 input=None if source in own else arrives.get(source)))
     return tuple(out)
-
-
-def _piece_rows(tensor: Any, share: Any) -> Any:
-    """The rows of `tensor`'s leading axis a piece covering `share` of it
-    is; refused where they are not whole rows, because then the piece is
-    not a cut of that axis and no shape here describes it."""
-    rows = Fraction(str(value_of(tensor.shape[0]))) * Fraction(share)
-    if rows.denominator != 1:
-        raise ValueError(
-            f"{tensor.logical_name}: a piece of {share} of its "
-            f"{value_of(tensor.shape[0])} rows is not whole rows")
-    return int(rows)
 
 
 class ReadTerm(NamedTuple):

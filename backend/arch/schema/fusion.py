@@ -455,6 +455,50 @@ class NaivePattern(BaseModel):
         """True when this pattern uses the variable-arity sibling form."""
         return self.parallel is not None
 
+    def specificity(self) -> Tuple[int, int]:
+        """`(required nodes, all nodes)` — how much of a graph a match of
+        this pattern takes, the key plans are tried in, largest first
+        (`framework_bindings.match_order`). An `optional` node is not
+        required; a parallel-form pattern (N anonymous siblings, the most
+        generic shape) is `(0, 0)`."""
+        nodes = self.expanded_nodes().values()
+        return (sum(1 for node in nodes if not node.optional), len(nodes))
+
+    def may_take_same_nodes(self, other: "NaivePattern") -> bool:
+        """Whether a match of this pattern and one of `other` could be the
+        same node set: equal `specificity`, and each node of one paired
+        with a node of the other whose ops they both accept (a parallel
+        form: the siblings' ops). Edges and constraints are not asked, so
+        True is a candidate, not a proof — the graph decides
+        (`eval.fusion_order`); False is a proof that order between the two
+        cannot decide a node set."""
+        if self.specificity() != other.specificity():
+            return False
+        mine, theirs = self._node_ops(), other._node_ops()
+        if len(mine) != len(theirs):
+            return False
+        paired: Dict[int, int] = {}
+
+        def place(i: int, seen: set) -> bool:
+            for j, ops in enumerate(theirs):
+                if j in seen or not mine[i] & ops:
+                    continue
+                seen.add(j)
+                if j not in paired or place(paired[j], seen):
+                    paired[j] = i
+                    return True
+            return False
+
+        return all(place(i, set()) for i in range(len(mine)))
+
+    def _node_ops(self) -> List[FrozenSet[str]]:
+        """The ops each node accepts (`op`, or its `op_choices`); a parallel
+        form's one sibling shape."""
+        forms = ((self.parallel,) if self.parallel is not None
+                 else tuple(self.expanded_nodes().values()))
+        return [frozenset([form.op] if form.op else form.op_choices or ())
+                for form in forms]
+
     def ops(self) -> FrozenSet[str]:
         """Every op a node of this pattern may match: each node's `op`, or
         each of its `op_choices`."""

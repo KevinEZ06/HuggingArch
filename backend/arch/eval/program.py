@@ -1191,7 +1191,17 @@ class Program:
         (two GEMMs each running the whole tensor, which is a `tied_weight:`,
         or pieces that leave part of it unread) is refused here, before any
         walk prices it, because a split is the only thing that address
-        means (`spec_tree.build._tie_shared_modules`).
+        means. That there are at least two pieces is structural and refused
+        earlier, where the tree ties the address
+        (`spec_tree.build._tie_shared_modules`); the sum needs each
+        reader's resolved declared weight, which is read here.
+
+        A piece's share is a count of the stored tensor's rows, not a
+        contiguous slice of them: `kv_b_proj` stores each head's W_UK rows
+        and W_UV rows interleaved (`[n_heads × (qk_nope + v), kv_lora]`), so
+        W_UK is `qk_nope / (qk_nope + v)` of every head's rows. A piece's
+        shape is that row count (`traffic.Streamed.piece_rows`), and a cut
+        of whole heads keeps the share on every rank.
         """
         aliases: Dict[int, Dict[int, TiedRead]] = {}
         pieces: Dict[int, Fraction] = {}

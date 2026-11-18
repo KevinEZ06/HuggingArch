@@ -348,11 +348,11 @@ class TestPhaseAlsoChangesTheGraph(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "store at module 'kv_b_proj'"):
             Phase(DECODE).substitute(prog).nodes()
 
-    def test_a_shared_address_whose_readers_leave_part_unread_is_refused(self):
-        """A shared `module:` address declares a split at load, so its
-        readers' pieces partition the stored tensor. Moving `v_absorbed` to
-        an address of its own leaves `q_absorbed_nope` covering half of
-        `kv_b_proj`: not a split, refused before a walk prices it."""
+    def test_a_shared_address_with_one_reader_is_refused_at_build(self):
+        """A shared `module:` address declares a split at load, and one
+        reader splits nothing. Moving `v_absorbed` to an address of its own
+        leaves `q_absorbed_nope` the only reader at `kv_b_proj`: refused
+        where the tree ties the address, before any `Program` reads it."""
         from backend.arch.loader import SpecLoader
         from backend.arch.eval.program import Program
         from tests.snapshots import resolve_snapshot
@@ -361,6 +361,23 @@ class TestPhaseAlsoChangesTheGraph(unittest.TestCase):
         graph = loader.library_component("mla_attention_absorbed").graph
         graph["v_absorbed"] = graph["v_absorbed"].model_copy(
             update={"module": "v_absorbed"})
+        prog = Program.of(resolve_snapshot(
+            "deepseek-ai__DeepSeek-V3", loader))
+        with self.assertRaisesRegex(ValueError, "one reader splits nothing"):
+            Phase(DECODE).substitute(prog)
+
+    def test_a_shared_address_whose_pieces_overlap_is_refused(self):
+        """Two or more readers, but pieces that do not partition the stored
+        tensor: a second `v_absorbed` at `kv_b_proj` makes the pieces cover
+        more than all of it. Refused by the first reader of the tie
+        (`Program.read_aliases`), before a walk prices it."""
+        from backend.arch.loader import SpecLoader
+        from backend.arch.eval.program import Program
+        from tests.snapshots import resolve_snapshot
+        # Its own loader, and NOT the shared layer (a component is edited).
+        loader = SpecLoader()
+        graph = loader.library_component("mla_attention_absorbed").graph
+        graph["v_absorbed_again"] = graph["v_absorbed"].model_copy()
         prog = Program.of(resolve_snapshot(
             "deepseek-ai__DeepSeek-V3", loader))
         with self.assertRaisesRegex(ValueError, "partition the stored"):

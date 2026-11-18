@@ -129,18 +129,21 @@ def match_order(op_name: str) -> Tuple[int, int, str]:
          + cast chain is the add's launch and the bare-norm plan sees only
          the norms no add precedes.
       3. The plan's name: an order that is the same in every process and
-         every caller, not a file's or a set's.
+         every caller, not a file's or a set's. It decides nothing: two
+         plans equal on 1 and 2 that would both match one node set are
+         refused where they are applied (`eval.fusion_order`, from
+         `Framework.rewrite`), since which of them took it would be an
+         alphabetical accident.
 
     A parallel-form pattern (N >= 2 anonymous siblings of one op, the most
     generic shape) and an unknown scheme rank as size 0 on both counts.
     """
     scheme = FUSION_SCHEMES.get(op_name)
     pattern = None if scheme is None else scheme.naive_pattern
-    if pattern is None or pattern.is_parallel():
+    if pattern is None:
         return (0, 0, op_name)
-    nodes = pattern.expanded_nodes().values()
-    return (-sum(1 for node in nodes if not node.optional),
-            -len(nodes), op_name)
+    required, total = pattern.specificity()
+    return (-required, -total, op_name)
 
 
 @dataclass(frozen=True)

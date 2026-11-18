@@ -98,3 +98,38 @@ def test_a_split_piece_is_named_as_the_piece_it_streams():
         assert row["weight_read_bytes_per_rank"] == (
             piece[0] * piece[1] * 2 * row["count_per_step"])
         assert not row["metadata_bytes_per_rank"]
+
+
+def test_a_split_pieces_shards_are_the_piece_it_streams():
+    """The scale grid a row publishes (`weight_shards`, what Kernel Bench's
+    block-scale refusal reads) describes the same tensor as its weights
+    column: W_UK, BF16, with no scale grid — not the FP8 `kv_b_proj` it is
+    split out of, whose per-tile blocks and whole rows the shards used to
+    report beside a BF16 weight. Under TP 2, so the per-rank rows are the
+    piece's share of the rank's heads, not of the stored tensor. The piece
+    is worked out here from the checkpoint config, not from the walk."""
+    config = snapshot_config(MLA)
+    tp = 2
+    est = estimate_capacity(
+        config=config, model_id=MLA,
+        resolved=resolve_snapshot(MLA), gpu_sku="H100-SXM",
+        parallel=ParallelConfig(tp_attention=tp), num_gpus=tp,
+        gpu_memory_fraction=0.9,
+        avg_input_tokens=1024, avg_output_tokens=64,
+        prefill_batch_size=2, decode_batch_size=2,
+        selection_mode="theoretical_only", measurement_scope=None,
+        precision={"preset": "w_fp8_kv_fp8"})
+    rows = [r for r in est["per_op_timing_decode"]
+            if r.get("display_path") == "self_attn.q_absorbed_nope"]
+    assert rows
+    heads, nope, lora = (config["num_attention_heads"],
+                         config["qk_nope_head_dim"], config["kv_lora_rank"])
+    for row in rows:
+        (weight,) = row["weights"]
+        (shard,) = row["weight_shards"]
+        assert weight["shape"] == [heads // tp * nope, lora]
+        assert (shard["rows"], shard["width"]) == (heads * nope, lora)
+        assert ([shard["rows_local"], shard["width_local"]]
+                == weight["shape"])
+        assert weight["dtype"] == "BF16"
+        assert shard["granularity"] is None

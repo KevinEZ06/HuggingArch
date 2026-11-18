@@ -1465,10 +1465,13 @@ def _tie_shared_modules(nodes) -> List[SpecIRNode]:
     whose tensor it streams whole and as stored — one tensor, two readers,
     no copy. Here siblings name one checkpoint ADDRESS and split it. The
     two are not interchangeable, and the address form is held to its one
-    meaning: the readers' declared weights must partition the stored
-    tensor (`Program.read_aliases` refuses pieces that do not sum to it),
-    so a GEMM that runs the whole tensor cannot hide behind a shared
-    `module:` — it is a `tied_weight:`."""
+    meaning. Two or more readers, refused here, where the address is read:
+    one reader splits nothing, and a GEMM that runs the whole tensor cannot
+    hide behind a shared `module:` — it is a `tied_weight:`. Their declared
+    weights must also partition the stored tensor; that needs the resolved
+    dims and the ops' weight templates (`projections.ir_to_leaf`, which
+    imports this module), so `Program.read_aliases` — the first reader of a
+    tie, before any walk prices it — refuses pieces that do not sum to it."""
     tied: List[SpecIRNode] = []
     for parent in nodes:
         at: Dict[str, List[SpecIRNode]] = {}
@@ -1485,11 +1488,21 @@ def _tie_shared_modules(nodes) -> List[SpecIRNode]:
                     f"at module {module!r}, one tensor, which {len(held)} "
                     f"stored parameters there declare (one must)")
             (owner,) = held
-            for node in sharing:
-                if node is not owner and node.tied_to_uid is None:
-                    node.tied_to, node.tied_to_uid = owner.name, owner.uid
-                    node.split_at_load = True
-                    tied.append(node)
+            pieces = [node for node in sharing
+                      if node is not owner and node.tied_to_uid is None]
+            if len(pieces) < 2:
+                raise ValueError(
+                    f"{parent.display_path}: {[n.name for n in pieces]} "
+                    f"share module {module!r} with the parameter "
+                    f"{owner.name!r} stored there. A shared `module:` "
+                    f"address declares a split of that tensor at load into "
+                    f"pieces, and one reader splits nothing: a node that "
+                    f"runs the stored tensor (or reads part of it in place) "
+                    f"declares `tied_weight:`.")
+            for node in pieces:
+                node.tied_to, node.tied_to_uid = owner.name, owner.uid
+                node.split_at_load = True
+                tied.append(node)
     return tied
 
 

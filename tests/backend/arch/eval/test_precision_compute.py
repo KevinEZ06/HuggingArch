@@ -21,8 +21,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from backend.arch.activation_formats import ACTIVATION_FORMATS
 from backend.arch.eval.precision import (AS_SHIPPED, PrecisionError,
                                          PrecisionProfile)
+from backend.arch.eval import traffic as traffic_mod
 from backend.arch.eval.traffic import ElementCopy
-from backend.arch.eval.transforms import Deployment
+from backend.arch.eval.transforms import DECODE, Deployment, Phase
 from backend.inference.framework_bindings import FRAMEWORK_BINDINGS
 from backend.inference.framework_bindings import (PrecisionLaunch,
                                                   ServingDeployment,
@@ -63,6 +64,31 @@ def test_a_weight_only_checkpoints_matmul_runs_at_its_edge():
                                   "mlp.experts.gate_up_proj")
     assert precision.required_format(node.role, "", reps) is None
     assert precision.compute_dtype(node.role, "", reps) == "BF16"
+
+
+def test_the_panels_compute_column_asks_the_matmuls_not_the_stored_tensor():
+    """DeepSeek-V3's decode attention runs its projections on FP8 weights
+    and its absorbed per-head GEMMs on the BF16 W_UK / W_UV split out of the
+    FP8 `kv_b_proj` at load. The panel's compute column is asked of each
+    matmul as it holds its weight (`traffic.matmul_operands`): the stored
+    `kv_b_proj` is no matmul, and the per-head GEMMs answer BF16 — so the
+    attention row names both columns its matmuls run at, on both sides
+    (the split is the framework's, whatever the profile)."""
+    program = Phase(DECODE).substitute(
+        shared_program("deepseek-ai__DeepSeek-V3"))
+    analysis = Deployment(program).at(batch=1, input_tokens=16).analyze()
+    precision = analysis.resolved_precision
+    operands = traffic_mod.matmul_operands(
+        analysis.program, analysis.formats.values, precision)
+    by_path = {analysis.program.by_uid(uid).display_path: (uid, reps)
+               for uid, reps in operands.items()}
+    assert "self_attn.kv_b_proj" not in by_path
+    uid, reps = by_path["self_attn.q_absorbed_nope"]
+    node = analysis.program.by_uid(uid)
+    assert precision.compute_dtype(node.role, "", reps) == "BF16"
+    (row,) = [r for r in analysis.precision_effective()["effective"]
+              if (r["category"], r["selector"]) == ("compute", "attention")]
+    assert row["effective"] == row["as_shipped"] == "BF16 + FP8 (E4M3)"
 
 
 def test_a_quantised_activation_does_not_by_itself_assert_a_narrow_mma():

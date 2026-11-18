@@ -556,10 +556,15 @@ class Analysis:
         BF16 row — as opposed to one a precision profile created by holding
         a weight wider than the checkpoint does."""
         return traffic_mod.weight_promotions(
-            self.program,
-            {uid: tuple(reps.as_saved() for reps in entries)
-             for uid, entries in self.formats.values.items()},
-            self.shipped_precision)
+            self.program, self._saved_formats, self.shipped_precision)
+
+    @memo_property
+    def _saved_formats(self) -> Mapping[int, Any]:
+        """`formats` as the checkpoint saved them (`Representations.
+        as_saved`, tensor by tensor) — the formats every as-shipped question
+        is asked of, beside `shipped_precision`."""
+        return {uid: tuple(reps.as_saved() for reps in entries)
+                for uid, entries in self.formats.values.items()}
 
     def precision_effective(self) -> Dict[str, Any]:
         """What this walk's precision profile is and what it changed: per
@@ -675,25 +680,35 @@ class Analysis:
         promotions = self.weight_promotions
         shipped_promotions = self.shipped_weight_promotions
         shipped_precision = self.shipped_precision
-        for uid in self.formats.values:
+        # Asked of each matmul and of what it reads, as it holds it
+        # (`traffic.matmul_operands`): a stored tensor is no matmul, and a
+        # piece split out of one at load runs at the piece's format, not the
+        # holder's — FP8 `kv_b_proj` under BF16 absorbed per-head GEMMs.
+        # Every layer segment of every tensor: what a kernel multiplies by
+        # is a question about formats, so it takes all of them.
+        operands = traffic_mod.matmul_operands(
+            program, self.formats.values, precision)
+        shipped_operands = traffic_mod.matmul_operands(
+            program, self._saved_formats, shipped_precision)
+        # A role enters the panel when one of its matmuls has something to
+        # say on EITHER side (a profile that quantises a promoted weight
+        # takes the promotion away, and that is exactly the change worth
+        # showing), and its row then names every dtype its matmuls compute
+        # in — as the weights row names every format a role holds: DeepSeek-
+        # V3's decode attention runs its projections in FP8 and its absorbed
+        # per-head GEMMs in BF16, and naming only the first hides the second.
+        speaks: set = set()
+        for uid, reps in operands.items():
             node = program.by_uid(uid)
-            if node is None or node.children:
-                continue
-            # Every layer segment of every tensor: what a kernel multiplies
-            # by is a question about formats, so it takes all of them.
-            reps = formats_mod.segments_of(self.formats.values, uid)
-            saved = tuple(rep.as_saved() for rep in reps)
+            saved = shipped_operands[uid]
             promotion = promotions.get(uid)
             shipped_promotion = shipped_promotions.get(uid)
-            # A leaf enters the panel when EITHER side has something to say:
-            # a profile that quantises a promoted weight takes the promotion
-            # away, and that is exactly the change worth showing.
-            if not (promotion is not None or shipped_promotion is not None
-                    or any(rep.resident.activation_format for rep in reps)
-                    or any(rep.resident.activation_format for rep in saved)):
-                continue
             role = precision.role_value(node.role)
             stack = program.stack_of(node)
+            if (promotion is not None or shipped_promotion is not None
+                    or any(rep.resident.activation_format for rep in reps)
+                    or any(rep.resident.activation_format for rep in saved)):
+                speaks.add(role)
             # A wide unquantized weight does not carry an activation format,
             # so a resolution alone would fall back to the edge. Its
             # promotion table is the one answer to what that matmul's operand
@@ -708,7 +723,7 @@ class Analysis:
                          if shipped_promotion is not None else None)))
             if precision.compute_dtype_is_chosen(node.role, stack, reps):
                 chosen_roles.add(role)
-        for role in sorted(compute_by):
+        for role in sorted(speaks):
             actual = " + ".join(display_name(d) for d in sorted(
                 compute_by[role]))
             shipped = " + ".join(display_name(d) for d in sorted(
@@ -1559,20 +1574,27 @@ class Analysis:
     def _axis_segments(self) -> Dict[Any, Any]:
         return self.rule.local_axis_segments(self)
 
-    def weight_shards(self, packs: Sequence[Sequence[int]]
-                      ) -> Tuple[WeightShard, ...]:
+    def weight_shards(self, packs: Any) -> Tuple[WeightShard, ...]:
         """The matrices a kernel multiplies, partition by partition, beside
         one rank's extents of them (`WeightShard`).
 
-        `packs` groups the nodes whose matrices one launch reads: each group
-        a set of nodes whose weights it concatenates into one (a
-        sibling-merging fusion's origins), every other node a group of its
-        own. A matrix is a stored tensor a GEMM contracts — `MATRIX` or
-        `HEADWISE`; vectors, tables and buffers are none, and a format's
-        metadata follows its weight.
+        `packs` (`access.WeightPacks`) groups the nodes whose matrices one
+        launch reads: each group a set of nodes whose weights it
+        concatenates into one (a sibling-merging fusion's origins), every
+        other node a group of its own. A matrix is a stored tensor a GEMM
+        contracts — `MATRIX` or `HEADWISE`; vectors, tables and buffers are
+        none, and a format's metadata follows its weight.
+
+        Each is described as the launch holds it (`packs.streamed`): a piece
+        split out of a stored tensor at load (absorbed MLA's W_UK out of
+        `kv_b_proj`) is its own rows of that tensor (`Streamed.piece_rows`)
+        at its own format (`Streamed.as_held`) — a BF16 piece has no scale
+        grid, whatever the stored tensor's. The row's weights column, its
+        weight dtype and its weight bytes read the same two answers.
         """
         out = []
-        for group, members in enumerate(packs):
+        streamed = packs.streamed
+        for group, members in enumerate(packs.groups):
             for uid in members:
                 for row in self.tensors_of(uid):
                     if row.tensor.kind not in (storage_mod.StorageKind.MATRIX,
@@ -1591,15 +1613,18 @@ class Analysis:
                             f"matrix's rows; no scale grid is read that way")
                     lead = tuple(local for ((_g, local),) in axes[:-2])
                     ((_width, width_local),) = axes[-1]
-                    resident = (row.rep.resident if row.rep is not None
-                                else None)
+                    resident = (streamed.as_held(uid, row.rep).resident
+                                if row.rep is not None else None)
                     granularity = (resident.weight_granularity
                                    if resident is not None else None)
                     for size, local in axes[-2]:
                         whole = replace(row.tensor, shape=(
-                            *row.tensor.shape[:-2], size, row.tensor.shape[-1]))
-                        held = replace(row.tensor,
-                                       shape=(*lead, local, width_local))
+                            *row.tensor.shape[:-2],
+                            streamed.piece_rows(uid, size),
+                            row.tensor.shape[-1]))
+                        held = replace(row.tensor, shape=(
+                            *lead, streamed.piece_rows(uid, local),
+                            width_local))
                         width, rows = whole.matrix_dims
                         width_held, rows_held = held.matrix_dims
                         out.append(WeightShard(

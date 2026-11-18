@@ -1345,7 +1345,7 @@ def compute_per_op_timing(
     #: rank's extents of them (`Analysis.weight_shards`, asked of the row's
     #: `LeafAccess.weight_packs`) — what each row publishes as
     #: `weight_shards`.
-    weight_shards: Callable[[Tuple[Tuple[int, ...], ...]], Tuple[Any, ...]],
+    weight_shards: Callable[[Any], Tuple[Any, ...]],
     #: The card the peaks came from, named so a refusal can say which one
     #: lists no column for a width the deployment chose.
     gpu_sku: str = "",

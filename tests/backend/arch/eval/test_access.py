@@ -64,7 +64,7 @@ class TestBorrowedTermsAddOnce(unittest.TestCase):
         self.assertEqual(rows[uid].weight, 100 + 7)
         self.assertEqual(rows[uid].metadata, 10 + 3)
         # A GEMM's own matrix is a weight of its own.
-        self.assertEqual(rows[uid].weight_packs, ((uid,),))
+        self.assertEqual(rows[uid].weight_packs.groups, ((uid,),))
 
 
 class TestScaleDtypeDescribesTheWidestTensor(unittest.TestCase):
