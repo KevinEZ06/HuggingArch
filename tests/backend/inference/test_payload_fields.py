@@ -136,6 +136,22 @@ for _phase in ("prefill", "decode"):
             "4fe1fa9e4/b89c49b0e: a module row carries the same primary "
             "output dtype, cached tensor, and cache format as its measured "
             "leaf, so a re-read can key the row by the output it walks")
+for _rows in ("per_op_timing", "per_op_timing_decode",
+              "phases.prefill.flops_by_module", "phases.decode.flops_by_module"):
+    for _field in ("input_dtypes", "input_dtypes[*]",
+                   "port_dtypes", "port_dtypes[*]"):
+        ADDED[f"{_rows}[*].{_field}"] = (
+            "each tensor's element dtype beside the shape column that names "
+            "it, as the walk billed its read or write (`LeafAccess."
+            "input_dtypes` / `port_dtype`): the per-op table shows "
+            "`[shape] dtype → [shape] dtype`, so a cast reads as one")
+    for _field in ("weights", "weights[*].name", "weights[*].shape[*]",
+                   "weights[*].dtype"):
+        ADDED[f"{_rows}[*].{_field}"] = (
+            "the stored tensors a kernel streams that arrive on no input, "
+            "each as one rank holds it with its resident dtype (`LeafAccess."
+            "weights`): the weight operands the shape column lists beside "
+            "the inputs")
 for _phase in ("prefill", "decode"):
     ADDED[f"phases.{_phase}.binding.s_pairs"] = _PAIRS
 # The rate ONE request sees, stated once by the phase that owns the

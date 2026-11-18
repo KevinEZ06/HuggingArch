@@ -2019,6 +2019,29 @@ def compute_per_op_timing(
                 "shape_out_dims": _outputs(shape, _named_dims),
                 "shape_out_full": shape_out_full_val,
                 "shape_outs": shape_outs_val,
+                # The element dtype of each tensor the shape columns name, as
+                # the walk billed its read or write (`LeafAccess.input_dtypes`
+                # / `port_dtype`): one per `shape_in` input, one per
+                # `shape_outs` port; `output_dtype` is `shape_out`'s.
+                "input_dtypes": (
+                    None if ab is None or not shape_in_val else list(
+                        ab.input_dtypes(len(shape_in_val)
+                                        if isinstance(shape_in_val[0], list)
+                                        else 1))),
+                # The stored tensors the kernel streams that arrive on no
+                # input (its own, a tie's target), each as one rank holds it
+                # (`LeafAccess.weights`): the weight operands beside the
+                # inputs; one an edge threads in is a `shape_in` input.
+                "weights": (
+                    None if ab is None else
+                    [{"name": w.name,
+                      "shape": [as_number(v) for v in w.shape],
+                      "dtype": w.dtype}
+                     for w in ab.weights if w.input is None] or None),
+                "port_dtypes": (
+                    None if ab is None or shape_outs_val is None else
+                    [ab.port_dtype(name)
+                     for name, p in _shape_outs_src.items() if p]),
                 # The MoE dispatch boundary this launch's routed buffer is
                 # on (`eval.routed.RoutedLaunch`, its `wire`), with which of
                 # its tensors are that buffer and the bytes it moves per
