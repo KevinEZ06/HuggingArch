@@ -95,6 +95,14 @@ for _lib in (
     # brings its own (the `quay.io/ascend/vllm-ascend` image), which is the
     # same arrangement `fa3` has: declared as a source build so a fresh env
     # does not pretend it can resolve one.
+    # The AscendC delta-rule kernels the plugin calls (`chunk_kda_fwd`,
+    # `recurrent_kda`). A DISTRIBUTION whose name is not its module's: the
+    # wheel is `flash-linear-attention-npu-a3` and the package sets no
+    # `__version__`, so every availability probe read it as absent while the
+    # import worked — the `kda` cells were planned and then skipped as
+    # "fla_npu not importable" on a box that runs them.
+    Library("fla_npu", pip=("flash-linear-attention-npu-a3",),
+            dist_name="flash-linear-attention-npu-a3", source_build=True),
     Library("vllm_ascend", source_build=True,
             build_hint="run inside the vllm-ascend image for the release the "
                        "binding is audited at (quay.io/ascend/vllm-ascend"

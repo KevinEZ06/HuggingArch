@@ -275,6 +275,14 @@ class Library:
     """
     name: str
     pip: Tuple[str, ...] = ()
+    #: The DISTRIBUTION that ships one of this library's import gates, when
+    #: its name is not the module's. `_probe_version` asks the module for
+    #: `__version__`, then the distribution of the same name; `fla_npu` has
+    #: neither — the wheel is `flash-linear-attention-npu-a3` and the package
+    #: sets no version attribute — so the import succeeded and the gate still
+    #: read the kernel as absent. Named per library because it is an
+    #: installation fact, the same class as `pip`.
+    dist_name: str = ""
     #: The versions a kernel of this library may run on, when wider than what
     #: a fresh env installs (`pip`). The env installs one release; the gate
     #: still accepts any release the library's kernels run on, and the row

@@ -152,9 +152,19 @@ def _probe_version(import_name: str) -> Optional[str]:
             v = None
         if v:
             return v
+    # A library whose DISTRIBUTION is not named after the module it ships
+    # (`fla_npu` arrives as `flash-linear-attention-npu-a3`, and sets no
+    # `__version__`): ask the distribution the registration names, because
+    # the module has nothing to say and the row needs the version.
+    try:
+        from .providers import _LIBRARIES
+        named = next((lib.dist_name for lib in _LIBRARIES.values()
+                      if lib.dist_name and lib.name in (root, import_name)), "")
+    except Exception:
+        named = ""
     try:
         from importlib.metadata import version as _dist
-        return _dist(root)
+        return _dist(named or root)
     except Exception:
         # Not "unknown": None is the honest answer, and the emit side refuses
         # to write a corpus row without a provider version — the version is
