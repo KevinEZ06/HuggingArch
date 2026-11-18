@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import pytest
 
@@ -1906,12 +1906,24 @@ def test_gallery_speculative_switch_reasks_the_frontier_under_its_draft(browser_
 
 def test_inspector_nav_restores_the_last_visit_without_reanalysis(browser_base):
     """The Inspector nav returns to its model and inner view. Its expensive
-    result remains in memory across a top-level client-side route change."""
+    result remains in memory across a top-level client-side route change.
+
+    The analysis is answered with a real `/analyze` payload, not the
+    module's refusal stub: a result is the thing being kept, so a visit
+    that never got one cannot show that it was kept — the tabs are part of
+    the result (they are inside `#results`), and a failed analysis is
+    legitimately re-asked on the way back, there being nothing to restore.
+    """
+    model = "deepseek-ai/DeepSeek-V4.1-Flash"
     browser, base = browser_base
-    s = Session(browser, base)
-    s.goto("/inspector.html#model=deepseek-ai%2FDeepSeek-V3.2")
+    s = Session(browser, base, overrides={
+        "/analyze": _fixture("analyze_deepseek_v41_arch.json"),
+        "/supported-models": {"model_ids": [model]},
+    })
+    s.goto(f"/inspector.html#model={quote(model, safe='')}")
     assert s.wait_for(lambda: s.count("/analyze") >= 1)
-    assert s.requests["/analyze"][0]["body"]["model_id"] == "deepseek-ai/DeepSeek-V3.2"
+    assert s.requests["/analyze"][0]["body"]["model_id"] == model
+    s.page.wait_for_selector("#tab-diagram", timeout=20000)
     s.page.click("#tab-diagram")
     assert "tab-active" in (s.page.get_attribute("#tab-diagram", "class") or "")
     s.page.click("a[data-tab='fusion']")
@@ -1920,8 +1932,9 @@ def test_inspector_nav_restores_the_last_visit_without_reanalysis(browser_base):
     s.page.wait_for_selector("#model-id", timeout=10000)
     s.page.wait_for_timeout(1000)
     assert s.count("/analyze") == 1, [r["body"] for r in s.requests["/analyze"]]
-    assert "model=deepseek-ai%2FDeepSeek-V3.2" in s.page.evaluate("window.location.hash")
-    assert "view=diagram" in s.page.evaluate("window.location.hash")
+    hash_now = s.page.evaluate("window.location.hash")
+    assert f"model={quote(model, safe='')}" in hash_now
+    assert "view=diagram" in hash_now
     assert "tab-active" in (s.page.get_attribute("#tab-diagram", "class") or "")
     s.assert_clean()
 

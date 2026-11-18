@@ -113,7 +113,7 @@ def test_react_gallery_axes_json_matches_sweep_grid():
     # sheet); the Gallery's curated series is within it, less the Kernel
     # Bench card the Scaling panel compares against.
     from backend.inference.gpu_specs import load_gpu_specs
-    assert DEFAULT_SWEEP_GPUS == [g.sku for g in load_gpu_specs()]
+    assert [g.sku for g in load_gpu_specs()] == DEFAULT_SWEEP_GPUS
     assert set(GALLERY_GPUS) <= set(DEFAULT_SWEEP_GPUS)
     assert "RTX-4090" in DEFAULT_SWEEP_GPUS and "RTX-4090" not in GALLERY_GPUS
     # The gallery shows every model as shipped: no precision axis.
