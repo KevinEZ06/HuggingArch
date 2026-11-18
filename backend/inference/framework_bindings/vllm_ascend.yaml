@@ -215,6 +215,22 @@ kernel_dispatches:
     when: {device: [npu], phase: [decode]}
     source_anchor: "Glm5NextLinearAttention._forward decode branch -> recurrent_kda (vllm_ascend/models/glm5next/kda.py:541-553) -> run_recurrent_kda (vllm_ascend/ops/kda.py:16-58) -> fla_npu.ops.ascendc.recurrent_kda, one aclnnRecurrentKda (profiler `aclnnRecurrentKda_RecurrentKda_RecurrentKda`, 34 us at B=16 on one die)"
 
+  # The two HC launches have no per-phase split: the plugin calls one
+  # AscendC entry for prefill and decode alike (`npu_hc_pre_v2` /
+  # `npu_hc_post`, read off the profiler as `HcPre` / `HcPost`). The
+  # `architectures` clause is the same one their fusions carry, so a
+  # measured HC row is only ever read on the model whose walk produced it.
+  - op: mhc_pre
+    library: vllm_ascend
+    impl_id: npu_hc_pre_v2
+    when: {device: [npu], architectures: [Glm5NextForConditionalGeneration]}
+    source_anchor: "Glm5NextDecoderLayer.hc_pre -> torch.ops._C_ascend.npu_hc_pre_v2 (vllm_ascend/models/glm5next/model.py:499-507), registered npu_hc_pre_v2_npu -> run_hc_pre_fusion (csrc/torch_binding.cpp:3255-3264); profiler `HcPre`"
+  - op: mhc_post
+    library: vllm_ascend
+    impl_id: npu_hc_post
+    when: {device: [npu], architectures: [Glm5NextForConditionalGeneration]}
+    source_anchor: "Glm5NextDecoderLayer.hc_post -> torch.ops._C_ascend.npu_hc_post (vllm_ascend/models/glm5next/model.py:523-525), registered npu_hc_post_npu -> EXEC_NPU_CMD(aclnnHcPost) (csrc/torch_binding.cpp:1434); profiler `HcPost`"
+
 op_implementations:
   # Residual add + RMSNorm: AscendRMSNorm.forward_oot with a residual makes
   # one npu_add_rms_norm_bias call (one aclnnAddRmsNormBias), prefill and
