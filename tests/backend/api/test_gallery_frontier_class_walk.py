@@ -29,7 +29,7 @@ def _same(got, want, path="priced"):
         return
     if isinstance(got, list):
         assert len(got) == len(want), path
-        for i, (one, other) in enumerate(zip(got, want)):
+        for i, (one, other) in enumerate(zip(got, want, strict=True)):
             _same(one, other, f"{path}[{i}]")
         return
     if isinstance(got, (int, float)) and not isinstance(got, bool):

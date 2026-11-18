@@ -20,7 +20,6 @@ from backend.measure.auto_sweep import MeasuredFormula, PointMeasure
 from backend.measure.lookup import Key
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.row_roofline import FloorForm
-from backend.inference.parallel_sweep import class_cards
 from backend.inference.sweep_grid import (
     FRONTIER_BATCH_GRID,
     FRONTIER_DRAFT_TOKENS,

@@ -636,7 +636,7 @@ def _delta_rule_reference(inputs: Dict[str, Any]) -> Any:
     """
     q, k, v = inputs["q"].float(), inputs["k"].float(), inputs["v"].float()
     g, beta = inputs["g"].float(), inputs["beta"].float()
-    B, T = q.shape[0], q.shape[1]
+    T = q.shape[1]
     _refuse_unaffordable_scan(
         "delta-rule", steps=T,
         elements=inputs["v"].numel() + inputs["initial_state"].numel())
@@ -734,7 +734,7 @@ def gdn_gates(a, b, A_log, dt_bias):
 
 def _gdn_decode_reference(inputs: Dict[str, Any]) -> Any:
     q = inputs["q"].float()
-    B, T = q.shape[0], q.shape[1]
+    T = q.shape[1]
     _refuse_unaffordable_scan(
         "delta-rule", steps=T,
         elements=inputs["v"].numel() + inputs["initial_state"].numel())
@@ -872,7 +872,7 @@ def kda_bounded_gates(f, b, A_log, dt_bias, lower_bound):
 
 def _kda_decode_reference(inputs: Dict[str, Any]) -> Any:
     q = inputs["q"].float()
-    B, T = q.shape[0], q.shape[1]
+    T = q.shape[1]
     _refuse_unaffordable_scan(
         "delta-rule", steps=T,
         elements=inputs["v"].numel() + inputs["initial_state"].numel())
@@ -1114,7 +1114,7 @@ def _ssd_scan(x, dt, A, B, C, D, dt_bias):
 
 def _mamba2_scan_reference(inputs: Dict[str, Any]) -> Any:
     x = inputs["x"].float()
-    B, T = x.shape[0], x.shape[1]
+    T = x.shape[1]
     _refuse_unaffordable_scan(
         "mamba2", steps=T,
         elements=x.numel() + inputs["B"].numel() + inputs["C"].numel())
@@ -1452,7 +1452,8 @@ register_ref("rmsnorm_gated",
 
 def rms_normalise(x: Any, w: Any, eps: float) -> Any:
     """`x · rsqrt(mean(x²) + eps) · w` over the last axis, in fp32 — the
-    one RMSNorm the fused-norm oracles below compose (`w=None`: no gain)."""
+    one RMSNorm every oracle below composes, fused-norm and fused-span
+    alike (`w=None`: no gain)."""
     import torch
     x = x.float()
     y = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
@@ -2739,7 +2740,6 @@ def _qk_mrope_reference(inputs: Dict[str, Any]) -> Any:
     half = int(inputs["d_rope"]) // 2
     lane = _mrope_axis(inputs["sections"], bool(inputs["interleaved"])
                        ).to(pos.device)
-    cols = torch.arange(half, device=pos.device)
 
     def gather(table):
         streams = torch.stack([table.index_select(0, pos[axis])
@@ -4256,15 +4256,6 @@ register_ref("fused_inv_rope",
 #     cell states only by its `kv` dtype) keeps the fp32 oracle, banded by
 #     that `kv` slot.
 # ---------------------------------------------------------------------------
-
-def rms_normalise(x: Any, w: Any, eps: float) -> Any:
-    """`x · rsqrt(mean(x²) + eps) · w` over the last axis, in fp32 — the
-    one RMSNorm the fused-span oracles compose (`w=None`: no gain)."""
-    import torch
-    x = x.float()
-    y = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-    return y if w is None else y * w.float()
-
 
 def _boundary_positions(tokens: int, compress_ratio: int, device: str,
                         batch: int = 1) -> Any:

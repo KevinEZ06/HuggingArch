@@ -320,7 +320,7 @@ def parent(args: argparse.Namespace) -> None:
     print(f"  plan build: {_fn_count(seq['plan'])} fns")
     report["import_fns"] = _fn_count(seq["import"])
     report["warm"] = {}
-    for i, e, p in zip(picks, seq["cells"], seq_plain["cells"]):
+    for i, e, p in zip(picks, seq["cells"], seq_plain["cells"], strict=True):
         missing = sorted(set(cold[i]) - set(e["items"]))
         report["warm"][names[i]] = {"plain_s": p["seconds"], "traced_s": e["seconds"],
                                     "functions": _fn_count(e["items"]),
