@@ -424,7 +424,7 @@ function MeasuredCheck({
 }) {
   return (
     <span className="inline-flex items-center gap-2" title={disabled || undefined}>
-      <label className={"inline-flex items-center gap-1.5 text-sm whitespace-nowrap "
+      <label className={"inline-flex items-center gap-1.5 h-7 text-xs whitespace-nowrap "
         + (disabled ? "text-gray-400 cursor-default" : "text-gray-700 cursor-pointer")}>
         <input
           id={id}
@@ -805,7 +805,7 @@ function ControlsSkeleton() {
   return (
     <span className="flex items-center gap-1.5" data-controls-skeleton aria-hidden>
       {[0, 1, 2].map((i) => (
-        <span key={i} className="skeleton h-8 w-24 rounded-lg" />
+        <span key={i} className="skeleton h-3.5 w-20 rounded" />
       ))}
     </span>
   );
@@ -830,30 +830,39 @@ function cloudLabel(d: CloudDim, v: CloudValue): string {
   return String(v);
 }
 
-/** The one shell every control of these sections wears: a rounded trigger
- *  with the control's name as a muted caption above its value, the same
- *  height, radius, border and focus ring whether the control holds several
- *  values (`MultiPick`) or exactly one (`OnePick`). */
-const PICK_SHELL = "inline-flex items-center gap-1.5 rounded-lg border bg-white pl-2.5 pr-1 h-8"
-  + " transition-colors min-w-0";
-const PICK_QUIET = "border-gray-200 hover:border-gray-300";
-/** The trigger of a control that holds something: amber, like its chips. */
-const PICK_HELD = "border-amber-200 hover:border-amber-300";
-const PICK_OPEN = "border-amber-400 ring-2 ring-amber-400/30";
-const PICK_CAPTION = "text-10 font-medium uppercase tracking-wide text-gray-400 leading-none";
-const PICK_VALUE = "flex items-center gap-1 min-w-0 min-h-[1rem] text-xs leading-tight text-gray-900";
-/** A row of these controls: they wrap, and a popover hangs below one. */
-const PICK_ROW = "flex items-center gap-1.5 flex-wrap";
+/** The one shell every control of these sections wears: a LINE OF TEXT —
+ *  the control's name in grey, its value in near-black, one caret — with
+ *  no box of its own, whether the control holds several values
+ *  (`MultiPick`) or exactly one (`OnePick`). Five boxed controls read as a
+ *  form to fill in; the same five as text read as a toolbar, and what a
+ *  reader looks for (the values) is what carries the ink. The row's hairline
+ *  dividers do the separating a border used to. */
+const PICK_SHELL = "group inline-flex items-center gap-1 h-7 min-w-0 rounded"
+  + " transition-colors";
+const PICK_QUIET = "";
+/** The trigger of a control that holds something: its value in amber, the
+ *  only tint in the row, so what is held is what stands out. */
+const PICK_HELD = "";
+/** Open: a wash of grey behind the words (the ring is the padding a
+ *  borderless control has none of), and the caret turned over. */
+const PICK_OPEN = "bg-gray-50 ring-4 ring-gray-50";
+const PICK_CAPTION = "text-xs text-gray-400 leading-none whitespace-nowrap";
+const PICK_VALUE = "flex items-center gap-1 min-w-0 text-xs leading-tight font-medium"
+  + " text-gray-900 group-hover:underline underline-offset-4 decoration-gray-300";
+/** A row of these controls: they wrap, a hairline stands between two of
+ *  them, and a popover hangs below one. */
+const PICK_ROW = "flex items-center gap-x-3 gap-y-1 flex-wrap"
+  + " [&>*+*]:border-l [&>*+*]:border-gray-200 [&>*+*]:pl-3";
 /** The row's segmented switch (one of a few forms / modes), at the pickers'
  *  height: one choice at a time, so it is buttons and not a dropdown. */
-const SEGMENTED = "inline-flex items-center h-8 rounded-lg border border-gray-200 bg-gray-50 p-0.5 text-xs";
+const SEGMENTED = "inline-flex items-center h-7 rounded-lg border border-gray-200 bg-gray-50 p-0.5 text-xs";
 const SEGMENT = "px-2.5 py-1 rounded-md transition-colors ";
 
 /** The caret every control of the row shows (the native select's own is
  *  turned off, so one shape points one way). */
 function Caret({ up = false }: { up?: boolean }) {
   return (
-    <svg className={`w-3 h-3 shrink-0 text-gray-400 transition-transform ${up ? "rotate-180" : ""}`}
+    <svg className={`w-3 h-3 shrink-0 text-gray-300 group-hover:text-gray-500 transition-transform ${up ? "rotate-180" : ""}`}
       viewBox="0 0 12 12" fill="none" aria-hidden="true">
       <path d="M3 4.5 6 7.5 9 4.5" stroke="currentColor" strokeWidth="1.5"
         strokeLinecap="round" strokeLinejoin="round" />
@@ -880,23 +889,25 @@ function OnePick({
     <label
       title={title}
       className={`${PICK_SHELL} ${PICK_QUIET} cursor-pointer max-w-full`
-        + " focus-within:border-amber-400 focus-within:ring-2 focus-within:ring-amber-400/30 "
-        + className}
+        + " focus-within:ring-2 focus-within:ring-amber-400/30 " + className}
     >
-      <span className="flex flex-col min-w-0 leading-tight">
-        <span className={PICK_CAPTION}>{label}</span>
-        <select
-          id={id}
-          className="appearance-none bg-transparent border-0 p-0 min-w-0 max-w-full truncate
-            text-xs leading-tight text-gray-900 cursor-pointer focus:outline-none
-            disabled:cursor-default disabled:text-gray-400"
-          disabled={disabled}
-          value={value}
-          onChange={onChange}
-        >
-          {children}
-        </select>
-      </span>
+      <span className={PICK_CAPTION}>{label}:</span>
+      <select
+        id={id}
+        // `field-sizing-content`: a native select is as wide as its widest
+        // option, which in a text toolbar leaves the caret stranded a word
+        // away from the value. Where the browser does not have it (Safari)
+        // the control is merely wider, never broken.
+        className="appearance-none field-sizing-content bg-transparent border-0 p-0 min-w-0
+          max-w-full truncate text-xs leading-tight font-medium text-gray-900 cursor-pointer
+          focus:outline-none group-hover:underline underline-offset-4 decoration-gray-300
+          disabled:cursor-default disabled:no-underline disabled:text-gray-400"
+        disabled={disabled}
+        value={value}
+        onChange={onChange}
+      >
+        {children}
+      </select>
       <Caret />
     </label>
   );
@@ -906,8 +917,7 @@ function OnePick({
  *  its trigger: a `<details>` whose summary IS the trigger, closing on
  *  Escape or a click outside, and hanging from the trigger's right edge
  *  when it would otherwise run past the viewport (a phone, or the row's
- *  last control). One shell, so a dimension's values and the Filters
- *  drawer that holds the dimensions themselves open the same way. */
+ *  last control). */
 function PickPopover({
   id, label, held, title, trigger, open, onOpen, onOpened, onKeyDown,
   panelClass = "", children,
@@ -935,10 +945,11 @@ function PickPopover({
       return;
     }
     // Dismissed on the CLICK outside, not its mousedown: closing this
-    // popover can move the row under the pointer (a hold promoted out of
-    // the Filters drawer), and a control that moves between a press and
-    // its release never receives the click at all — the first click
-    // outside would be spent on the dismissal.
+    // popover can move the row under the pointer (the trigger's width
+    // follows what it holds, so the controls after it shift), and a
+    // control that moves between a press and its release never receives
+    // the click at all — the first click outside would be spent on the
+    // dismissal.
     const onOutside = (e: MouseEvent) => {
       if (root.current && !root.current.contains(e.target as Node)) onOpen(false);
     };
@@ -987,6 +998,7 @@ function PickPopover({
         aria-haspopup="listbox"
         title={title}
         className={`${PICK_SHELL} list-none select-none cursor-pointer max-w-[15rem]`
+          + " [&::-webkit-details-marker]:hidden"
           + " focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50 "
           + (open ? PICK_OPEN : held ? PICK_HELD : PICK_QUIET)}
       >
@@ -1037,24 +1049,23 @@ function MultiPick({
   const more = picked.length - chips.length;
   const toggle = (v: CloudValue, on: boolean) =>
     onChange(on ? picked.filter((x) => x !== v) : [...picked, v]);
+  // Held values are the control's text, each with a faint × that drops it
+  // — no chip, no box inside a box: the value IS the control's value, and
+  // the amber says this one is held.
   const trigger = (
-    <span className="flex flex-col min-w-0 leading-tight">
-      <span className={PICK_CAPTION}>{label}</span>
+    <>
+      <span className={PICK_CAPTION}>{label}:</span>
       <span className={PICK_VALUE}>
         {picked.length ? (
           <>
-            {chips.map((v) => (
-              <span
-                key={String(v)}
-                className="inline-flex items-center gap-0.5 max-w-[7rem] rounded-md
-                  border border-amber-200 bg-amber-50 pl-1.5 pr-0.5 text-10 text-amber-900"
-              >
+            {chips.map((v, i) => (
+              <span key={String(v)} className="inline-flex items-center max-w-[8rem] text-amber-800">
                 <span className="truncate">{text(v)}</span>
                 <button
                   type="button"
                   tabIndex={-1}
                   aria-label={`Remove ${text(v)}`}
-                  className="px-0.5 leading-none text-amber-500 hover:text-amber-800"
+                  className="px-0.5 leading-none text-amber-300 hover:text-amber-700"
                   onClick={(e) => {
                     // A click inside a <summary> would toggle the popover.
                     e.preventDefault();
@@ -1064,15 +1075,14 @@ function MultiPick({
                 >
                   ×
                 </button>
+                {i < chips.length - 1 || more > 0 ? "," : ""}
               </span>
             ))}
-            {more > 0 ? (
-              <span className="rounded-md bg-amber-100 px-1 text-10 text-amber-900">+{more}</span>
-            ) : null}
+            {more > 0 ? <span className="text-amber-800">+{more}</span> : null}
           </>
-        ) : <span className="text-gray-400 truncate">{emptyText}</span>}
+        ) : <span className="font-normal text-gray-400 truncate">{emptyText}</span>}
       </span>
-    </span>
+    </>
   );
   return (
     <PickPopover
@@ -1188,77 +1198,24 @@ const HOLD_LABEL: Record<CloudDim, string> = {
   ep_load_factor: "EP load",
 };
 
-/** The dimensions not in play, behind one trigger: the holds a reader can
- *  still add, and — said in a line rather than rendered as a dead "any"
- *  box — the ones this cloud answers with a single value (the speculative
- *  knobs of a plain decode sweep). Which dimension is here and which is a
- *  control of the row is read off the cloud's own answer, never a list
- *  this page keeps.
- *
- *  Which dimensions it holds is the caller's (the section freezes them
- *  while the drawer is open and keeps them out of the row): holding a
- *  value promotes that dimension to the row, and a control must not
- *  vanish from under the click that set it, nor stand in two places. */
-function FiltersPick({
-  id, dims, fixed, values, picked, onPick, open, onOpen,
+/** The dimensions this cloud answers with ONE value, said in a line under
+ *  the row: there is nothing to pick, so they are no control — but a
+ *  reader comparing two sweeps still has to know which value the cloud
+ *  priced. A line, not a disclosure and not a dead "any" box: a dimension
+ *  the cloud gives a CHOICE on is always a control of the row itself. */
+function FixedNote({
+  dims, values,
 }: {
-  id: string;
-  /** The dimensions it offers as controls, in the cloud's order. */
+  /** The dimensions this cloud has one value for, in the cloud's order. */
   dims: CloudDim[];
-  /** The dimensions this cloud has one value for, with that value. */
-  fixed: CloudDim[];
   values: Record<string, CloudValue[]> | undefined;
-  picked: Holds;
-  onPick: (d: CloudDim, vs: CloudValue[]) => void;
-  open: boolean;
-  onOpen: (v: boolean) => void;
 }) {
-  const shown = dims.filter((d) => (values?.[d]?.length ?? 0) > 1);
+  if (!dims.length) return null;
   return (
-    <PickPopover
-      id={id}
-      label="Filters"
-      held={false}
-      title={`${dims.length} more dimension${dims.length === 1 ? "" : "s"} to hold`}
-      open={open}
-      onOpen={onOpen}
-      panelClass="overflow-visible"
-      trigger={
-        <span className="flex items-center gap-1.5 text-xs text-gray-700">
-          Filters
-          {dims.length ? (
-            <span data-filters-count
-              className="rounded-full bg-gray-100 px-1.5 text-10 leading-4 text-gray-600">
-              {dims.length}
-            </span>
-          ) : null}
-        </span>
-      }
-    >
-      <div className="flex flex-col items-start gap-1.5 p-2">
-        {shown.map((d) => (
-          <MultiPick
-            key={d}
-            id={`infer-throughput-fix-${d}`}
-            label={HOLD_LABEL[d] ?? d}
-            options={values?.[d] || []}
-            picked={picked[d] || []}
-            text={(v) => cloudLabel(d, v)}
-            onChange={(vs) => onPick(d, vs)}
-          />
-        ))}
-        {!shown.length ? (
-          <span className="px-0.5 text-11 text-gray-400">nothing else to hold</span>
-        ) : null}
-      </div>
-      {fixed.length ? (
-        <div data-filters-fixed
-          className="border-t border-gray-100 px-2.5 py-1.5 text-10 leading-relaxed text-gray-500">
-          One value in this cloud: {fixed.map((d) =>
-            `${HOLD_LABEL[d] ?? d} ${cloudLabel(d, (values?.[d] || [])[0])}`).join(" · ")}
-        </div>
-      ) : null}
-    </PickPopover>
+    <div data-fixed-note className="mt-1 text-10 leading-relaxed text-gray-400">
+      One value in this cloud: {dims.map((d) =>
+        `${HOLD_LABEL[d] ?? d} ${cloudLabel(d, (values?.[d] || [])[0])}`).join(" · ")}
+    </div>
   );
 }
 
@@ -1500,10 +1457,6 @@ function ThroughputSection({
   // form's default.
   const [picked, setPicked] = useState<Holds>({});
   const [pickedLines, setPickedLines] = useState<CloudDim[] | null>(null);
-  // The Filters drawer: null while closed, else the dimensions it holds
-  // (frozen on the way open, so the row and the drawer never show one
-  // dimension twice).
-  const [drawer, setDrawer] = useState<CloudDim[] | null>(null);
   const [baseAnswer, setBaseAnswer] = useState<
     { key: string; cloud: string; base: CloudBase } | null>(null);
   const [answer, setAnswer] = useState<{ key: string; view: CloudView } | null>(null);
@@ -1512,7 +1465,7 @@ function ThroughputSection({
   // A new CLOUD holds nothing the reader picked: it may not have it. The
   // same cloud's measured answer is not a new cloud (`cloudOf`).
   const sweepKey = cloudOf(sweepBody);
-  useEffect(() => { setPicked({}); setPickedLines(null); setDrawer(null); }, [sweepKey]);
+  useEffect(() => { setPicked({}); setPickedLines(null); }, [sweepKey]);
   // What the cloud serves: asked once per sweep.
   const baseKey = sweepBody ? JSON.stringify(baseRequest(sweepBody)) : "";
   const fresh = baseKey && baseAnswer?.key === baseKey ? baseAnswer.base : null;
@@ -1658,21 +1611,17 @@ function ThroughputSection({
     : active
       ? "bg-white shadow-sm text-gray-900 font-medium"
       : "text-gray-500 hover:text-gray-800");
-  // Which dimensions are controls of the row, and which sit behind
-  // Filters — read off the cloud's own answer (`values`), never a list
-  // this page keeps. A dimension the cloud offers ONE value for is
-  // nothing to pick (the speculative knobs of a plain decode sweep): it
-  // is stated inside Filters, not rendered as a dead "any" box. Of the
-  // rest, the ones actually in play — the form's defaults and whatever
-  // the reader holds — are the row; the others are behind Filters.
+  // Which dimensions are controls of the row — read off the cloud's own
+  // answer (`values`), never a list this page keeps. Every dimension the
+  // cloud gives a CHOICE on is a control, held or not: nothing a reader
+  // can change sits behind a disclosure, because one click costs more
+  // than the two boxes it saves. A dimension the cloud offers ONE value
+  // for is nothing to pick (the speculative knobs of a plain decode
+  // sweep): it is said in the line under the row, not rendered as a dead
+  // "any" box. Let a sweep make those dimensions multi-valued and they
+  // join the row by the same rule.
   const offered = (d: CloudDim) => lastValues?.[d]?.length ?? 0;
-  const inPlay = (d: CloudDim) => (fix[d]?.length ?? 0) > 0;
-  // The drawer's dimensions are frozen while it is open — holding a value
-  // promotes that dimension to the row, and a control must neither vanish
-  // from under the click that set it nor stand in two places at once.
-  const drawerDims = drawer ?? dims.filter((d) => offered(d) > 1 && !inPlay(d));
-  const rowDims = dims.filter((d) => offered(d) > 1 && inPlay(d)
-    && !drawerDims.includes(d));
+  const rowDims = dims.filter((d) => offered(d) > 1);
   const fixedDims = dims.filter((d) => offered(d) === 1);
   const hold = (d: CloudDim) => (
     <MultiPick
@@ -1735,18 +1684,6 @@ function ThroughputSection({
       {pending ? <ControlsSkeleton /> : (
         <>
           {rowDims.map(hold)}
-          {drawerDims.length || fixedDims.length ? (
-            <FiltersPick
-              id="infer-throughput-filters"
-              dims={drawerDims}
-              fixed={fixedDims}
-              values={lastValues}
-              picked={fix}
-              onPick={(d, vs) => setPicked((f) => ({ ...f, [d]: vs }))}
-              open={drawer !== null}
-              onOpen={(v) => setDrawer(v ? drawerDims : null)}
-            />
-          ) : null}
           {lineOptions.length ? (
             <MultiPick
               id="infer-throughput-lines"
@@ -1789,7 +1726,10 @@ function ThroughputSection({
         {switches}
       </div>
       <p className="text-10 leading-snug text-gray-400 mb-2 max-w-[90ch]">{subtitle}</p>
-      <div className="mb-2">{controls}</div>
+      <div className="mb-2">
+        {controls}
+        {pending ? null : <FixedNote dims={fixedDims} values={lastValues} />}
+      </div>
     </>
   );
   // The fields this view is drawn from, as the backend named them: the page
@@ -2592,7 +2532,7 @@ export function ScalingPanel(props: {
           <OnePick
             id="infer-scaling-gpu"
             label="GPU"
-            className="w-[15rem]"
+            className="max-w-[18rem]"
             value={skuOpts.includes(ovGpu) ? ovGpu : (skuOpts[0] || ovGpu)}
             onChange={(e) => setOvGpu(e.target.value)}
           >

@@ -1092,15 +1092,16 @@ def test_throughput_charts_are_views_the_backend_draws_of_one_cloud(browser_base
         open_pick(s, control)
         s.page.check(f"#{control} input[value='{value}']")
 
-    # Only the holds in play are controls of the row; the rest are behind
-    # Filters, and a dimension the cloud answers with ONE value is no
-    # control at all (it is said inside the drawer, not drawn as a dead
-    # "any" box). Which is which is the cloud's `values`, not a list this
+    # Every dimension the cloud gives a CHOICE on is a control of the row,
+    # held or not — nothing a reader can change sits behind a disclosure.
+    # A dimension the cloud answers with ONE value is no control at all:
+    # it is said in the quiet line under the row, not drawn as a dead
+    # "any" box. Which is which is the cloud's `values`, not a list this
     # page keeps: here the mode and the batch are the two with a choice.
-    assert s.page.inner_text("#infer-throughput-filters [data-filters-count]") == "2"
+    assert s.page.query_selector("#infer-throughput-fix-mode") is not None
+    assert s.page.query_selector("#infer-throughput-fix-batch_key") is not None
     assert s.page.query_selector("#infer-throughput-fix-draft_tokens") is None
-    open_pick(s, "infer-throughput-filters")
-    fixed = s.page.inner_text("#infer-throughput-filters [data-filters-fixed]")
+    fixed = s.page.inner_text("#infer-throughput [data-fixed-note]")
     assert "Draft tokens 0" in fixed and "GPU B200" in fixed
     open_pick(s, "infer-throughput-fix-mode")
     s.page.wait_for_function(
@@ -1204,7 +1205,8 @@ def test_throughput_holds_are_multi_selects_a_reader_can_see_are_multi(browser_b
 def test_a_dimension_the_cloud_gives_a_choice_on_is_a_control(browser_base):
     """Whether a cloud dimension gets a picker is read off the cloud's own
     `values`, not a list this page keeps: one value is nothing to pick and
-    is stated inside Filters; two or more make it a control again.
+    is stated in the line under the row; two or more make it a control of
+    the row itself, held or not.
 
     The speculative knobs are the case that matters — a plain decode sweep
     answers one draft-token count, so eight "any" boxes used to sit in the
@@ -1226,17 +1228,16 @@ def test_a_dimension_the_cloud_gives_a_choice_on_is_a_control(browser_base):
     s.page.route(f"**{view}", answer)
     s.goto("/inference.html#model=deepseek-ai%2FDeepSeek-V3&gpu=B200&ep=8&dp_attn=8")
     assert s.wait_for(lambda: s.count(view) >= 2)
-    s.page.wait_for_selector("#infer-throughput-filters", timeout=15000)
     # Three dimensions with a choice and none of them held: mode, batch and
-    # now the draft tokens.
-    assert s.wait_for(lambda: s.page.inner_text(
-        "#infer-throughput-filters [data-filters-count]") == "3")
-    open_pick(s, "infer-throughput-filters")
-    assert s.page.query_selector("#infer-throughput-fix-draft_tokens") is not None
-    fixed = s.page.inner_text("#infer-throughput-filters [data-filters-fixed]")
+    # now the draft tokens — all three controls of the row, none of them
+    # behind a disclosure.
+    s.page.wait_for_selector("#infer-throughput-fix-draft_tokens", timeout=15000)
+    assert s.page.query_selector("#infer-throughput-fix-mode") is not None
+    assert s.page.query_selector("#infer-throughput-fix-batch_key") is not None
+    fixed = s.page.inner_text("#infer-throughput [data-fixed-note]")
     assert "Draft tokens" not in fixed and "Acceptance 1" in fixed
-    # Holding one takes it out of the drawer and into the row, where the
-    # title says it — but not while the drawer the click landed in is open.
+    # Holding one asks for that view, and the control stays where it was:
+    # nothing moves under the click that set it.
     open_pick(s, "infer-throughput-fix-draft_tokens")
     s.page.check("#infer-throughput-fix-draft_tokens input[value='4']")
     assert s.wait_for(lambda: (s.requests[view][-1]["body"].get("fix") or {})
@@ -1244,8 +1245,6 @@ def test_a_dimension_the_cloud_gives_a_choice_on_is_a_control(browser_base):
     s.page.keyboard.press("Escape")
     assert s.wait_for(lambda: s.page.query_selector(
         "#infer-throughput-fix-draft_tokens") is not None)
-    assert s.page.inner_text(
-        "#infer-throughput-filters [data-filters-count]") == "2"
     s.assert_clean()
 
 
