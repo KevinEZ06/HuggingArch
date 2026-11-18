@@ -960,7 +960,7 @@ def _build_jobs_over_points(
                 # whose own backends serve it; the deployment's own page
                 # (no list asked) is the estimate's key and always kept.
                 if _paged and kv_block_sizes:
-                    served = served_kv_block_sizes(sig)
+                    served = served_kv_block_sizes(sig, gpu=gpu)
                     paged_points = [ap for ap, pg in zip(at_pages, _kv_block_sizes, strict=True)
                                     if pg in served]
                 else:

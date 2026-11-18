@@ -295,6 +295,22 @@ class Library:
     # env's torch from the build, so it fails before compiling; this
     # declares that the build must see the target env.
     no_build_isolation: bool = False
+    #: Which accelerator this library's kernels run on, in the sheet's
+    #: vocabulary (`gpu_specs.csv` `device`: `cuda`, `npu`). None: the
+    #: library is not bound to one (torch). This is the ONE stored device
+    #: fact for a library — `Env.device` is the box's; a CUDA-only library
+    #: on an NPU box is a mismatch even if the import gate passes, which
+    #: is how flashinfer was marked available on Ascend and its pages
+    #: (16/32/64) entered an NPU sweep.
+    device: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        from ..device import DEVICES
+        if self.device is not None and self.device not in DEVICES:
+            raise ValueError(
+                f"Library.device is one of {list(DEVICES)} or None "
+                f"(the `gpu_specs.csv` `device` vocabulary); "
+                f"got {self.device!r}")
 
     def spec_for(self, import_name: str) -> str:
         """The pip spec that constrains the module `import_name`, or "".
@@ -1140,6 +1156,11 @@ class Provider:
     def unavailability(self, env: Env):
         """Why this kernel cannot run in `env` at all, clause by clause —
         `available` read for its reasons, as `refusals` is for `accepts`."""
+        if not self._device_ok(env):
+            want = self.lib.device
+            got = env.device or "no accelerator"
+            yield f"library device {want} does not run on {got}"
+            return
         if not env.has(self.import_name):
             yield f"{self.import_name} not importable"
             return
@@ -1180,6 +1201,21 @@ class Provider:
             yield why
             return
         yield from self.refusals(inv, env)
+
+    def _device_ok(self, env: Env) -> bool:
+        """False when this library named an accelerator and the box is not it.
+
+        Unbound libraries (torch) allow on every box. An env that has not
+        named a device is unknown, not a mismatch — same as `_version_ok`
+        and `_sm_ok` on an unparseable `sm`: decline what is proven, do
+        not invent a skip. A CUDA-only library on an NPU env used to pass
+        because `_sm_ok` only refuses a stated `min_sm`, and flashinfer
+        states none.
+        """
+        want = self.lib.device
+        if want is None or env.device is None:
+            return True
+        return env.device == want
 
     def _sm_ok(self, env: Env) -> bool:
         """False only when this card is provably below the kernel's floor.
@@ -1596,7 +1632,8 @@ def discover() -> None:
     _DISCOVERED = True
 
 
-def served_kv_block_sizes(signature: Optional[str] = None) -> Tuple[int, ...]:
+def served_kv_block_sizes(signature: Optional[str] = None,
+                          *, gpu: Optional[str] = None) -> Tuple[int, ...]:
     """Every paged-KV page some registered backend can serve, ascending —
     of `signature`'s backends when one is named. A page only another
     family's backend serves is no page this kernel runs at: vLLM forces an
@@ -1616,9 +1653,22 @@ def served_kv_block_sizes(signature: Optional[str] = None) -> Tuple[int, ...]:
     by the accident of another import pulling `indexer` in, and a page
     declared by a module added later would have been missed with nothing
     failing.
+
+    `gpu` is a sheet SKU. When named, only libraries that run on that
+    card's device contribute pages — otherwise the union of CUDA's 16/32/64
+    and Ascend's 128 is a page no deployment on either family allocates,
+    which is how 36 NPU rows were measured at FlashInfer's pages.
     """
+    device = None
+    if gpu:
+        from backend.inference.gpu_specs import get_gpu
+        spec = get_gpu(gpu)
+        if spec is None:
+            raise ValueError(f"unknown gpu {gpu!r}")
+        device = spec.device
     pages = {page for provider in all_providers()
              if signature is None or provider.signature == signature
+             if device is None or provider.lib.device in (None, device)
              for page in ((provider.serves.kv_block_sizes or ())
                           if provider.serves else ())}
     return tuple(sorted(pages))

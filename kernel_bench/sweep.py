@@ -541,7 +541,8 @@ def _plan_deployment(label: str, par: Any, *, model_id: str, gpu: str,
                 # page is an axis of these cells in both phases
                 # (`op_signatures.PAGE_AXIS`), so this changes
                 # which cells are planned and no identity.
-                kv_block_sizes=served_kv_block_sizes(), with_unplaced=True)
+                kv_block_sizes=served_kv_block_sizes(gpu=gpu),
+                with_unplaced=True)
         except Exception as e:
             log(f"skip {label} {phase} ({len(wanted)} points): {e}")
             continue
@@ -645,7 +646,7 @@ def plan_points(model_id: str, gpu: str, parallel: Any, phase: str,
         avg_output_tokens=avg_output_tokens, parallel=parallel,
         framework=framework, precision=AS_SHIPPED, resolved=resolved,
         binding=_deployed_binding(framework, gpu, AS_SHIPPED, resolved),
-        gpu=gpu, kv_block_sizes=served_kv_block_sizes())
+        gpu=gpu, kv_block_sizes=served_kv_block_sizes(gpu=gpu))
 
 
 def sweep_surfaces() -> Dict[str, Dict[str, Any]]:

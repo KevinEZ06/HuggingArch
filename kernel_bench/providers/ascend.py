@@ -45,10 +45,14 @@ from ..invocation import Invocation
 from ..env import Env
 from . import (BenchCase, KernelSignature, Provider, register)
 
-#: The paged-KV page vLLM-Ascend allocates the cache in, from the binding
-#: (`framework_bindings/vllm_ascend.yaml` `kv_block_size`, read at
-#: `vllm_ascend/utils.py:1504-1505`). Stated once here; a second literal in
-#: a build would be a second statement of the framework's own choice.
+#: The paged-KV page vLLM-Ascend's attention backends actually run, from
+#: the binding (`framework_bindings/vllm_ascend.yaml` `kv_block_size`,
+#: read at `vllm_ascend/utils.py:1504-1505`) and from each backend's
+#: `get_supported_kernel_block_sizes()` — all `[128]` on A3. Stated once
+#: here; a second literal in a build would be a second statement of the
+#: kernel page. The hybrid scheduler alignment (640, or 2176/4352 under
+#: int8 KV) is the KV-pool grain, not this axis: HuggingArch keys a paged
+#: cell on `op_signatures.PAGE_AXIS`, which is the kernel page.
 ASCEND_PAGE = 128
 
 #: The float formats these kernels take. The plugin serves a model at its

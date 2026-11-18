@@ -24,10 +24,14 @@ devices: [npu]
 # `refresh_block_size` (vllm_ascend/utils.py:1482-1505, called from
 # vllm_ascend/platform.py:1373) sets an unset block size to 128, and forces
 # 128 under prefix caching or chunked prefill (vllm_ascend/utils.py:1536-1540).
-# Billed at 128 for every model; not modelled: a deepseek_v4 checkpoint
-# defaults to 32 (vllm_ascend/utils.py:1520-1528), a hybrid attention+mamba
-# model sizes its own page (vllm_ascend/utils.py:1531-1534), and C8 MXFP KV
-# rounds to its kernel block (vllm_ascend/utils.py:1509-1515).
+# Billed at 128 for every model. Not modelled as this field: a deepseek_v4
+# checkpoint defaults to 32 (vllm_ascend/utils.py:1520-1528), a hybrid
+# attention+mamba model aligns the scheduler / KV-pool block (640 without
+# int8 KV; 2176/4352 with it — vllm_ascend/utils.py:1531-1534), and C8 MXFP
+# KV rounds to its kernel block (vllm_ascend/utils.py:1509-1515). Those
+# alignments are the pool grain. This field is the kernel page
+# (`op_signatures.PAGE_AXIS`); every Ascend attention backend's
+# `get_supported_kernel_block_sizes()` is `[128]`.
 kv_block_size: 128
 
 # The plugin runs vLLM's model config: `ModelConfig.get_mamba_chunk_size`

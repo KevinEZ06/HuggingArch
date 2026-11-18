@@ -5919,7 +5919,8 @@ class TestSweepKeepsKernelParamVariants:
             seen = True
             # Each signature keeps every page ITS backends serve, and no
             # page only another family's backend does.
-            assert blocks == set(served_kv_block_sizes(sig)), (sig, blocks)
+            assert blocks == set(served_kv_block_sizes(sig, gpu="H100-SXM")), (
+                sig, blocks)
         if not seen:
             pytest.skip("model has no paged decode signature")
 

@@ -908,7 +908,10 @@ def deployment_kv_block_size(framework_binding: Optional[Any],
 
     The request's value when it states one; otherwise the framework
     binding's own declared page, because the framework owns the cache
-    manager. `None` when neither says — sglang declares no page (it
+    manager. That declared page is the kernel page (`op_signatures.PAGE_AXIS`),
+    not the scheduler / KV-pool alignment a hybrid model may pick (640, or
+    2176/4352 under int8 KV on vLLM-Ascend): those numbers never key a
+    cell. `None` when neither says — sglang declares no page (it
     resolves one per attention backend) and `THEORY` has no binding and
     runs no kernels. A kernel that reads a paged cache then has no cell
     (the page is an axis of it, `op_signatures.PAGE_AXIS`) instead of one
