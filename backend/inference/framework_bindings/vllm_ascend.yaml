@@ -189,6 +189,32 @@ kernel_dispatches:
     when: {device: [npu], phase: [decode]}
     source_anchor: "The decode path reads the paged cache through a block table at the plugin's page (vllm_ascend/attention/attention_v1.py:1102-1121, page at vllm_ascend/utils.py:1504-1505)"
 
+  # MLA's absorbed W_UK / W_UV, one per-head matmul each, both phases: the
+  # SFA backend folds kv_b_proj into the two sides of the attention and runs
+  # each as one npu_transpose_batchmatmul (vllm_ascend/attention/sfa_v1.py:
+  # 1342 for the query against W_UK_T, :1373 for the output against W_UV).
+  # The node names on the walk are `q_absorbed_nope` and `v_absorbed`.
+  - op: per_head_linear
+    library: vllm_ascend
+    impl_id: npu_transpose_batchmatmul
+    when: {device: [npu]}
+    source_anchor: "AscendSFAImpl._q_proj_and_k_up_proj -> torch_npu.npu_transpose_batchmatmul(q_nope, self.W_UK_T, perm_x1=(1,0,2), perm_x2=(0,1,2), perm_y=(1,0,2)) (vllm_ascend/attention/sfa_v1.py:1337-1348) and _v_up_proj -> the same call on W_UV with perm_x1=(1,0,2), perm_y=(1,0,2) (vllm_ascend/attention/sfa_v1.py:1361-1379); both reached from the layer's forward (vllm_ascend/attention/sfa_v1.py:2079, vllm_ascend/attention/sfa_v1.py:2158). Weights packed at vllm_ascend/attention/sfa_v1.py:945-962"
+
+  # KDA, two kernels by phase: the chunked prefill and the one-token
+  # recurrent step. Not the Triton `chunk_kda_with_fused_gate` the patch
+  # file installs for upstream FLA's import — that is a shim whose body
+  # calls this same AscendC entry.
+  - op: kda
+    library: vllm_ascend
+    impl_id: npu_chunk_kda_fwd
+    when: {device: [npu], phase: [prefill]}
+    source_anchor: "Glm5NextLinearAttention._forward prefill branch -> chunk_kda (vllm_ascend/models/glm5next/kda.py:556-570) -> run_chunk_kda (vllm_ascend/ops/kda.py:60-110) -> fla_npu.ops.ascendc.chunk_kda_fwd, one aclnnChunkKdaFwd (profiler `aclnnChunkKdaFwd_KdaChunkForward_ChunkKdaFwd`, 546 us at 1024 tokens on one die)"
+  - op: kda
+    library: vllm_ascend
+    impl_id: npu_recurrent_kda
+    when: {device: [npu], phase: [decode]}
+    source_anchor: "Glm5NextLinearAttention._forward decode branch -> recurrent_kda (vllm_ascend/models/glm5next/kda.py:541-553) -> run_recurrent_kda (vllm_ascend/ops/kda.py:16-58) -> fla_npu.ops.ascendc.recurrent_kda, one aclnnRecurrentKda (profiler `aclnnRecurrentKda_RecurrentKda_RecurrentKda`, 34 us at B=16 on one die)"
+
 op_implementations:
   # Residual add + RMSNorm: AscendRMSNorm.forward_oot with a residual makes
   # one npu_add_rms_norm_bias call (one aclnnAddRmsNormBias), prefill and

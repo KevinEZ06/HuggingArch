@@ -516,6 +516,227 @@ register(Provider(
 
 
 # ---------------------------------------------------------------------------
+# Per-head matmuls and the delta-rule linear attention.
+#
+# `npu_transpose_batchmatmul` is what the SFA backend runs MLA's absorbed
+# `W_UK` / `W_UV` through (vllm_ascend/attention/sfa_v1.py:1342 and :1373),
+# and the profiler shows 264 of them in a 12-step trace — 12 steps x 11 MLA
+# layers x 2, none in a KDA layer. The fallback those call sites keep for
+# old builds is `torch.bmm` on a transposed operand; measured against it on
+# one die this call agrees at cosine 0.9999988.
+#
+# `chunk_kda_fwd` / `recurrent_kda` are the two halves of KDA, and which one
+# runs is the PHASE: the plugin reads the cache through
+# `fla_npu.ops.ascendc`, chunked in prefill and recurrent in decode
+# (vllm_ascend/models/glm5next/ops/kda.py:16-30 and :60-110). Two providers
+# on one signature, separated by `phases` — the same arrangement vLLM's own
+# `kda` pair and the Ascend `gqa_attention` pair already use.
+# ---------------------------------------------------------------------------
+
+def _tbm_per_head_build(inv: Invocation, env: Env,
+                        inputs: Dict[str, Any]) -> BenchCase:
+    """`npu_transpose_batchmatmul` over `[B, H, S, K] x [H, N, K]`.
+
+    The operator takes its activations token-major and permutes internally,
+    which is why the call passes `perm_x1=(1, 0, 2)`: `[T, H, K]` is read as
+    `[H, T, K]`, the batch dim being the head. `perm_y=(1, 0, 2)` puts the
+    result back token-major. The plugin's call site is handed the tensor in
+    exactly that form, so the reshape below is the layout the kernel was
+    given, not a conversion this build invents.
+    """
+    import torch
+    import torch_npu
+
+    x, w = inputs["x"], inputs["w"]          # [B,H,S,K], [H,N,K]
+    B, H, S, K = x.shape
+    N = w.shape[1]
+    # The op rejects a batch operand dim at or past 65536
+    # (`TRANSPOSE_BMM_MAX_SUPPORTED_DIM`, sfa_v1.py:329), and the internal
+    # transpose needs H*K under it too (sfa_v1.py:1366-1372). A cell past
+    # either is the fallback's launch, not this one's.
+    if B * S >= 65536 or H * K >= 65536:
+        raise NotImplementedError(
+            f"npu_transpose_batchmatmul takes operand dims under 65536; this "
+            f"cell is tokens={B * S}, n_heads*d_reduce={H * K}")
+
+    x_t = x.permute(0, 2, 1, 3).reshape(-1, H, K).contiguous()
+    w_t = w.transpose(1, 2).contiguous()     # [H,N,K] -> [H,K,N]
+
+    def run():
+        return torch_npu.npu_transpose_batchmatmul(
+            x_t, w_t, bias=None, scale=None,
+            perm_x1=(1, 0, 2), perm_x2=(0, 1, 2), perm_y=(1, 0, 2),
+            batch_split_factor=1)
+
+    # [T,H,N] back to the canonical [B,H,S,N] the oracle produces.
+    return BenchCase(
+        run=run,
+        to_canonical=lambda o: o.reshape(B, S, H, N).permute(0, 2, 1, 3))
+
+
+register(Provider(
+    library="vllm_ascend", signature="per_head_gemm",
+    kernel_impl="npu_transpose_batchmatmul", import_name="torch_npu",
+    build=_tbm_per_head_build,
+    serves=KernelSignature(signature="per_head_gemm",
+                           activation=_ASCEND_FLOAT, weight=_ASCEND_FLOAT,
+                           output=_ASCEND_FLOAT),
+))
+
+
+def _kda_bsnd(inputs: Dict[str, Any]):
+    """The cell's operands in the layout the AscendC kernels take.
+
+    The cell states `q` as `[B, s_query, n_heads, d]` — BSND, which is what
+    `layout="BSND"` means to `fla_npu` — while the ENGINE layout in the
+    catalog is `[B, n_heads, s_query, d]`, the shape the framework emits.
+    A provider is handed the CANONICAL contract, so nothing is transposed
+    here: the kernels' own layout argument says which one they want.
+
+    The BATCH goes too, and that is the one thing this build does reshape.
+    Both entry points are varlen: `cu_seqlens` says where each sequence
+    starts, and the plugin hands them `[1, tokens, heads, d]` with one
+    leading dim whatever the batch (`models/glm5next/kda.py:534-570`
+    reshapes `q_ns` to `[1, -1, h, d]`). A cell stating `[B, s, h, d]` is
+    the same tokens with the batch still split out, so it folds here and
+    `cu_seqlens` / the state slots carry `B` instead — which is the shape
+    the operator accepts: `[B, s, …]` is refused with ACLNN 161002.
+    """
+    import torch
+    B, S = inputs["q"].shape[0], inputs["q"].shape[1]
+    q, k, v = (t.reshape(1, B * S, t.shape[2], t.shape[3]).contiguous()
+               for t in (inputs["q"], inputs["k"], inputs["v"]))
+    g = inputs["g"].reshape(1, B * S, inputs["g"].shape[2],
+                            inputs["g"].shape[3]).float().contiguous()
+    beta = inputs["beta"].reshape(1, B * S, inputs["beta"].shape[2]).contiguous()
+    # One sequence per batch row, laid end to end.
+    cu = [i * S for i in range(B + 1)]
+    return q, k, v, g, beta, cu, B, S
+
+
+def _chunk_kda_build(inv: Invocation, env: Env,
+                     inputs: Dict[str, Any]) -> BenchCase:
+    """`chunk_kda_fwd`: the prefill half, one launch over the whole block.
+
+    The gate arrives ALREADY FORMED (`g` is the per-channel log decay the
+    walk's gate chain produced) and `beta` already activated, so this is the
+    span with `use_gate_in_kernel=False` — not the fused-gate variant the
+    plugin's own call site runs, which is a different span
+    (`fused_kda_gate`) and a different provider. The q/k norm IS inside, as
+    the oracle applies it (`refs._delta_rule_scan` normalises both), and as
+    the device's recurrent half takes it.
+
+    The chunk size is the kernel's own 64 (constant in the plugin's
+    `run_chunk_kda`), not an axis: it does not divide the query block in a
+    way the cell's identity distinguishes, and the plugin passes the
+    constant.
+    """
+    from fla_npu.ops.ascendc import chunk_kda_fwd
+
+    q, k, v, g, beta, cu, B, S = _kda_bsnd(inputs)
+    state = inputs["initial_state"].float().contiguous()
+    scale = float(q.shape[-1]) ** -0.5
+
+    def run():
+        return chunk_kda_fwd(
+            q, k, v, g, beta, scale, 64,
+            layout="BSND", initial_state=state, output_final_state=True,
+            cu_seqlens=cu, safe_gate=False, use_qk_l2norm_in_kernel=True,
+            return_intermediate_states=False, state_v_first=True)
+
+    return BenchCase(
+        run=run,
+        # `(o, final_state, ...)`; the cell is the output.
+        to_canonical=lambda out: (
+            out[0] if isinstance(out, (tuple, list)) else out).float())
+
+
+register(Provider(
+    library="vllm_ascend", signature="kda",
+    kernel_impl="npu_chunk_kda_fwd", import_name="fla_npu",
+    build=_chunk_kda_build,
+    serves=KernelSignature(signature="kda", phases=("prefill",),
+                           activation=_ASCEND_FLOAT, takes_state=True),
+))
+
+
+#: Tokens per sequence the recurrent step takes on the path this provider
+#: models: exactly one. The plugin's own constant is 8
+#: (`models/glm5next/kda.py:151`, `ops/kda.py:11`), but that is the bound on
+#: a SPECULATIVE step — `num_spec + 1` tokens per sequence, whose
+#: `cu_seqlens` are built from the accepted-token counts and whose state
+#: slots advance per accepted token. Measured on a die, the plain path takes
+#: one token per sequence and refuses anything else with ACLNN 161002
+#: whether the axis is stated as `s_query` or as a longer `cu_seqlens`
+#: (B=16 with s_query 1 runs at 68.5 us; the same cell at 4 raises). Rather
+#: than model the speculative variant's bookkeeping, this declines above
+#: one, so a cell it cannot launch is never measured as if it could.
+_KDA_RECURRENT_TOKENS = 1
+
+
+def _recurrent_kda_build(inv: Invocation, env: Env,
+                         inputs: Dict[str, Any]) -> BenchCase:
+    """`recurrent_kda`: the decode half, one launch for the step.
+
+    Two shape facts this build settles, both read off the plugin's own call
+    site rather than guessed:
+
+      * the state is a POOL plus one slot index per sequence, not a dense
+        `[N, H, V, K]` — `run_recurrent_kda` hands the cache pool and
+        `ssm_state_indices` through (ops/kda.py:16-30), which is sglang's
+        shape of this call and not vLLM's chunked one (`_initial_state_args`
+        records that split). The cell's state is one sequence's worth, so
+        the pool is `[B+1, H, V, K]` with slot 0 unused and `B` slots used —
+        exactly what the GPU provider for this span builds.
+      * `state_v_first=True`: the plugin's state is `[V, K]`, the cell's
+        `[d_lin_v_head, d_lin_k_head]`.
+    """
+    import torch
+    from fla_npu.ops.ascendc import recurrent_kda
+
+    q, k, v, g, beta, cu_list, B, S = _kda_bsnd(inputs)
+    if S != _KDA_RECURRENT_TOKENS:
+        raise NotImplementedError(
+            f"the recurrent step takes {_KDA_RECURRENT_TOKENS} token per "
+            f"sequence and this cell has s_query={S}. A whole block is the "
+            f"chunked kernel's — the prefill provider on this signature. "
+            f"The plugin's own 8-token bound is its SPECULATIVE step, whose "
+            f"cu_seqlens and state slots follow the accepted-token counts "
+            f"and are not this launch")
+    _one, _tokens, HV, V = v.shape
+    K = q.shape[-1]
+    dense = inputs["initial_state"].float()
+    pool = torch.zeros(B + 1, HV, V, K, dtype=torch.float32,
+                       device=dense.device)
+    pool[1:] = dense
+    slots = torch.arange(1, B + 1, dtype=torch.int32, device=dense.device)
+    cu = torch.tensor(cu_list, dtype=torch.int32, device=dense.device)
+    scale = float(K) ** -0.5
+
+    def run():
+        return recurrent_kda(
+            q, k, v, g, beta, pool, cu_seqlens=cu,
+            ssm_state_indices=slots, layout="BSND", scale=scale,
+            output_final_state=False, inplace_final_state=True,
+            state_v_first=True, use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=False, safe_gate=False)
+
+    return BenchCase(
+        run=run,
+        to_canonical=lambda out: (
+            out[0] if isinstance(out, (tuple, list)) else out).float())
+
+
+register(Provider(
+    library="vllm_ascend", signature="kda",
+    kernel_impl="npu_recurrent_kda", import_name="fla_npu",
+    build=_recurrent_kda_build,
+    serves=KernelSignature(signature="kda", phases=("decode",),
+                           activation=_ASCEND_FLOAT, takes_state=True),
+))
+
+
+# ---------------------------------------------------------------------------
 # BF16 primitives and the bound fusions.
 # ---------------------------------------------------------------------------
 
