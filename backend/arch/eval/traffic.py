@@ -850,12 +850,13 @@ def declared_output(node: Identified, program: Any = None,
         # own reads are of other members, never of the launch's ports.
         if not inside and launch_of and node.uid in launch_of:
             launch = launch_of[node.uid]
-            if node.uid not in launch.output_ports:
+            published = launch.published_port(node.uid, port)
+            if published is None:
                 raise ValueError(
                     f"node {node.uid} is read outside the launch "
                     f"{launch.op!r} that absorbed it, which publishes no "
-                    f"port for it")
-            port = launch.output_ports[node.uid]
+                    f"port for its {port or 'out'!r} output")
+            port = published
             node = launch
         fmt = _written_formats(node, program).get(port or "")
         if fmt is not None:
@@ -876,11 +877,13 @@ def declared_output(node: Identified, program: Any = None,
             # the member's that the launch publishes there, when that
             # member's own declaration says how it is written.
             want = port or ""
-            for member_uid, published in node.output_ports.items():
+            for member_uid, origin, published in node.publishers():
                 member = (program.by_uid(member_uid)
                           if program is not None else None)
                 if (published or "") == want and member is not None:
-                    found = written(member, inside=True)
+                    found = written(member,
+                                    "" if origin in ("", "out") else origin,
+                                    inside=True)
                     if found is not None:
                         return found
         if port and declared:
@@ -2652,9 +2655,9 @@ def produced_dtype(src, port, precision: Any, program) -> str:
     activation dtype (`ResolvedPrecision.edge_dtype`)."""
     if src is None:
         return precision.edge_dtype(None, "")
-    ports = src.output_ports if isinstance(src, FusedNode) else {}
+    publishers = src.publishers() if isinstance(src, FusedNode) else ()
     want = port or "out"
-    for origin, name in ports.items():
+    for origin, _origin_port, name in publishers:
         if (name or "out") == want:
             member = program.by_uid(origin)
             if member is None:
@@ -2754,7 +2757,8 @@ def _settle_conversions(out: Dict[int, Traffic],
         if node is None:
             return (read.producer, read.port)
         # The launch renames its members' outputs to its own ports.
-        return (launch, node.output_ports.get(read.producer, read.port))
+        published = node.published_port(read.producer, read.port)
+        return (launch, read.port if published is None else published)
 
     for uid, (conversion, edge) in conversions.items():
         traffic = out.get(uid)
@@ -2796,10 +2800,11 @@ def _written_formats(node: Any, program: Any) -> Dict[str, Any]:
                 f"writes is read off its members, and no program was given "
                 f"to find them in")
         out: Dict[str, Any] = {}
-        for uid, port in node.output_ports.items():
+        for uid, origin, port in node.publishers():
             member = program.by_uid(uid)
             if member is not None:
-                found = _written_formats(member, program).get("")
+                found = _written_formats(member, program).get(
+                    "" if origin in ("", "out") else origin)
                 if found is not None:
                     out[port or ""] = found
         return out

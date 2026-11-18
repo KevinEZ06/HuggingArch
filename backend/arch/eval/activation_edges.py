@@ -31,19 +31,21 @@ def leaf_input_ids(program, rewrite: Optional[Rewrite] = None) -> Dict[int, List
     """
     rewrite = rewrite or Rewrite()
 
-    absorbed_to: Dict[int, Tuple[Any, str]] = {}
+    # Keyed by the member AND the port of its own output a reader names:
+    # a launch may publish two of one member's tensors (`split.post` and
+    # `split.comb`), and they land on two different ports.
+    absorbed_to: Dict[Tuple[int, str], Tuple[Any, str]] = {}
     for fused_uid in (rewrite.origins or {}):
         fused = program.by_uid(fused_uid)
         if fused is None:
             continue
         if not isinstance(fused, FusedNode):
             continue
-        ports = fused.output_ports or {}
-        for origin, port in ports.items():
-            absorbed_to[origin] = (fused, port or "out")
+        for origin, origin_port, port in fused.publishers():
+            absorbed_to[(origin, origin_port or "out")] = (fused, port or "out")
         sink = fused.sink
-        if sink is not None and sink not in absorbed_to:
-            absorbed_to[sink] = (fused, "out")
+        if sink is not None and (sink, "out") not in absorbed_to:
+            absorbed_to[(sink, "out")] = (fused, "out")
 
     out: Dict[int, List] = {}
     for node in program.nodes():
@@ -55,7 +57,8 @@ def leaf_input_ids(program, rewrite: Optional[Rewrite] = None) -> Dict[int, List
                 inputs.append(ref.external_sid)
                 continue
             producer, port = program.output_leaf(ref.src, ref.port or "out")
-            published = absorbed_to.get(producer.uid)
+            published = (absorbed_to.get((producer.uid, port or "out"))
+                         or absorbed_to.get((producer.uid, "out")))
             if published is not None:
                 producer, port = published
             inputs.append(tensor_id(producer.uid, port))
