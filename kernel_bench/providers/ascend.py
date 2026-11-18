@@ -341,6 +341,181 @@ register(Provider(
 
 
 # ---------------------------------------------------------------------------
+# The hyper-connection seam, as vLLM-Ascend runs it for GLM-5.3-Flash.
+#
+# Both halves live in the plugin's own compiled extension rather than in
+# `torch_npu`, so reaching them needs two things that no other provider
+# here needs, and both are done once in `_c_ascend()`:
+#
+#   * the extension module has to be imported — `torch.ops._C_ascend` is an
+#     empty namespace until `vllm_ascend.vllm_ascend_C` is loaded;
+#   * CANN has to be told where the plugin's custom operator package is.
+#     The plugin prepends it to `ASCEND_CUSTOM_OPP_PATH` itself
+#     (`vllm_ascend/utils.py:455-458`); a bare process that skips that
+#     prepend gets the op registered and then "aclnnHcPre ... not in
+#     libopapi.so" when it runs, which is a loud failure rather than a
+#     wrong number, but it is not the kernel declining either.
+#
+# `torch_npu.npu_mhc_pre` / `npu_mhc_post` exist and take the same maths,
+# and are NOT used: on this CANN and this chip the first of them
+# segfaults the process. The plugin calls the `_C_ascend` pair, which is
+# also what the profiler shows (`HcPre` / `HcPost`), so that is what gets
+# measured.
+# ---------------------------------------------------------------------------
+
+#: The plugin's custom operator package, relative to its own package dir.
+#: `vllm_ascend/utils.py:455-458` prepends exactly this to
+#: `ASCEND_CUSTOM_OPP_PATH`, and the plugin does it at import time —
+#: before anything touches a device.
+_CUSTOM_OPP_REL = ("_cann_ops_custom", "vendors", "custom_transformer")
+
+#: `ASCEND_CUSTOM_OPP_PATH` as this process found it, read at import of this
+#: module — which is before any provider runs and before the first device
+#: call. That is the only value that says anything: importing
+#: `vllm_ascend` prepends the plugin's own package to the variable, so a
+#: check made later always finds it and CANN has already read the variable
+#: it had at initialisation.
+_OPP_AT_IMPORT = tuple(
+    p for p in __import__("os").environ.get(
+        "ASCEND_CUSTOM_OPP_PATH", "").split(__import__("os").pathsep) if p)
+
+
+def _c_ascend():
+    """`torch.ops._C_ascend`, with the plugin's extension loaded.
+
+    Two things have to be true before either hc op will run, and only one
+    of them can be arranged from here:
+
+      * the extension module must be imported — `torch.ops._C_ascend` is an
+        empty namespace until `vllm_ascend.vllm_ascend_C` is loaded. Done
+        below;
+      * CANN must have the plugin's operator package on its search path,
+        and it reads `ASCEND_CUSTOM_OPP_PATH` **once, at initialisation**.
+        Setting it from a provider that runs after the first device call is
+        too late: the op registers, then fails at run time with "The tiling
+        function does not exist" (EZ1008) — measured, not inferred. So this
+        CHECKS the variable and refuses, rather than setting it and
+        returning a launch that cannot run. The box profile exports it
+        (`kernel_bench/envs/boxes/ascend-910c-a3-cann82.toml`), which is
+        where a process-wide environment fact belongs.
+    """
+    import os
+
+    import torch
+    import vllm_ascend
+
+    vendor = os.path.join(os.path.dirname(vllm_ascend.__file__),
+                          *_CUSTOM_OPP_REL)
+    # Judged against what the PROCESS inherited, not what is there now:
+    # the `import vllm_ascend` two lines up added `vendor` to the live
+    # variable whether or not CANN ever saw it.
+    if not any(p.rstrip(os.sep) == vendor.rstrip(os.sep)
+               for p in _OPP_AT_IMPORT):
+        raise NotImplementedError(
+            f"the plugin's custom operator package is not on "
+            f"ASCEND_CUSTOM_OPP_PATH, and CANN reads that variable once at "
+            f"initialisation, so this process cannot add it: export "
+            f"ASCEND_CUSTOM_OPP_PATH={vendor} before starting the run "
+            f"(the box profile does)")
+    import vllm_ascend.vllm_ascend_C  # noqa: F401  (registers the ops)
+    return torch.ops._C_ascend
+
+
+def _mhc_pre_build(inv: Invocation, env: Env,
+                   inputs: Dict[str, Any]) -> BenchCase:
+    """`npu_hc_pre_v2`: the whole pre-mix, one launch.
+
+    The kernel takes `[T, n, D]` — one token per row, never a batch dim,
+    which is the layout the plugin hands it (`model.py:425`: the model's
+    stream is `[tokens, n, d]` throughout). The signature writes the axes
+    as `[B, s_query, n, d]`, which the walk folds into `[tokens, n, d]`
+    whenever B is 1, so both ranks reach this build; whatever is not the
+    last two axes is the token axis.
+
+    The three scalars that are not axes ride on the inputs, where every
+    consumer of this span reads them (`refs._hc_scalars`); the Sinkhorn
+    round count is an axis and comes from `dims`, as the scan chunk does
+    for `mamba2_scan`.
+    """
+    import torch
+
+    ops = _c_ascend()
+    residual = inputs["residual"]
+    n, d = residual.shape[-2], residual.shape[-1]
+    x = residual.reshape(-1, n, d).contiguous()
+    fn = inputs["fn"].float().contiguous()
+    scale = inputs["scale"].float().contiguous()
+    base = inputs["base"].float().contiguous()
+    iters = int(inv.dims["sinkhorn_repeat"])
+    rms_eps = float(inputs["rms_eps"])
+    hc_eps = float(inputs["hc_pre_eps"])
+
+    def run():
+        return ops.npu_hc_pre_v2(x, fn, scale, base, n, iters,
+                                 rms_eps, hc_eps)
+
+    # The launch writes three tensors and `_cross_check` compares one, so
+    # they are folded side by side exactly as the oracle folds them
+    # (`refs._hc_pre_reference`). `post` arrives `[T, n]` and `comb`
+    # `[T, n, n]`, both fp32.
+    return BenchCase(
+        run=run,
+        to_canonical=lambda o: torch.cat(
+            [o[0].float(), o[1].float(), o[2].float().flatten(1)], dim=-1),
+    )
+
+
+register(Provider(
+    library="vllm_ascend", signature="mhc_pre",
+    kernel_impl="npu_hc_pre_v2", import_name="vllm_ascend",
+    build=_mhc_pre_build, fused_op="mhc_pre",
+    serves=KernelSignature(signature="mhc_pre", activation=_ASCEND_FLOAT),
+))
+
+
+def _mhc_post_build(inv: Invocation, env: Env,
+                    inputs: Dict[str, Any]) -> BenchCase:
+    """`npu_hc_post`: the closing post-mix, one launch.
+
+    The plugin calls it with a leading singleton on every operand and
+    squeezes it off the result (`model.py:523-525`), so the cell's
+    `[B, s_query, ...]` tensors fold to `[T, ...]` and take that singleton
+    back — the same tensors, in the layout the kernel was registered for.
+    `post` reaches the cell `[T, n]`; the plugin carries a trailing 1 on it
+    between the two halves and drops it here, so the call takes it flat.
+    """
+    ops = _c_ascend()
+    sublayer, residual = inputs["sublayer"], inputs["residual"]
+    post, comb = inputs["post"], inputs["comb"]
+    # Everything but the last (one for the sublayer, two for the residual
+    # and the cross-mix) axes is the token axis, as in the pre-mix; the
+    # plugin's leading singleton is put back here because that is the rank
+    # the op was registered for.
+    x = sublayer.reshape(1, -1, sublayer.shape[-1]).contiguous()
+    res = residual.reshape(1, -1, residual.shape[-2],
+                           residual.shape[-1]).contiguous()
+    gate = post.reshape(1, -1, post.shape[-1]).float().contiguous()
+    mix = comb.reshape(1, -1, comb.shape[-2],
+                       comb.shape[-1]).float().contiguous()
+
+    def run():
+        return ops.npu_hc_post(x, res, gate, mix)
+
+    return BenchCase(
+        run=run,
+        to_canonical=lambda o: o.squeeze(0).float(),
+    )
+
+
+register(Provider(
+    library="vllm_ascend", signature="mhc_post",
+    kernel_impl="npu_hc_post", import_name="vllm_ascend",
+    build=_mhc_post_build, fused_op="mhc_post",
+    serves=KernelSignature(signature="mhc_post", activation=_ASCEND_FLOAT),
+))
+
+
+# ---------------------------------------------------------------------------
 # BF16 primitives and the bound fusions.
 # ---------------------------------------------------------------------------
 

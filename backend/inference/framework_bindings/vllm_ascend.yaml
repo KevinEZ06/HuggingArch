@@ -37,6 +37,17 @@ kv_block_size: 128
 ssm_chunk_size:
   from_config: [mamba_chunk_size, chunk_size]
 
+# The plugin reads the Sinkhorn round count the hyper-connection pre-mix
+# kernel is handed from the checkpoint config, first field present wins:
+# `Glm5NextConfig` folds `hc_sinkhorn_iters` into `mhc_sinkhorn_iterations`
+# (vllm_ascend/models/glm5next/config.py:89) and the model hands that to
+# `npu_hc_pre_v2` as its fifth argument
+# (vllm_ascend/models/glm5next/model.py:505). The count is an axis of the
+# `mhc_pre` cell on the device's own numbers: at T=1024 the same launch
+# takes 119.2 us at 20 rounds and 164.0 us at 100.
+hc_sinkhorn_iters:
+  from_config: [mhc_sinkhorn_iterations, hc_sinkhorn_iters]
+
 # The launches the plugin selects for a quantised matmul, first viable wins
 # (a candidate whose `mma_dtypes` all have peak columns on the card).
 precision_launches:
@@ -239,5 +250,32 @@ op_implementations:
   # Gated DeltaNet gates: one Triton launch for g and beta over the whole
   # batch, both phases. beta is written at the input dtype while the plan
   # bills fp32 — an over-statement of bytes, left as is.
+  # The hyper-connection seam, both halves, one launch each. GLM-5.3-Flash
+  # is the one model here that has it.
+  #
+  # `mhc_pre` takes the WHOLE pre-mix, the Sinkhorn split included — which
+  # is where this binding differs from the CUDA ones. There the split stays
+  # a billed node between `mhc_pre_gemm` and `mhc_pre_big_fuse`
+  # (`fusion_plans/mhc_pre_big_fuse.yaml` states that residual); here the
+  # kernel does all of it, and the profiler agrees: one `HcPre` per seam,
+  # 126.6 us at 1024 tokens against a launch floor near 35, where the
+  # seven primitives would be seven launches.
+  #
+  # The sublayer RMSNorm is NOT absorbed: the plugin calls `npu_rms_norm`
+  # on the launch's output (vllm_ascend/models/glm5next/model.py:513) and the trace shows its own
+  # `RmsNorm` kernel beside `HcPre`. It stays a node, as the plan does.
+  mhc_pre:
+    crosses: component
+    when:
+      architectures: [Glm5NextForConditionalGeneration]
+      device: [npu]
+    source_anchor: "Glm5NextDecoderLayer.hc_pre -> torch.ops._C_ascend.npu_hc_pre_v2(x, hc_fn, hc_scale, hc_base, n, mhc_sinkhorn_iterations, rms_norm_eps, hc_eps) (vllm_ascend/models/glm5next/model.py:499-507), registered npu_hc_pre_v2_npu -> run_hc_pre_fusion (csrc/torch_binding.cpp:3255-3264); called once per sublayer seam from the layer's forward (vllm_ascend/models/glm5next/model.py:425-446) and through hc_post_pre (vllm_ascend/models/glm5next/model.py:536-545)"
+  mhc_post:
+    crosses: component
+    when:
+      architectures: [Glm5NextForConditionalGeneration]
+      device: [npu]
+    source_anchor: "Glm5NextDecoderLayer.hc_post -> torch.ops._C_ascend.npu_hc_post(x, residual, post, comb) (vllm_ascend/models/glm5next/model.py:523-525), registered npu_hc_post_npu -> EXEC_NPU_CMD(aclnnHcPost) (csrc/torch_binding.cpp:1434); the last layer materialises its own (vllm_ascend/models/glm5next/model.py:484) and every other defers it into the next layer's pre (vllm_ascend/models/glm5next/model.py:536)"
+
   fused_gdn_gating:
     source_anchor: "fused_gdn_gating_patch (vllm_ascend/ops/triton/fused_gdn_gating.py:59-99, kernel vllm_ascend/ops/triton/fused_gdn_gating.py:14-56) via DeviceOperator.fused_gdn_gating (vllm_ascend/device/device_op.py:940-942), from AscendGatedDeltaNetAttention._forward_core (vllm_ascend/ops/gdn.py:680)"

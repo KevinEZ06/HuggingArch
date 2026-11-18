@@ -1372,7 +1372,8 @@ class RowIdentity:
 
     def __init__(self, analysis: Any, *,
                  kv_block_size: Optional[int] = None,
-                 ssm_chunk_size: Optional[int] = None) -> None:
+                 ssm_chunk_size: Optional[int] = None,
+                 sinkhorn_iters: Optional[int] = None) -> None:
         # The serving choices a cell may be keyed on, which the deployment
         # makes and the model does not: the paged-KV page (`PAGE_AXIS`; the
         # framework binding states it and a request may override it) and the
@@ -1382,7 +1383,8 @@ class RowIdentity:
         # None is not stated: a cell that declares the axis then has no
         # identity, rather than one keyed on a guessed value.
         self._served = {axis: int(value) for axis, value in (
-            (PAGE_AXIS, kv_block_size), ("ssm_chunk_size", ssm_chunk_size))
+            (PAGE_AXIS, kv_block_size), ("ssm_chunk_size", ssm_chunk_size),
+            ("sinkhorn_repeat", sinkhorn_iters))
             if value is not None}
         self._leaves = gqa_leaf_variants(analysis)
         self._result = analysis

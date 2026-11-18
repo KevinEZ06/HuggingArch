@@ -772,11 +772,14 @@ def point_keys(cell: Any, rows: Sequence[Mapping[str, Any]],
     binding = deployment.framework_binding
     served = (deployment.kv_block_size,
               None if binding is None else cell.analysis.program
-              .scan_chunk_size(binding.ssm_chunk_size_from))
+              .scan_chunk_size(binding.ssm_chunk_size_from),
+              None if binding is None else cell.analysis.program
+              .sinkhorn_iters(binding.hc_sinkhorn_iters_from))
     identity = cell.identities.get(served)
     if identity is None:
         identity = cell.identities[served] = RowIdentity(
-            cell, kv_block_size=served[0], ssm_chunk_size=served[1])
+            cell, kv_block_size=served[0], ssm_chunk_size=served[1],
+            sinkhorn_iters=served[2])
     return [point_row_of(row, identity, deployment, model_id=model_id,
                          spec_hash=spec_hash) for row in rows]
 

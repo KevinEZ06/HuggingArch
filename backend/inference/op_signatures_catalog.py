@@ -3204,6 +3204,42 @@ register_signature(OpSignature(
 ))
 
 register_signature(OpSignature(
+    name="mhc_pre",
+    binds_ops=('mhc_pre',),
+    # The seam's opening, whole: the multi-copy residual, the mix
+    # projection and the affine of the split. `pre` never leaves the
+    # launch — it weights the copies on the way out — so it is no operand
+    # and no port; `post` and `comb` are ports the post-mix reads.
+    inputs=(_HC_RESIDUAL, _HC_FN,
+            TensorLayout("scale", (3,), role="metadata"),
+            TensorLayout("base", (_HC_MIX,), role="metadata")),
+    engine_inputs=((0, _HC_RESIDUAL_ENGINE), (1, _HC_FN)),
+    # The copy count is an axis no tensor of the SPLIT carries — the mix
+    # vector is one `n²+2n` row per token — and the Sinkhorn rounds are
+    # work: the kernel alternates a row and a column normalisation over
+    # the `n_hidden_copies²` block that many times. Measured on a 910C
+    # die at T=1024, 20 rounds against 100 is 119.2 us against 164.0, so
+    # two iteration counts are two measurements and the count is in the
+    # identity. The deployment's value is the checkpoint's, read at the
+    # fields the framework binding names
+    # (`FrameworkBinding.hc_sinkhorn_iters_from`).
+    structural_axes=("n_hidden_copies", "sinkhorn_repeat"),
+    dtype_slots=("activation",),
+    doc=("Hyper-connection PRE-mix, whole, as ONE launch: flatten the "
+         "copies, RMS-normalise the flat stream unscaled, project it onto "
+         "the mix vector, split that into the `pre` / `post` / `comb` "
+         "coefficients with the Sinkhorn projection on the cross-mix, and "
+         "reduce the copies under `pre`. Writes the sublayer's input plus "
+         "the two coefficient sets its closing post-mix will read. "
+         "vLLM-Ascend `torch.ops._C_ascend.npu_hc_pre_v2` (profiler "
+         "`HcPre`). The sublayer RMSNorm after it is NOT inside: the "
+         "plugin calls `npu_rms_norm` separately and the profiler shows "
+         "its own kernel. The GPU frameworks cut this span differently "
+         "— `mhc_pre_gemm` plus `mhc_pre_big_fuse`, with the split left "
+         "outside as a billed node."),
+))
+
+register_signature(OpSignature(
     name="mhc_pre_gemm",
     # `mhc_pre_gemm_stream` is the same launch spelled on a stream that is
     # already flat: DeepSeek-V4.1 carries its copies across block boundaries

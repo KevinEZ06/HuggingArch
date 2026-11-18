@@ -5432,6 +5432,76 @@ register_ref("mhc_pre_gemm",
              RefSpec(_hc_pre_gemm_inputs, _hc_pre_gemm_reference))
 
 
+def _hc_pre_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
+    """The whole pre-mix's cell: the multi-copy residual, the mix
+    projection, and the affine of the split. `scale` and `base` are drawn
+    rather than set to the identity parameterisation the big fuse uses,
+    because this launch applies the Sinkhorn rounds to the result and a
+    degenerate cross-mix would make them a no-op — the rounds are an axis
+    of this cell and have to do their work."""
+    import torch
+    out = {
+        "residual": torch.randn(*_shape(inv, "residual"),
+                                dtype=_dtype(inv.dtype), device=device,
+                                generator=gen),
+        "fn": _hc_fn(inv, device, gen),
+        "scale": torch.rand(*_shape(inv, "scale"), dtype=torch.float32,
+                            device=device, generator=gen) + 0.5,
+        "base": 0.1 * torch.randn(*_shape(inv, "base"), dtype=torch.float32,
+                                  device=device, generator=gen),
+    }
+    out.update(_hc_scalars())
+    # The rounds the cell is keyed at, not the span's default: this axis is
+    # in the identity (`OpSignature.structural_axes`), so the oracle runs
+    # the count the row was measured at.
+    out["sinkhorn_repeat"] = int(inv.dims["sinkhorn_repeat"])
+    return out
+
+
+def hc_pre_mix(inputs: Dict[str, Any]) -> Any:
+    """The hyper-connection pre-mix, whole — vLLM-Ascend's `npu_hc_pre_v2`.
+
+    The chain the component walks as seven primitives, in fp32:
+
+        flat   = flatten(residual)
+        mixes  = fn @ rms_unscaled(flat)
+        pre, post, comb = split_sinkhorn(mixes, scale, base)
+        y      = Σ_c pre[c]·residual[c]
+
+    Returns the three tensors the launch publishes — the sublayer input and
+    the two coefficient sets — in the order the fused node's ports list
+    them. `pre` stays inside: it is consumed by the reduce on the last line
+    and no reader outside the launch has it.
+    """
+    import torch
+    residual = inputs["residual"].float()
+    flat = residual.reshape(residual.shape[0], -1)
+    mixes = hc_normalised_mixes(flat, inputs["fn"], float(inputs["rms_eps"]))
+    pre, post, comb = hc_split_coefficients(
+        mixes, inputs["scale"].float(), inputs["base"].float(),
+        int(residual.shape[-2]),
+        pre_eps=float(inputs["hc_pre_eps"]),
+        post_mult=float(inputs["hc_post_mult_value"]),
+        sinkhorn_eps=float(inputs["hc_sinkhorn_eps"]),
+        sinkhorn_iters=int(inputs["sinkhorn_repeat"]))
+    y = (residual * pre.unsqueeze(-1)).sum(dim=-2)
+    return y, post, comb
+
+
+def _hc_pre_reference(inputs: Dict[str, Any]) -> Any:
+    """The oracle's single tensor: the three outputs folded the way the
+    provider's `to_canonical` folds them, because `_cross_check` compares
+    one tensor and a launch that writes three has to put them side by
+    side to be checked at all (`quantise_activation` folds a pair the
+    same way)."""
+    import torch
+    y, post, comb = hc_pre_mix(inputs)
+    return torch.cat([y, post, comb.flatten(1)], dim=-1)
+
+
+register_ref("mhc_pre", RefSpec(_hc_pre_inputs, _hc_pre_reference))
+
+
 def _hc_big_fuse_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
     """The epilogue's cell: the projection's dots and their sum-of-squares
     partner, the scale and base of the mix split, the residual it reduces and

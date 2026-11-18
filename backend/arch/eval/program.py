@@ -1081,6 +1081,15 @@ class Program:
             return ()
         return tuple(str(n) for n in config.get("architectures") or ())
 
+    def sinkhorn_iters(self, fields: Tuple[str, ...]) -> Optional[int]:
+        """The hyper-connection Sinkhorn round count the checkpoint config
+        states, at the first of `fields` it has — the same contract as
+        `scan_chunk_size` above, for the other kernel argument that keys a
+        cell (`mhc_pre`). None when the config states none of them, and for
+        a framework that declares no fields at all."""
+        return self._config_int(fields, "the hyper-connection Sinkhorn "
+                                        "round count")
+
     def scan_chunk_size(self, fields: Tuple[str, ...]) -> Optional[int]:
         """The Mamba-2 scan chunk the checkpoint config states, at the first
         of `fields` it has — the order a serving framework reads them in,
@@ -1090,6 +1099,15 @@ class Program:
         a graph fact, so no dim binds it. None when the config states none
         of them: no framework fallback stands in. A field that is present
         but not a positive integer is refused, not skipped."""
+        return self._config_int(fields, "the Mamba-2 scan chunk")
+
+    def _config_int(self, fields: Tuple[str, ...],
+                    what: str) -> Optional[int]:
+        """The positive integer the checkpoint config states at the first of
+        `fields` it has. The one reader for every kernel ARGUMENT that keys
+        a cell — the scan chunk and the Sinkhorn rounds — because they differ
+        only in which fields they read and what to call the value when it is
+        malformed."""
         config = self.resolved.config
         if not isinstance(config, dict):
             return None
@@ -1099,8 +1117,8 @@ class Program:
                 continue
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(
-                    f"the checkpoint config's `{name}` (the Mamba-2 scan "
-                    f"chunk) is {value!r}, not a positive integer")
+                    f"the checkpoint config's `{name}` ({what}) is "
+                    f"{value!r}, not a positive integer")
             return int(value)
         return None
 

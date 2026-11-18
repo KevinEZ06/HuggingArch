@@ -125,6 +125,7 @@ class TestShippedSchemesLoad(unittest.TestCase):
                 "mhc_fused_post_pre",
                 "mhc_mega_post_pre",
                 "mhc_post",
+                "mhc_pre",
                 "mhc_pre_big_fuse",
                 "mhc_pre_gemm",
                 "mhc_pre_gemm_stream",
@@ -376,7 +377,11 @@ class TestShippedBindingsLoad(unittest.TestCase):
                 "fused_inv_rope",
                 # The hyper-connection sublayer boundary, one plan per launch,
                 # plus DeepSeek-V4.1's spelling of the projection over the
-                # already-flattened stream.
+                # already-flattened stream. NOT `mhc_pre`: that plan takes
+                # the whole pre, Sinkhorn split included, which is the
+                # Ascend kernel's span and not one vLLM makes — it cuts the
+                # same boundary as `mhc_pre_gemm` + `mhc_pre_big_fuse` with
+                # the split left standing between them.
                 "mhc_post",
                 "mhc_pre_gemm",
                 "mhc_pre_gemm_stream",
@@ -717,7 +722,8 @@ class TestShippedBindingsLoad(unittest.TestCase):
             FrameworkBinding.KEYS,
             {"framework", "audited_at", "devices", "op_implementations",
              "kv_block_size",
-             "ssm_chunk_size", "collectives", "precision_launches",
+             "ssm_chunk_size", "hc_sinkhorn_iters",
+             "collectives", "precision_launches",
              "edge_dtypes", "kernel_dispatches"})
         self.assertEqual(set(CollectiveRung._fields), {
             "algorithm", "max_bytes", "max_bytes_times_world",

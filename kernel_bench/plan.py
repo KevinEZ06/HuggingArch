@@ -778,6 +778,14 @@ def _build_jobs_over_points(
                                and "ssm_chunk_size" in _signature.cell_dims
                                and ar.analysis.program.scan_chunk_size(
                                    binding.ssm_chunk_size_from) is None) else
+                           f"{sig!r} rounds its Sinkhorn projection and the "
+                           f"checkpoint config states none of the fields "
+                           f"{binding.framework} reads the round count from "
+                           f"{list(binding.hc_sinkhorn_iters_from)}"
+                           if (_signature is not None
+                               and "sinkhorn_repeat" in _signature.cell_dims
+                               and ar.analysis.program.sinkhorn_iters(
+                                   binding.hc_sinkhorn_iters_from) is None) else
                            f"no shape projection for signature {sig!r} "
                            f"(shape_in={shp_in}) — would fabricate model-wide dims")
                     note = f"{op} [{point.aggregation_id or op}]: {why}"

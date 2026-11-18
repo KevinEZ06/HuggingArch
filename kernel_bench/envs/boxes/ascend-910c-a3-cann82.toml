@@ -31,5 +31,13 @@ python = "3.11"
 # One die per process; the collectives that would span more are registered
 # and disabled (`providers/ascend.py`), so nothing here starts a group.
 ASCEND_RT_VISIBLE_DEVICES = "0"
+# The plugin's own custom operator package. The hyper-connection kernels
+# (`npu_hc_pre_v2` / `npu_hc_post`, the `mhc_pre` / `mhc_post` providers)
+# live in it rather than in CANN's own, and CANN reads this variable ONCE
+# at initialisation — a provider that sets it on first use gets the op
+# registered and then "The tiling function does not exist" (EZ1008). So it
+# is declared here, where a process-wide environment fact belongs, exactly
+# as the plugin itself prepends it (`vllm_ascend/utils.py:455-458`).
+ASCEND_CUSTOM_OPP_PATH = "/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer"
 OMP_NUM_THREADS = "8"
 TOKENIZERS_PARALLELISM = "false"

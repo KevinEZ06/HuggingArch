@@ -1330,6 +1330,15 @@ class FrameworkBinding:
     #: `RowIdentity`. Empty only on a binding built in code without one; a
     #: file must declare it.
     ssm_chunk_size_from: Tuple[str, ...] = ()
+    #: The checkpoint-config fields this framework reads the Sinkhorn round
+    #: count it hands its hyper-connection pre-mix kernel from, first present
+    #: wins. Like the scan chunk above it is a kernel ARGUMENT rather than a
+    #: graph fact — no `dims.yaml` symbol binds it — and it keys the
+    #: `mhc_pre` cell (`OpSignature.structural_axes`), because the launch
+    #: alternates a row and a column normalisation that many times.
+    #: OPTIONAL, unlike the scan chunk: a framework that runs no such kernel
+    #: states nothing, and then no cell of its is keyed on the count.
+    hc_sinkhorn_iters_from: Tuple[str, ...] = ()
     #: The framework's all-reduce dispatch inside one NVLink domain, by
     #: collective op: its rungs in order (`comm_cost.CollectiveRung`; the
     #: module docstring), each with the part of its `when:` the walk answers
@@ -1366,7 +1375,8 @@ class FrameworkBinding:
     #: The fields of a binding file.
     KEYS = frozenset({"framework", "audited_at", "devices",
                       "op_implementations",
-                      "kv_block_size", "ssm_chunk_size", "collectives",
+                      "kv_block_size", "ssm_chunk_size",
+                      "hc_sinkhorn_iters", "collectives",
                       "precision_launches", "edge_dtypes",
                       "kernel_dispatches"})
 
@@ -2133,6 +2143,8 @@ def _load_framework_bindings_dir(
                 f"present wins. It is an axis of the `mamba2_scan` "
                 f"measurement cell, so it is declared, not defaulted; got "
                 f"{ssm_chunk!r}.")
+        hc_iters = data.get("hc_sinkhorn_iters")
+        hc_iters_from = _config_fields(hc_iters, "hc_sinkhorn_iters", fname)
         op_impls_raw = data.get("op_implementations") or {}
         if not isinstance(op_impls_raw, dict):
             raise ValueError(
@@ -2191,6 +2203,7 @@ def _load_framework_bindings_dir(
             op_implementations=tuple(impls),
             kv_block_size=(None if kv_block is None else int(kv_block)),
             ssm_chunk_size_from=tuple(ssm_from),
+            hc_sinkhorn_iters_from=hc_iters_from,
             collectives=collectives,
             collective_anchors=anchors,
             precision_launches=precision_launches,
@@ -2200,6 +2213,27 @@ def _load_framework_bindings_dir(
         )
         _check_entry_devices(out[framework], fname)
     return out
+
+
+def _config_fields(raw: Any, key: str, fname: str) -> Tuple[str, ...]:
+    """A `{from_config: [<field>, ...]}` declaration: the checkpoint-config
+    fields a framework reads one kernel argument from, first present wins.
+    Absent is the empty tuple — the framework runs no such kernel — but a
+    malformed one is refused rather than silently ignored."""
+    if raw is None:
+        return ()
+    fields = (raw.get("from_config")
+              if isinstance(raw, dict) and set(raw) == {"from_config"}
+              else None)
+    if (not isinstance(fields, list) or not fields
+            or not all(isinstance(f, str) and f for f in fields)
+            or len(set(fields)) != len(fields)):
+        raise ValueError(
+            f"framework_bindings/{fname}: `{key}` is "
+            f"`{{from_config: [<field>, ...]}}`, the checkpoint-config "
+            f"fields this framework reads that kernel argument from, first "
+            f"present wins; got {raw!r}.")
+    return tuple(fields)
 
 
 def _devices(raw: Any, fname: str) -> Tuple[str, ...]:
