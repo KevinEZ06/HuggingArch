@@ -247,6 +247,12 @@ def _cmd_run(argv: List[str]) -> int:
                     help="do not take the per-GPU exclusive lock. Only for a "
                          "device you know is otherwise idle: concurrent runs "
                          "make every latency wrong and the rows do not record it")
+    ap.add_argument("--comm-stride", type=int, default=1,
+                    help="die spacing of a collective group: die_id = "
+                         "rank * stride (default 1). The cell already "
+                         "carries n_comm_stride; this is the box mapping")
+    ap.add_argument("--comm-origin", type=int, default=0,
+                    help="first die of a collective group (default 0)")
     ap.add_argument("--append-output", action="store_true",
                     help=argparse.SUPPRESS)
     ap.add_argument("--measured-in", action="append", default=[],
@@ -327,8 +333,12 @@ def _cmd_run(argv: List[str]) -> int:
     # the file, so what is on disk is always usable as-is.
     # One sweep per physical card. Taken BEFORE the output file is opened so a
     # refused run doesn't truncate a file it will never write.
+    from .group import dies_for_jobs
     from .gpulock import GpuBusy, GpuLock
-    lock = GpuLock(wait=args.wait_for_gpu, enabled=not args.no_gpu_lock)
+    group_dies = dies_for_jobs(jobs, stride=args.comm_stride,
+                               origin=args.comm_origin)
+    lock = GpuLock(wait=args.wait_for_gpu, enabled=not args.no_gpu_lock,
+                   **({"devices": group_dies} if group_dies else {}))
     try:
         lock.acquire()
     except GpuBusy as e:
@@ -416,6 +426,9 @@ def _cmd_run(argv: List[str]) -> int:
                        run_id=args.run_id or _new_run_id(),
                        box=args.box if args.box is not None
                        else os.environ.get("KERNEL_BENCH_BOX", ""),
+                       comm_stride=args.comm_stride,
+                       comm_origin=args.comm_origin,
+                       take_lock=False,
                        cross_check=not args.no_cross_check,
                        skip_existing=args.skip_existing,
                        log=lambda m: print(" ", m), on_row=_persist,

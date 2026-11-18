@@ -43,7 +43,7 @@ from typing import Any, Dict
 
 from ..invocation import Invocation
 from ..env import Env
-from . import (BenchCase, KernelSignature, Provider, register)
+from . import (BenchCase, KernelSignature, Launch, Provider, register)
 
 #: The paged-KV page vLLM-Ascend's attention backends actually run, from
 #: the binding (`framework_bindings/vllm_ascend.yaml` `kv_block_size`,
@@ -976,25 +976,11 @@ register(Provider(
 # ---------------------------------------------------------------------------
 # HCCL collectives.
 #
-# The four signatures have existed since multi-GPU totals were wanted
-# (`op_signatures_catalog.py:1367-1420`: "without these, a multi-GPU
-# deployment could never have a measured total") and have never had a
-# provider. These are the first.
-#
-# REGISTERED AND DISABLED, which is a declaration rather than a gap. The
-# harness runs ONE process (`driver.py` has no rank, no world size), and in
-# one process every one of these collectives is the identity: the call
-# returns, the clock reads a local copy, and the row says an N-rank
-# all-reduce costs what a memcpy costs. That is exactly how the one
-# collective anyone had measured — `allreduce_fused_rmsnorm` — came to be
-# disabled with the same reason, and its note is the precedent followed
-# here.
-#
-# What it would take, so the next reader does not re-derive it: a runner
-# that starts `n_comm_ranks` processes, each on its own die, with the group
-# initialised on HCCL — `torchrun --nproc_per_node=N`, `backend="hccl"`,
-# `torch.npu.set_device(local_rank)`. The measurement itself is settled;
-# what is missing is the harness's process model, not the kernel.
+# A group of `n_comm_ranks` processes, each on its own die, with the
+# communicator on HCCL (`kernel_bench.group`, `backend="hccl"`). The
+# cell already carried the group size; the process model is what was
+# missing. Still disabled: the fused all-reduce floor
+# (`allreduce_fused_rmsnorm`), which is a different kernel.
 #
 # MEASURED ANYWAY, out of band, because the sheet's link rate needed a
 # bound (2026-11-15, one process per die, 128 MiB payloads, bus bandwidth
@@ -1007,46 +993,38 @@ register(Provider(
 # in `tests/backend/inference/test_ascend_peaks_bound_measurement.py`.
 # ---------------------------------------------------------------------------
 
-_SINGLE_PROCESS = (
-    "one process: every collective is the identity, so this would time a "
-    "local buffer and record it as an N-rank collective — a group of "
-    "n_comm_ranks needs that many processes, each on its own die, with the "
-    "group on HCCL")
-
 
 def _hccl_build(op: str):
-    """The build for one collective. `torch.distributed` is the entry point
-    the plugin's own ranks use; the group is the process group HCCL
-    initialised, which a single-process harness does not have — hence the
-    disabled_reason above."""
+    """One HCCL collective. The process group is the one `rankworker`
+    initialised; `n_comm_ranks < 2` is refused by `Provider.world`."""
 
     def build(inv: Invocation, env: Env, inputs: Dict[str, Any]) -> BenchCase:
+        import torch
         import torch.distributed as dist
 
         payload = inputs["payload"]
+        ranks = int(inputs["n_comm_ranks"])
+        rank = int(inputs.get("rank", inv.rank) or 0)
         if op == "all_reduce":
-            run = lambda: dist.all_reduce(payload)
-        elif op == "all_gather":
-            import torch
-            ranks = int(inputs["n_comm_ranks"])
-            out = torch.empty(payload.numel() * ranks, dtype=payload.dtype,
+            run = Launch(dist.all_reduce, payload)
+            return BenchCase(run=run, to_canonical=lambda _o: payload)
+        if op == "all_gather":
+            chunk = payload.numel() // ranks
+            send = payload.reshape(-1)[rank * chunk:(rank + 1) * chunk].contiguous()
+            out = torch.empty(payload.numel(), dtype=payload.dtype,
                               device=payload.device)
-            run = lambda: dist.all_gather_into_tensor(out, payload)
-        elif op == "reduce_scatter":
-            import torch
-            ranks = int(inputs["n_comm_ranks"])
+            run = Launch(dist.all_gather_into_tensor, out, send)
+            return BenchCase(run=run, to_canonical=lambda _o: out)
+        if op == "reduce_scatter":
             out = torch.empty(payload.numel() // ranks, dtype=payload.dtype,
                               device=payload.device)
-            run = lambda: dist.reduce_scatter_tensor(out, payload)
-        elif op == "all_to_all":
-            import torch
+            run = Launch(dist.reduce_scatter_tensor, out, payload)
+            return BenchCase(run=run, to_canonical=lambda _o: out)
+        if op == "all_to_all":
             out = torch.empty_like(payload)
-            run = lambda: dist.all_to_all_single(out, payload)
-        else:
-            raise ValueError(op)
-        # No oracle: on one process there is nothing to compare against, and
-        # with a real group each rank holds a different answer.
-        return BenchCase(run=run, to_canonical=None)
+            run = Launch(dist.all_to_all_single, out, payload)
+            return BenchCase(run=run, to_canonical=lambda _o: out)
+        raise ValueError(op)
 
     return build
 
@@ -1058,5 +1036,4 @@ for _op in ("all_reduce", "all_gather", "reduce_scatter", "all_to_all"):
         build=_hccl_build(_op),
         serves=KernelSignature(signature=_op, activation=_ASCEND_FLOAT),
         world="n_comm_ranks",
-        disabled_reason=_SINGLE_PROCESS,
     ))

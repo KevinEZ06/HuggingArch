@@ -18,6 +18,7 @@ ends and `run-all` records the implementation in flight as a `crash`.
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, Iterable, List, Mapping,
@@ -325,6 +326,11 @@ def run_jobs(
     measured_keys: Optional[Iterable[Any]] = None,
     on_attempt: Optional[Callable[[List[Dict[str, str]]], None]] = None,
     on_disable: Optional[Callable[[str, str], None]] = None,
+    in_group: bool = False,
+    align: Optional[Callable[[], None]] = None,
+    comm_stride: int = 1,
+    comm_origin: int = 0,
+    take_lock: bool = True,
 ) -> RunResult:
     """`on_row` is called with each row as soon as it exists — a measurement
     or a recorded outcome — so a caller can persist it immediately. Rows are
@@ -347,6 +353,7 @@ def run_jobs(
     from .emit import build_refusal_row, build_row
 
     env = env or detect_env()
+    in_group = bool(in_group or os.environ.get("KERNEL_BENCH_IN_GROUP") == "1")
     result = RunResult()
 
     def record(row: Dict[str, str], run_key, label: str, note: List[str],
@@ -448,10 +455,41 @@ def run_jobs(
             todo.append((p, impl_id, version, run_key, label))
         return todo
 
-    def attempt(inv, todo) -> None:
+    def attempt(inv, todo, job) -> None:
         """Attempt one cell with the given providers (`pending`'s entries):
         its inputs and oracle built once, then each provider built, checked
         and timed, every attempt ending in a row or a note."""
+        if (not in_group) and any(p.world for p, *_rest in todo):
+            from .group import GroupFailed, measure_job
+            try:
+                rows = measure_job(
+                    job, env=env, stride=comm_stride, origin=comm_origin,
+                    take_lock=take_lock, date=date, contributor=contributor,
+                    run_id=run_id, box=box)
+            except GroupFailed as e:
+                result.failures.append(
+                    f"{inv.op} {inv.dims}: group failed ({e})")
+                log(f"FAIL group {inv.op}: {e}")
+                return
+            index = {impl_id: (run_key, label)
+                     for _p, impl_id, _v, run_key, label in todo}
+            for row in rows:
+                impl = row.get("kernel_impl") or ""
+                run_key, label = index.get(impl, (None, impl))
+                if run_key is not None:
+                    measured_here.add(run_key)
+                    verdicts[run_key] = row
+                result.rows.append(row)
+                if on_row is not None:
+                    try:
+                        on_row(row)
+                    except Exception as write_error:
+                        result.failures.append(
+                            f"{label}: measured but not persisted "
+                            f"({type(write_error).__name__}: {write_error})")
+                log(f"ok   {label} p50={row.get('p50_us')} "
+                    f"{row.get('_rank_spread') or ''}")
+            return
 
         # Canonical inputs + reference for this op — built ONCE, shared by
         # every provider so their outputs (and latencies) are comparable.
@@ -773,7 +811,7 @@ def run_jobs(
                             f"rel_err={xrel:.3g} cos={xcos:.5f}")
                         continue
                 try:
-                    stats = time_callable(case.run)
+                    stats = time_callable(case.run, align=align)
                 except TooSlowToMeasure as e:
                     # A `timeout`: one launch costs more than the whole timing
                     # budget, so this implementation cannot be sampled here.
@@ -1028,7 +1066,7 @@ def run_jobs(
             # against the canary's cell, and nothing before it is lost.
             if on_job_start is not None:
                 on_job_start(job_index, jobs[j])
-            attempt(inv_j, entries)
+            attempt(inv_j, entries, jobs[j])
             for e in entries:
                 judge(inv_j, e)
         if ahead and on_job_start is not None:
@@ -1042,7 +1080,7 @@ def run_jobs(
             kept.append(entry)
         if not kept:
             continue
-        attempt(inv, kept)
+        attempt(inv, kept, job)
         for entry in kept:
             if _launch_path(inv, entry[0].library, entry[1]) in here:
                 judge(inv, entry)

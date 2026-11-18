@@ -133,7 +133,7 @@ class TestACollectiveNamesItsWorld(unittest.TestCase):
         self.assertEqual(len(hccl), 4, [p.kernel_impl for p in hccl])
         for p in hccl:
             self.assertEqual(p.world, "n_comm_ranks", p.kernel_impl)
-            self.assertTrue(p.disabled_reason)
+            self.assertFalse(p.disabled_reason, p.kernel_impl)
 
     def test_an_enabled_collective_without_world_is_refused(self):
         from kernel_bench.providers import Provider, _check_execution_world
