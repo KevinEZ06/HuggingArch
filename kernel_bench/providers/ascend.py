@@ -644,11 +644,21 @@ def _chunk_kda_build(inv: Invocation, env: Env,
             cu_seqlens=cu, safe_gate=False, use_qk_l2norm_in_kernel=True,
             return_intermediate_states=False, state_v_first=True)
 
-    return BenchCase(
-        run=run,
-        # `(o, final_state, ...)`; the cell is the output.
-        to_canonical=lambda out: (
-            out[0] if isinstance(out, (tuple, list)) else out).float())
+    def canonical(out):
+        """`(o, final_state, ...)` in the kernel's varlen form back to the
+        cell's `[B, s_query, n_heads, d]`.
+
+        The launch writes `[1, B·s_query, h, d]` — one leading dim, the
+        batch folded into the tokens — so the result is split back along
+        that token axis at `s_query`. Skipping this handed the cross-check a
+        `[1, B·S, h, d]` tensor against a `[B, S, h, d]` reference: the same
+        numbers in a different shape, which the gate reports as a shape
+        mismatch and the row is never written.
+        """
+        o = out[0] if isinstance(out, (tuple, list)) else out
+        return o.reshape(B, S, *o.shape[2:]).float()
+
+    return BenchCase(run=run, to_canonical=canonical)
 
 
 register(Provider(
@@ -721,10 +731,14 @@ def _recurrent_kda_build(inv: Invocation, env: Env,
             state_v_first=True, use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=False, safe_gate=False)
 
-    return BenchCase(
-        run=run,
-        to_canonical=lambda out: (
-            out[0] if isinstance(out, (tuple, list)) else out).float())
+    def canonical(out):
+        """`[1, B, h, d]` back to the cell's `[B, 1, h, d]`: one token per
+        sequence, split by the batch (`_kda_bsnd` folds them, this unfolds).
+        A shape the cross-check reads, not a detail — see the chunk build."""
+        o = out[0] if isinstance(out, (tuple, list)) else out
+        return o.transpose(0, 1).float()
+
+    return BenchCase(run=run, to_canonical=canonical)
 
 
 register(Provider(
