@@ -262,6 +262,14 @@ def _spawn(job: dict, *, env, n_ranks: int, dies: List[int],
             "env_device": getattr(env, "device", None),
             "env_library": getattr(env, "library", None),
             "gpu_sku": getattr(env, "gpu_sku", None),
+            # The card's bandwidth travels with its name. The parent
+            # resolved both off the BOX when the driver's device name does
+            # not name a sheet SKU (`cli._cmd_run`: `Ascend910_9362` has no
+            # digitless family token, so the matcher cannot resolve it), and
+            # a child that re-detects gets neither. Every row is validated
+            # against `peak_bw_at_test`, so without this the group measures
+            # correctly and then drops every row at schema validation.
+            "peak_bw_gbps": getattr(env, "peak_bw_gbps", None),
             "date": date,
             "contributor": contributor,
             "run_id": run_id,

@@ -62,6 +62,28 @@ def _env():
     return Env("2.11", None, None, None, None)
 
 
+#: What a child reported back about the config it was handed. A module-level
+#: queue is not available to a spawned process, so the rank puts the fields
+#: it cares about on the queue the parent already reads.
+def _cfg_echo_rank(cfg, queue):
+    rank = int(cfg["rank"])
+    queue.put({
+        "rank": rank,
+        "rows": [{
+            "kernel_impl": "hccl_all_reduce",
+            "p50_us": f"{10.0 + rank:.4f}",
+            "p95_us": f"{12.0 + rank:.4f}",
+            "latency_us": f"{10.0 + rank:.4f}",
+            "outcome": "measured",
+            "launch_signature": "dist.all_reduce()",
+            # Not a real column: the test reads it off the aggregated row to
+            # see what the parent put in `cfg`.
+            "_saw_peak_bw": repr(cfg.get("peak_bw_gbps")),
+            "_saw_gpu_sku": repr(cfg.get("gpu_sku")),
+        }],
+    })
+
+
 class TestDieMappingStaysOutOfIdentity(unittest.TestCase):
     def test_die_id_is_rank_times_stride(self):
         from kernel_bench.group import dies_for
@@ -151,6 +173,41 @@ class TestHcclIsAGroupKernel(unittest.TestCase):
         for p in hccl:
             self.assertEqual(p.world, "n_comm_ranks")
             self.assertFalse(p.disabled_reason)
+
+    def test_the_child_is_handed_the_card_the_parent_resolved(self):
+        """The regression: a group measured correctly and wrote nothing.
+
+        `emit.py:507` writes `peak_bw_at_test` from `env.peak_bw_gbps`, and
+        an empty one fails schema validation, so every row a group measured
+        was dropped at persist. The parent resolves the card off the BOX
+        when the driver's device name names no sheet SKU (an Ascend die
+        reports `Ascend910_9362`, whose family token carries no digit), so a
+        child that only re-detects gets `None` and writes "".
+
+        Both facts travel, because the SKU alone does not carry the
+        bandwidth: `cli._cmd_run` looks the card up and replaces BOTH.
+        """
+        from dataclasses import replace
+
+        from kernel_bench.group import measure_job
+        env = replace(_env(), gpu_sku="Ascend-910C-A3", peak_bw_gbps=1600.0)
+        rows = measure_job(_JOB, env=env, take_lock=False, timeout_s=15,
+                           worker=_cfg_echo_rank)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["_saw_peak_bw"], repr(1600.0))
+        self.assertEqual(rows[0]["_saw_gpu_sku"], repr("Ascend-910C-A3"))
+
+    def test_the_empty_bandwidth_column_is_what_schema_rejects(self):
+        """The other half of the failure: why an empty column loses the row.
+
+        The group measured correctly and the log said `measured 2 rows`;
+        both were then dropped at persist. That step is a REQUIRED column
+        check, so a child that inherits no bandwidth does not fail loudly —
+        it writes "" and the row disappears. Asserted against the validator
+        itself rather than a copy of its list.
+        """
+        from backend.inference.benchmarks import MEASUREMENT_COLUMNS
+        self.assertIn("peak_bw_at_test", MEASUREMENT_COLUMNS)
 
     def test_a_single_rank_is_not_a_group(self):
         from kernel_bench.invocation import Invocation

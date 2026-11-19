@@ -58,6 +58,13 @@ def _measure(cfg: Dict[str, Any], rank: int, world: int) -> Dict[str, Any]:
         env = replace(env, library=cfg["env_library"])
     if cfg.get("gpu_sku") and not env.gpu_sku:
         env = replace(env, gpu_sku=cfg["gpu_sku"])
+    # The card the PARENT resolved, not what this child can detect. On a
+    # box whose driver device name names no sheet SKU the parent reads both
+    # the SKU and its bandwidth off the box profile; a child that only
+    # inherits the name writes an empty `peak_bw_at_test` and every row it
+    # measured is dropped at schema validation.
+    if cfg.get("peak_bw_gbps") and not env.peak_bw_gbps:
+        env = replace(env, peak_bw_gbps=cfg["peak_bw_gbps"])
 
     job = dict(cfg["job"])
     job["rank"] = rank
