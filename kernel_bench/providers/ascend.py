@@ -224,12 +224,37 @@ def _grouped_quant_matmul_build(inv: Invocation, env: Env,
     scale = w_scale.to(_torch_dtype(inv.dtype_env.get("metadata") or "bf16"))
     out_dtype = _torch_dtype(inv.dtype if inv.dtype in _ASCEND_FLOAT
                              else "bf16")
+    # The kernel returns ONE flat run of `running` rows; the cell's form is
+    # the reference's `[E, s_expert_rows, N]`, each expert's block holding
+    # its `count` real rows and zeros past them
+    # (`refs._grouped_gemm_reference` zeroes the tail itself). Scattering
+    # the run back is the inverse of the gather above and the same
+    # arithmetic — no second opinion about what the kernel computed, which
+    # is why this can be compared at all. Without it the row read
+    # `not_comparable` and the two expert matmuls — the largest op on the
+    # GLM walk — were measured and never checked.
+    n_out = int(w.shape[1])
+    blocks, offset = [], 0
+    for count in counts:
+        blocks.append((offset, int(count)))
+        offset += int(count)
+
+    def canonical(out):
+        o = out[0] if isinstance(out, (list, tuple)) else out
+        o = o.reshape(-1, n_out)
+        full = torch.zeros(len(counts), per_block, n_out,
+                           dtype=o.dtype, device=o.device)
+        for e, (start, count) in enumerate(blocks):
+            if count:
+                full[e, :count] = o[start:start + count]
+        return full.float()
+
     return BenchCase(
         run=lambda: torch_npu.npu_grouped_matmul(
             [flat], [wt], scale=[scale], per_token_scale=[per_token],
             group_list=groups, split_item=2, group_type=0,
             output_dtype=out_dtype),
-        to_canonical=None,   # flat-vs-blocked layout; measured, not verified
+        to_canonical=canonical,
     )
 
 
