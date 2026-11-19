@@ -466,7 +466,8 @@ def _cmd_run(argv: List[str]) -> int:
     if not writer.has_rows:
         print("\nno valid rows measured (this env runs no applicable provider, "
               "or every row failed validation). Output holds a header only.")
-        return 0 if not res.rows else EXIT_NO_VALID_ROWS
+        return run_exit_code(measured=bool(res.rows), persisted=False,
+                             dropped=len(bad), disabled=bool(res.disabled))
 
     # Structural guard (header + duplicate identity) read back from what was
     # actually persisted — the rows are already on disk, so this reports a
@@ -478,7 +479,8 @@ def _cmd_run(argv: List[str]) -> int:
         print(f"\nWARNING: {e}\n  (rows are individually valid and already written)")
     print(f"\nwrote {writer.count} validated rows → {args.output}"
           + (f" ({len(bad)} dropped)" if bad else ""))
-    return EXIT_PATHS_DISABLED if res.disabled else 0
+    return run_exit_code(measured=bool(res.rows), persisted=writer.has_rows,
+                         dropped=len(bad), disabled=bool(res.disabled))
 
 
 # uv's own default is 30s per download, which is not enough for these envs: a
@@ -504,6 +506,39 @@ EXIT_NO_VALID_ROWS = 3
 #: `.done` — the next pass runs it again, which is one canary per path while
 #: the env stays broken, and the whole path once it is fixed.
 EXIT_PATHS_DISABLED = 4
+
+#: `run`'s exit when it reached the end of its jobs, wrote some rows, and
+#: validation refused others. A measurement the device really made and the
+#: harness then could not persist is a defect in the row the harness built
+#: — an identity column it left empty, a peak it could not resolve — and
+#: the log says `measured N rows` either way. Losing EVERY row already
+#: exits `EXIT_NO_VALID_ROWS`; this is the same fault with one row
+#: surviving, which used to exit 0 and read as success. Like the two codes
+#: above it means "reached the end": `run-all` quarantines nothing and
+#: clears it, so the operator sees the drops without the queue stalling.
+EXIT_ROWS_DROPPED = 5
+
+
+def run_exit_code(*, measured: bool, persisted: bool, dropped: int,
+                  disabled: bool) -> int:
+    """What `run` exits with, from what reached the file.
+
+    One function because the two returns at the end of `_cmd_run` answer
+    the same question at different points and used to disagree: the "no
+    rows at all" branch already reported a drop, and the branch below it
+    reported nothing at all, so a run that lost all but one row looked
+    exactly like a clean one.
+
+    `measured` is whether the device produced any row, `persisted` whether
+    any survived validation, `dropped` how many did not.
+    """
+    if not persisted:
+        # Nothing on disk. An env with no applicable provider measured
+        # nothing and is not a fault; one that measured and kept none is.
+        return EXIT_NO_VALID_ROWS if measured else 0
+    if dropped:
+        return EXIT_ROWS_DROPPED
+    return EXIT_PATHS_DISABLED if disabled else 0
 
 
 def uv_run_cmd(env_file: str, run_args: List[str], *,
@@ -816,6 +851,10 @@ def _cmd_run_all(argv: List[str]) -> int:
                     # Reached the end. The paths it disabled are read off
                     # the sidecar above, the one place that also holds
                     # them when the run died after disabling.
+                    rc = 0
+                if rc == EXIT_ROWS_DROPPED:
+                    print(f"[{lib}] ran to the end; some rows it measured "
+                          "failed validation (see the drops above)")
                     rc = 0
                 if rc == 0:
                     break
