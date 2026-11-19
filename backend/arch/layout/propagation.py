@@ -58,6 +58,9 @@ from .layout import (
     sharded,
 )
 from .resolver import families_for, layout_for_symbol, pipeline_family_for
+from .stages import StagePlacement
+from backend.arch.eval.occurrence import Occurrence
+from backend.arch.eval.program import OpStage
 from .transfer_table import (
     CONTRACT,
     CellResult,
@@ -456,6 +459,27 @@ class LayoutPropagation(Rule):
     def resident_weights(self, analysis: Any) -> Any:
         """The `eval.capacity.Weights` ledger of this rule's rank."""
         return resident_weights(physical_artifacts(analysis))
+
+    def stage_of(self, analysis: Any) -> Any:
+        """The stage a node of a graph built over the walk runs on at an
+        iteration, as the pipeline world places the walk
+        (`stages.StagePlacement`); one stage without one. A node grafted
+        into a layer (a cast, a collective) runs where that layer's
+        iteration does, and a model-level node where its stage root does."""
+        if self.pipeline_family is None:
+            return super().stage_of(analysis)
+        placement = StagePlacement.of(analysis)
+
+        def stage(program: Any, uid: int, iteration: Any) -> int:
+            evaluating, root = program.evaluating_stage(uid)
+            if placement.partitioned(evaluating):
+                return placement.iteration_stage(evaluating, iteration)
+            # A model-level stage runs where its op does — the op the walk
+            # placed, whatever a pass grafted beside it (`OpStage.grafted`).
+            anchor = (evaluating.node if isinstance(evaluating, OpStage)
+                      else root)
+            return placement.stage(Occurrence(anchor.uid, iteration))
+        return stage
 
     def _prepare_node(
         self,

@@ -83,7 +83,7 @@ def _rewrite(transform: Any, name: str) -> Tuple[Any, Any]:
     return transform.rewrite(analysis.program, analysis)
 
 
-def _leaf_totals(analysis: Any) -> Tuple[Any, Any]:
+def _leaf_totals(analysis: Any, runs: Any = None) -> Tuple[Any, Any]:
     """Summed over LEAVES, because `total()` sums component roots whose cost
     already includes their children — it would report preservation even if the
     leaf layer were double-counted.
@@ -93,13 +93,20 @@ def _leaf_totals(analysis: Any) -> Tuple[Any, Any]:
     128 tokens bills its expert activation 540672/7 FLOPs), and a fused node
     that carries the exact sum of two such leaves truncates once where the two
     leaves truncated twice — 2 FLOPs apart on a total that the rewrite in fact
-    preserved to the last unit."""
+    preserved to the last unit.
+
+    Weighted by how many times each leaf runs (`runs`, a count layer over
+    the analysis's program): a launch across a layer seam runs once per
+    seam, and a member it took only some runs of keeps the rest as a leaf
+    of its own (`Rewrite.shares`), so a per-node sum would count the member
+    in both. Unweighted when `runs` is None."""
     flops = params = 0
     for uid, cost in analysis.cost.values.items():
         if getattr(analysis.program.by_uid(uid), "children", None):
             continue
-        flops += dim_mod.value_of(cost.flops)
-        params += dim_mod.value_of(cost.params)
+        n = 1 if runs is None else runs.values[uid]
+        flops += n * dim_mod.value_of(cost.flops)
+        params += n * dim_mod.value_of(cost.params)
     return flops, params
 
 
@@ -125,8 +132,11 @@ class TestCostSurvivesTheRewrite(unittest.TestCase):
         for name in MODELS:
             with self.subTest(model=name):
                 d = Deployment(_program(name)).at(batch=1, input_tokens=128)
-                naive = _leaf_totals(shared_walk(d))
-                fused = _leaf_totals(shared_walk(d.fused(framework)))
+                walked = shared_walk(d)
+                rewritten = shared_walk(d.fused(framework))
+                naive = _leaf_totals(walked, walked.instances)
+                fused = _leaf_totals(rewritten, walked.instances.rebase_counts(
+                    rewritten.rewrite, rewritten.program))
                 self.assertEqual(naive, fused)
 
     def test_own_copies_follow_the_rewrite(self):
@@ -173,6 +183,13 @@ class TestCostSurvivesTheRewrite(unittest.TestCase):
         for new_uid, sources in fused.rewrite.origins.items():
             self.assertIn(new_uid, fused.cost.values)
             for source in sources:
+                # A node a launch across a seam took only some runs of
+                # keeps the rest (layer 0's input norm reads the embedding,
+                # not a previous layer's add) and so stays; every other
+                # absorbed node is gone.
+                if fused.rewrite.partly(source):
+                    self.assertIn(source, fused.cost.values)
+                    continue
                 self.assertNotIn(source, fused.cost.values,
                                  "an absorbed node survived its replacement")
 
@@ -2055,9 +2072,21 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
             for m in vllm["merged_column_parallel_linear_wide"]))
         self.assertTrue(all(m == sorted(["q_concat", "kv_concat"])
                             for m in vllm["mla_q_concat_kv_insert"]))
-        self.assertTrue(all(m == sorted(["attn_residual", "mlp_res",
-                                         "post_attention_layernorm"])
-                            for m in vllm["add_attn_res_combine_norm"]))
+        # After attention, the attention add with the FFN readout and its
+        # norm (model.py:1050-1068); before it, the previous layer's FFN add
+        # with the attention readout and the input norm (model.py:1024-1035)
+        # — a launch across the layer seam (`fusion.Seams`). At the exit the
+        # pattern also meets the final norm, which vLLM runs later in
+        # `compute_logits` (model.py:1413-1414): one launch a step this graph
+        # bills fused that vLLM runs apart, a known gap of the graph (the
+        # norm's call site is not a fact it holds), not a binding case.
+        self.assertTrue(all(
+            m in (sorted(["attn_residual", "mlp_res",
+                          "post_attention_layernorm"]),
+                  sorted(["mlp_residual", "attn_res", "input_layernorm"]),
+                  sorted(["mlp_residual", "language_model.model.norm",
+                          "language_model.model.output_attn_res"]))
+            for m in vllm["add_attn_res_combine_norm"]))
 
         tp8 = fused("vllm", walk(k3, tp=8))
         self.assertNotIn("merged_column_parallel_linear_wide", tp8)
@@ -2327,11 +2356,16 @@ class TestASeamCrossesComponentsInsideOneLayer(unittest.TestCase):
         return analysis, fused, rewrite
 
     def _counts(self, model: str, framework: str, phase: str) -> dict:
-        _analysis, fused, _rewrite = self._ops(model, framework, phase)
+        """Launches a step runs per mHC op: a launch across a layer seam
+        runs once per seam, and a member it took only some runs of keeps
+        the rest (`Rewrite.shares`)."""
+        analysis, fused, rewrite = self._ops(model, framework, phase)
+        runs = analysis.instances.rebase_counts(rewrite, fused)
         counts: dict = {}
         for node in fused.nodes():
             if node.op and node.op.startswith("mhc_"):
-                counts[node.op] = counts.get(node.op, 0) + 1
+                counts[node.op] = (counts.get(node.op, 0)
+                                   + runs.values.get(node.uid, 0))
         return counts
 
     def test_each_phase_takes_the_launches_its_framework_makes(self):
@@ -2342,24 +2376,28 @@ class TestASeamCrossesComponentsInsideOneLayer(unittest.TestCase):
         precisely to model a dispatch condition"): prefill reads as the
         large-token path, decode as the small-token one.
 
-        DeepSeek-V4-Flash has five block templates, each with an in-layer
-        attention→FFN seam and a cross-layer FFN→attention one, so ten seams.
-        In prefill every seam is post + GEMM + big fuse. In decode the
-        in-layer seam is one fused post+pre launch plus the big fuse, while
-        the cross-layer one still bills its post and its GEMM apart — stage 1
-        does not cross a layer boundary."""
+        DeepSeek-V4-Flash runs 44 layers a step (43 and the MTP layer), each
+        with an attention→FFN boundary and, from the second on, the boundary
+        from the previous layer's FFN into its attention: vLLM calls the
+        fused post+pre on both (models/deepseek_v4/nvidia/model.py:1264 and
+        :1236), a launch across the layer seam here (`fusion.Seams`). In
+        prefill every boundary is post + GEMM + big fuse. In decode both
+        are one fused post+pre launch plus the big fuse, except where a
+        layer has no boundary before it or after it: layer 0's attention
+        pre (and the MTP layer's) is a GEMM alone, and the stack's exit (and
+        the MTP layer's) a post alone."""
         for framework in ("vllm", "sglang"):
             with self.subTest(framework=framework):
                 self.assertEqual(
                     self._counts("deepseek-ai__DeepSeek-V4-Flash",
                                  framework, "prefill"),
-                    {"mhc_post": 10, "mhc_pre_gemm": 10,
-                     "mhc_pre_big_fuse": 10})
+                    {"mhc_post": 88, "mhc_pre_gemm": 88,
+                     "mhc_pre_big_fuse": 88})
                 self.assertEqual(
                     self._counts("deepseek-ai__DeepSeek-V4-Flash",
                                  framework, "decode"),
-                    {"mhc_fused_post_pre": 5, "mhc_post": 5,
-                     "mhc_pre_gemm": 5, "mhc_pre_big_fuse": 10})
+                    {"mhc_fused_post_pre": 86, "mhc_post": 2,
+                     "mhc_pre_gemm": 2, "mhc_pre_big_fuse": 88})
 
     def test_the_big_fuse_reaches_the_sublayer_norm_across_components(self):
         """The launch our `mhc_pre_big_fuse` stands for ends in the sublayer
@@ -2395,11 +2433,19 @@ class TestASeamCrossesComponentsInsideOneLayer(unittest.TestCase):
                 for node in fused.nodes():
                     if not (node.op or "").startswith("mhc_"):
                         continue
-                    blocks = {analysis.program.block_of(uid)
-                              for uid in node.origins}
-                    self.assertEqual(len(blocks), 1, (model, framework,
-                                                      node.op))
-                    self.assertNotIn(None, blocks)
+                    # A launch across a layer seam runs in the reading
+                    # layer; its members of the layer before are that
+                    # layer's, one occurrence each side.
+                    for side in (
+                            set(node.origins) - node.previous_iteration,
+                            node.previous_iteration):
+                        if not side:
+                            continue
+                        blocks = {analysis.program.block_of(uid)
+                                  for uid in side}
+                        self.assertEqual(len(blocks), 1, (model, framework,
+                                                          node.op))
+                        self.assertNotIn(None, blocks)
 
     def test_the_seam_preserves_flops_and_weights(self):
         """A fusion moves bytes, never arithmetic."""
@@ -2607,27 +2653,31 @@ class TestTheShiftedSeamIsTheSameLaunchesOverACarriedPre(unittest.TestCase):
 
     def test_the_deepseek_v4_seam_is_unchanged(self):
         """Binding V4.1 moved nothing for the model the plans were written
-        for: the same counts as the stage-1 class pins, both frameworks."""
+        for: the same launches a step as the stage-1 class pins
+        (`test_each_phase_takes_the_launches_its_framework_makes`), both
+        frameworks."""
         for framework in ("vllm", "sglang"):
             with self.subTest(framework=framework):
                 program = _program("deepseek-ai__DeepSeek-V4-Flash")
                 for phase, expect in (
-                        ("prefill", {"mhc_post": 10, "mhc_pre_gemm": 10,
-                                     "mhc_pre_big_fuse": 10}),
-                        ("decode", {"mhc_fused_post_pre": 5, "mhc_post": 5,
-                                    "mhc_pre_gemm": 5,
-                                    "mhc_pre_big_fuse": 10})):
+                        ("prefill", {"mhc_post": 88, "mhc_pre_gemm": 88,
+                                     "mhc_pre_big_fuse": 88}),
+                        ("decode", {"mhc_fused_post_pre": 86, "mhc_post": 2,
+                                    "mhc_pre_gemm": 2,
+                                    "mhc_pre_big_fuse": 88})):
                     walk = Deployment(program).at(input_tokens=128)
                     if phase == "decode":
                         walk = walk.during(DECODE, cache_len=4096)
                     analysis = shared_walk(walk)
-                    fused, _rw = Framework.of(
+                    fused, rewrite = Framework.of(
                         get_binding(framework).deployed(self.DEPLOYMENT),
                         FUSION_SCHEMES).rewrite(analysis.program, analysis)
+                    runs = analysis.instances.rebase_counts(rewrite, fused)
                     counts: dict = {}
                     for node in fused.nodes():
                         if node.op and node.op.startswith("mhc_"):
-                            counts[node.op] = counts.get(node.op, 0) + 1
+                            counts[node.op] = (counts.get(node.op, 0)
+                                               + runs.values.get(node.uid, 0))
                     self.assertEqual(counts, expect, (framework, phase))
 
 

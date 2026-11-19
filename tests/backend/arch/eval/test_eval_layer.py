@@ -187,5 +187,60 @@ class TestRewrite(unittest.TestCase):
         self.assertEqual(out[20], 6)
 
 
+    def test_a_launch_taken_in_part_keeps_the_rest_of_its_runs(self):
+        """A launch over nodes 1, 2 runs at iterations 0..3; a later launch
+        takes iterations 1..3 of it with node 3. The first keeps iteration
+        0, every run is counted once (1 + 3, not 4 + 3), and each run of
+        node 1 is run by the launch that took it (`Rewrite.taken`, composed
+        by `then`)."""
+        program = _Iterations({1: (0, 1, 2, 3), 2: (0, 1, 2, 3),
+                               3: (0, 1, 2, 3)})
+        each = {it: it for it in range(4)}
+        first = Rewrite(origins={10: (1, 2)}, dropped=frozenset({1, 2}),
+                        taken={10: {1: each, 2: each}}, homes={10: 1})
+        later = {it: it for it in (1, 2, 3)}
+        second = Rewrite(origins={20: (10, 3)}, dropped=frozenset({3}),
+                         taken={20: {10: later, 3: dict(later)}},
+                         homes={20: 10})
+        both = first.then(second)
+        counts = Layer(program, {1: 4, 2: 4, 3: 4}).rebase_counts(both, None)
+        self.assertEqual((counts[10], counts[20]), (1, 3))
+        self.assertEqual(both.home(20), 1)
+        self.assertEqual([both.launch_at(1, it) for it in range(4)],
+                         [10, 20, 20, 20])
+
+    def test_a_seam_launch_runs_the_writers_previous_iteration(self):
+        """Across a seam, the launch at reading iteration i runs the writer's
+        iteration i − 1: a read of the writer's last run is someone else's
+        (here, no launch's: it stays the writer's own)."""
+        program = _Iterations({1: (0, 1, 2), 2: (0, 1, 2)})
+        rw = Rewrite(origins={10: (2, 1)}, dropped=frozenset(),
+                     taken={10: {2: {1: 1, 2: 2}, 1: {1: 0, 2: 1}}},
+                     homes={10: 2})
+        self.assertEqual([rw.launch_at(1, it) for it in range(3)],
+                         [10, 10, None])
+        self.assertTrue(rw.partly(1) and rw.partly(2))
+        counts = Layer(program, {1: 3, 2: 3}).rebase_counts(rw, None)
+        self.assertEqual((counts[10], counts[1], counts[2]), (2, 1, 1))
+
+    def test_a_symbolic_count_is_refused_not_branched_on(self):
+        import sympy as sp
+        program = _Iterations({1: (0, 1)})
+        rw = Rewrite(origins={10: (1,)}, dropped=frozenset(),
+                     taken={10: {1: {1: 1}}}, homes={10: 1})
+        with self.assertRaises(ValueError):
+            Layer(program, {1: sp.Symbol("L")}).rebase_counts(rw, None)
+
+
+@dataclass(frozen=True)
+class _Iterations:
+    """A program that answers only which iterations each node runs at."""
+
+    layers: dict
+
+    def occurrence_layers(self, uid):
+        return self.layers[uid]
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -298,6 +298,29 @@ traffic bills, so a measured cell can stand for a launch it did not time.
 
 **Fix.** Key every written port's format, not only the primary one.
 
+### 3.6 DeepSeek-V4.1's layer seam is written into its spec, not matched across
+
+**Today.** A launch that spans the seam between two layers is matched there:
+the matcher follows the formal a layer reads into the iteration that wrote it
+(`eval.fusion.Seams`, `docs/inference_cost_model.md`, "A launch across the
+seam between two layers"). DeepSeek-V4.1's spec reaches the same launches
+another way. Its blocks are written at an offset, so each template opens with
+the previous layer's `hc_post` and carries the pre-mix across
+(`mhc_shifted_post_pre`). That is a second mechanism for one phenomenon.
+
+**Deviation.** None in the numbers today:
+`TestTheShiftedSeamIsTheSameLaunchesOverACarriedPre` pins V4.1's counts. But
+the offset spec puts layer 0's `hc_post` and the stack's last one where no
+layer of the checkpoint has them, and a reader of the graph has to know
+which of the two mechanisms a model uses.
+
+**Fix (migration path).**
+1. Write V4.1's blocks unshifted: `hc_post` back at each layer's tail, and
+   the carried pre-mix as the stream the layer hands on.
+2. Let the mHC plans meet `hc_pre`'s formal across the seam, as DeepSeek-V4's
+   already do. The matcher needs nothing new for this.
+3. Delete the offset, and check the pinned counts are unchanged.
+
 ---
 
 ## 4. Measured calibration and kernel declarations

@@ -33,6 +33,7 @@ import pytest
 
 from tests.snapshots import resolve_snapshot, snapshot_config
 
+from backend.arch.eval.cache import Edges
 from backend.arch.layout.physical import physical_kernel_shapes
 from backend.inference.framework_bindings import get_binding
 
@@ -119,6 +120,7 @@ def test_peak_leaf_uids_match_the_serving_rewrite(model_id: str, seq_len: int):
     )
     records_by_block, _ext = _eval_leaf_records(
         serving.program, shapes, analysis.resolved_precision, rewrite=serving.rewrite,
+        edges=Edges(analysis, serving.program, serving.rewrite),
     )
     peak_uids = {
         r["uid"]
@@ -163,6 +165,7 @@ def test_fused_leaf_inputs_do_not_reference_deleted_sids():
     )
     records_by_block, _ext = _eval_leaf_records(
         serving.program, shapes, analysis.resolved_precision, rewrite=serving.rewrite,
+        edges=Edges(analysis, serving.program, serving.rewrite),
     )
     live = {
         output_id
@@ -233,8 +236,8 @@ def test_liveness_isolated_by_live_block_invocation(model_id):
         if contribution.block_index is not None and contribution.count == 0
     }
 
-    assert {index for index, _template in records_by_block} == live_indices
-    assert not ({index for index, _template in records_by_block} & dormant_indices)
+    assert {key[0] for key in records_by_block} == live_indices
+    assert not ({key[0] for key in records_by_block} & dormant_indices)
     for records in records_by_block.values():
         output_ids = [
             output_id

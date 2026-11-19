@@ -88,6 +88,7 @@ from ..cache_formats import CacheFormat
 from ..precision_profile import PrecisionError
 from .layer import Layer
 from .node import Identified
+from .occurrence import Occurrence
 from ..ops import OP_REGISTRY
 from .op_ref import KVPositions
 from .program import BlockStage
@@ -849,6 +850,22 @@ def main_port(port: Optional[str]) -> str:
     return "" if port in (None, "", "out") else port
 
 
+@dataclass(frozen=True)
+class Run:
+    """One run of a reader's input (`Edges.runs`): the iteration the reader
+    runs at; the iteration of the node whose input this is at that run
+    (`at` — the reader's own, or for a launch the iteration of the member
+    whose input it carries, which a launch across a seam ran a layer
+    earlier); the occurrence of the walked writer read there; and the node
+    that writes that occurrence now with the port it publishes it on."""
+
+    iteration: Optional[int]
+    at: Optional[int]
+    written: Any
+    node: Any
+    port: str
+
+
 class Edges:
     """What each node input of a graph reads, for the cache and traffic
     derivations.
@@ -874,9 +891,6 @@ class Edges:
         self._table = analysis.reference_table
         self._walked_uids = frozenset(
             node.uid for node in self._table.program.nodes())
-        self._absorbed_by = {
-            old: new for new, olds in self.rewrite.origins.items()
-            for old in olds if old in self.rewrite.dropped}
 
     def covers(self, node: Identified) -> bool:
         """Whether `node` runs in this analysis: the walk evaluated it, or a
@@ -906,23 +920,113 @@ class Edges:
             if ref.src.uid in self._table.program.handed_exits:
                 return ()
             return ((ref.src, main_port(ref.port)),)
+        found: Dict[Tuple[int, str], Identified] = {}
+        for run in self.runs(reader, index):
+            found.setdefault((run.node.uid, run.port), run.node)
+        return tuple((node, port) for (_uid, port), node in found.items())
+
+    def handed_exits(self) -> Any:
+        """The encoder outputs the walk reads as handed over
+        (`Program.handed_exits`): no node of this step writes them."""
+        return self._table.program.handed_exits
+
+    def writer_at(self, written: Occurrence, port: str
+                  ) -> Tuple[Identified, str]:
+        """The node that writes occurrence `written` of a node now, and the
+        port it publishes it on: the launch that took that run
+        (`Rewrite.launch_at`) on the port it exposes the member at, or the
+        node itself on `port`. The one answer to "which launch is this run"
+        every reader asks, and a run nothing writes any more is refused."""
+        launch = self.rewrite.launch_at(written.uid, written.iteration)
+        if launch is None:
+            if self.rewrite.whole(written.uid):
+                raise ValueError(
+                    f"iteration {written.iteration!r} of uid {written.uid} "
+                    f"is run by no launch, and the node is gone")
+            return self.program.by_uid(written.uid), port
+        node = self.program.by_uid(launch)
+        exposed = node.output_ports.get(written.uid)
+        return node, (exposed if exposed else port)
+
+    def runs(self, reader: Identified, index: int) -> Tuple["Run", ...]:
+        """`_runs`, once per input: every reader of the graph asks it."""
+        cache = self.__dict__.setdefault("_runs_cache", {})
         key = (reader.uid, index)
-        if not self._table.covers(reader.uid):
-            if key not in self.rewrite.inputs:
+        if key not in cache:
+            cache[key] = self._runs(reader, index)
+        return cache[key]
+
+    def _runs(self, reader: Identified, index: int) -> Tuple["Run", ...]:
+        """Each run of input `index` of `reader`: the iteration the reader
+        runs at, the occurrence of the walked writer it reads there — the
+        writer's own iteration, which a read across a layer seam or of a
+        stack's exit makes another than the reader's — and what writes that
+        occurrence now (`writer_at`).
+
+        The writer's iteration is the walk's (`Analysis.input_reference`).
+        A launch reads what each member whose input it carries read
+        (`Rewrite.inputs`), at the member's iteration each of its runs took
+        (`Rewrite.taken`). A node grafted after the walk that reads a
+        producer by its edge stands in that producer's scope, in its
+        iteration (`materialize_cast`, `materialize_comm`)."""
+        ref = tuple(reader.inputs_obj or ())[index]
+        key = (reader.uid, index)
+        out: List[Run] = []
+        if not self._table.covers(reader.uid) and key not in self.rewrite.inputs:
+            if ref.src is None:
                 raise ValueError(
                     f"{reader.display_path}: input {index} names "
                     f"{ref.external_sid!r}, and neither the walk nor a "
                     f"rewrite bound it")
+            if ref.src.uid in self._table.program.handed_exits:
+                return ()
+            leaf, port = ref.src, main_port(ref.port)
+            if ref.src.children:
+                leaf, written_port = self.program.output_leaf(
+                    ref.src, ref.port or "out")
+                port = main_port(written_port or "out")
+            for it in self.program.occurrence_layers(reader.uid):
+                if it is None and self.program.block_of(leaf.uid) is not None:
+                    raise ValueError(
+                        f"{reader.display_path}: a model-level node reads "
+                        f"{leaf.display_path}, a layer's, by its edge; which "
+                        f"layer's run it reads is unstated")
+                written = Occurrence(leaf.uid, it)
+                node, node_port = self.writer_at(written, port)
+                out.append(Run(it, it, written, node, node_port))
+            return tuple(out)
+        if self._table.covers(reader.uid):
+            pairs = [(it, it)
+                     for it in self.program.occurrence_layers(reader.uid)]
+        else:
             key = self.rewrite.inputs[key]
+            pairs = (list(self.rewrite.taken[reader.uid][key[0]].items())
+                     if reader.uid in self.rewrite.taken else
+                     [(it, it)
+                      for it in self.program.occurrence_layers(reader.uid)])
+            if not self._table.covers(key[0]):
+                # A member the walk did not evaluate — a collective spliced
+                # in — reads what its own input names, at its iterations.
+                member = {run.iteration: run for run in self.runs(
+                    self.program.by_uid(key[0]), key[1])}
+                return tuple(
+                    Run(it, at, member[at].written, member[at].node,
+                        member[at].port)
+                    for it, at in pairs if at in member)
         reference = self._table.at(*key)
-        found_reads: Dict[Tuple[int, str], None] = {}
-        for _iteration, found in reference.table:
-            for source in found:
-                uid = self._absorbed_by.get(source.occurrence.uid,
-                                            source.occurrence.uid)
-                found_reads[(uid, main_port(source.port))] = None
-        return tuple((self.program.by_uid(uid), port)
-                     for uid, port in found_reads)
+        for it, at in pairs:
+            for source in reference.at(at):
+                written, port = source.occurrence, main_port(source.port)
+                writer = self.program.by_uid(written.uid)
+                if writer is not None and writer.children:
+                    # A component's port: the leaf that writes it.
+                    leaf, leaf_port = self.program.output_leaf(
+                        writer, source.port or "out")
+                    written = Occurrence(leaf.uid, written.iteration)
+                    port = main_port(leaf_port or "out")
+                node, node_port = self.writer_at(written, port)
+                out.append(Run(it, at, written, node, node_port))
+        return tuple(out)
 
     def absorbed(self) -> Tuple[Identified, ...]:
         """The walked nodes a rewrite absorbed into a launch, in walk order.

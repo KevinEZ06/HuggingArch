@@ -15,7 +15,7 @@ created after the walk, out of nodes the walk already evaluated.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, FrozenSet, Mapping, Optional, Tuple
 
 from backend.arch.ops import attention_kernel
 
@@ -121,6 +121,22 @@ class FusedNode:
     #: outside-read members become boundary ports: a fused add+rmsnorm
     #: still lands the residual in HBM.
     sink: Optional[int] = None
+    #: The members that ran in the PREVIOUS iteration of the layer loop: a
+    #: launch matched across a seam (`fusion.Seams`) — the residual add that
+    #: closes layer i and the norm that opens layer i+1 — stands in the
+    #: reader's layer, its graph inputs the reader's formal, and runs once
+    #: per seam (`Rewrite.taken`). Empty for a launch within one iteration.
+    previous_iteration: FrozenSet[int] = frozenset()
+    #: The origin this launch runs with: its iterations index that origin's
+    #: (`Program.occurrence_layers`), and it stands in that origin's block
+    #: and repeat scope. For a launch across a seam, the reading layer's
+    #: member that reads the formal; otherwise the first origin.
+    home_uid: Optional[int] = None
+    @property
+    def home(self) -> int:
+        """The origin this launch runs with (`home_uid`; the first origin
+        for a launch built without one)."""
+        return self.origins[0] if self.home_uid is None else self.home_uid
 
     @property
     def aggregation_id(self) -> str:

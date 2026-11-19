@@ -26,10 +26,11 @@ reported peak belonged to an edge the replay invented, not to the model.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from backend.arch.eval.refusal import node_context
 from backend.arch.eval.activation_edges import leaf_input_ids, tensor_id
+from backend.arch.eval.cache import Edges
 
 import sympy as sp
 from backend.arch.eval.analysis import Point
@@ -80,6 +81,7 @@ def _eval_leaf_records(
     precision,
     *,
     rewrite=None,
+    edges=None,
     top_level: bool = False,
     differing: Optional[list] = None,
 ) -> Tuple[
@@ -138,82 +140,91 @@ def _eval_leaf_records(
                 )
             pending.extend(owned.children or ())
 
-    for fused_uid, origins in (rewrite.origins or {}).items():
-        fused = program.by_uid(fused_uid)
-        if fused is None:
+    for fused_uid in (rewrite.origins or {}):
+        if program.by_uid(fused_uid) is None:
             continue
-        keys = {ownership[uid] for uid in origins if uid in ownership}
-        if not keys:
-            continue
-        if len(keys) != 1:
+        # A launch belongs to the block invocation of the origin it runs
+        # with (`Rewrite.home`, `FusedNode.home`): for one across a layer
+        # seam, the reading layer's.
+        home = rewrite.home(fused_uid)
+        if home in ownership:
+            ownership[fused_uid] = ownership[home]
+
+    # The edge → producer join, made once in eval (absorption-resolved),
+    # per iteration class of each leaf (`activation_edges.leaf_input_ids`):
+    # a template whose layers run different launches is simulated once per
+    # class, each its own group (`(block, template, class)`).
+    input_ids = leaf_input_ids(program, rewrite, edges=edges)
+
+    by_template: Dict[Tuple[Any, ...], list] = {}
+    external_by_template: Dict[Tuple[Any, ...], Dict[str, int]] = {}
+
+    def _record(node, owner, inputs) -> None:
+        shape = shapes.values.get(node.uid)
+        main_bpe = precision.edge_bytes(node.role,
+                                        program.stack_of(node))
+        out_bytes = _tensor_bytes(
+            shape.out if shape is not None else None, main_bpe)
+        outputs = {tensor_id(node.uid, "out"): out_bytes}
+        if shape is not None:
+            for port, dims in shape.ports.items():
+                outputs[tensor_id(node.uid, port)] = _tensor_bytes(
+                    dims, _port_bpe(node, port, precision, program))
+        by_template.setdefault(owner, []).append({
+            "id": node.aggregation_id, "uid": node.uid, "op": node.op,
+            "inputs": inputs,
+            "out_bytes": out_bytes,
+            "outputs": outputs})
+        refs = tuple(node.inputs_obj or ())
+        if shape is None:
+            if refs:
+                raise ValueError(
+                    f"{node.display_path}: activation leaf has inputs but no "
+                    "physical shape"
+                )
+            return
+        if len(refs) != len(shape.ins):
             raise ValueError(
-                f"fused {fused.op} uid {fused_uid} spans block "
-                f"invocations {sorted(keys)!r}"
+                f"{node.display_path}: activation input refs/shapes have "
+                f"arity {len(refs)} != {len(shape.ins)}"
             )
-        ownership[fused_uid] = next(iter(keys))
+        external = external_by_template.setdefault(owner, {})
+        for ref, dims in zip(refs, shape.ins, strict=True):
+            if ref.src is not None or not ref.external_sid:
+                continue
+            input_bytes = _tensor_bytes(
+                dims, precision.default_edge_bytes)
+            previous = external.setdefault(ref.external_sid, input_bytes)
+            if previous != input_bytes and differing is not None and (
+                    isinstance(previous, sp.Basic)
+                    or isinstance(input_bytes, sp.Basic)):
+                differing.append(
+                    (owner, ref.external_sid, previous, input_bytes))
+            elif previous != input_bytes:
+                raise ValueError(
+                    f"block invocation {owner[0]} ({owner[1]!r}) external "
+                    f"input {ref.external_sid!r} "
+                    f"has conflicting physical sizes {previous} and "
+                    f"{input_bytes} bytes"
+                )
 
-    # The edge → producer join, made once in eval (absorption-resolved). This
-    # leaf's inputs are read off it rather than re-walked here.
-    input_ids = leaf_input_ids(program, rewrite)
-
-    by_template: Dict[Tuple[int, str], list] = {}
-    external_by_template: Dict[Tuple[int, str], Dict[str, int]] = {}
     for node in program.nodes():
         if node.children:
             continue
         with node_context(node.display_path):
-            owner = ownership.get(node.uid)
-            if owner is None:
+            block_owner = ownership.get(node.uid)
+            if block_owner is None:
                 continue
-            shape = shapes.values.get(node.uid)
-            inputs = input_ids[node.uid]
-            main_bpe = precision.edge_bytes(node.role,
-                                            program.stack_of(node))
-            out_bytes = _tensor_bytes(
-                shape.out if shape is not None else None, main_bpe)
-            outputs = {tensor_id(node.uid, "out"): out_bytes}
-            if shape is not None:
-                for port, dims in shape.ports.items():
-                    outputs[tensor_id(node.uid, port)] = _tensor_bytes(
-                        dims, _port_bpe(node, port, precision, program))
-            by_template.setdefault(owner, []).append({
-                "id": node.aggregation_id, "uid": node.uid, "op": node.op,
-                "inputs": inputs,
-                "out_bytes": out_bytes,
-                "outputs": outputs})
-            refs = tuple(node.inputs_obj or ())
-            if shape is None:
-                if refs:
-                    raise ValueError(
-                        f"{node.display_path}: activation leaf has inputs but no "
-                        "physical shape"
-                    )
-                continue
-            if len(refs) != len(shape.ins):
-                raise ValueError(
-                    f"{node.display_path}: activation input refs/shapes have "
-                    f"arity {len(refs)} != {len(shape.ins)}"
-                )
-            external = external_by_template.setdefault(owner, {})
-            for ref, dims in zip(refs, shape.ins, strict=True):
-                if ref.src is not None or not ref.external_sid:
-                    continue
-                input_bytes = _tensor_bytes(
-                    dims, precision.default_edge_bytes)
-                previous = external.setdefault(ref.external_sid, input_bytes)
-                if previous != input_bytes and differing is not None and (
-                        isinstance(previous, sp.Basic)
-                        or isinstance(input_bytes, sp.Basic)):
-                    differing.append(
-                        (owner, ref.external_sid, previous, input_bytes))
-                elif previous != input_bytes:
-                    raise ValueError(
-                        f"block invocation {owner[0]} ({owner[1]!r}) external "
-                        f"input {ref.external_sid!r} "
-                        f"has conflicting physical sizes {previous} and "
-                        f"{input_bytes} bytes"
-                    )
+            for iterations, inputs in input_ids[node.uid].items():
+                _record(node, (*block_owner, _class_key(iterations)), inputs)
+
     return by_template, external_by_template
+
+
+def _class_key(iterations) -> Tuple[Any, ...]:
+    """A class of iterations as a key: its iterations, in order."""
+    return tuple(sorted(iterations, key=lambda it: (it is None, it or 0)))
+
 
 
 def _tensor_bytes(dims, bytes_per_element):
@@ -410,6 +421,7 @@ class ActivationLiveness:
                 serving.shapes,
                 precision,
                 rewrite=serving.rewrite,
+                edges=Edges(analysis, serving.program, serving.rewrite),
                 # An encode step's model-level ops are its own work.
                 top_level=analysis.rule.phase == "encode",
                 differing=self._differing,
@@ -419,19 +431,29 @@ class ActivationLiveness:
         }))
         duplicate_names = {
             name
-            for _index, name in records_by_template
-            if sum(1 for key in records_by_template if key[1] == name) > 1
+            for _index, name, _class in records_by_template
+            if len({key[0] for key in records_by_template
+                    if key[1] == name}) > 1
         }
+        # A block whose layers run different launches is simulated once per
+        # iteration class (`Rewrite.iteration_classes`), each a group.
+        classes_of = {}
+        for block_index, _name, _iterations in records_by_template:
+            classes_of[block_index] = classes_of.get(block_index, 0) + 1
         #: `(label, records, external bytes)` per block invocation, every
         #: byte count a number or its law.
         self._blocks: List[Tuple[str, List[dict], Dict[str, object]]] = []
         for key, records in records_by_template.items():
-            block_index, template = key
+            block_index, template, iterations = key
             label = (
                 f"{template} (model-level ops)" if block_index == -1
                 else f"{template}#block={block_index}"
                 if template in duplicate_names else template
             )
+            if classes_of[block_index] > 1:
+                label = (f"{label} [layers {iterations[0]}-{iterations[-1]}]"
+                         if len(iterations) > 1
+                         else f"{label} [layer {iterations[0]}]")
             self._blocks.append((
                 label,
                 [{**record,
@@ -486,7 +508,8 @@ class ActivationLiveness:
         else:
             def value(law):
                 return law
-        for (block_index, template), sid, first, second in self._differing:
+        for (block_index, template, _class), sid, first, second in \
+                self._differing:
             if value(first) != value(second):
                 raise ValueError(
                     f"block invocation {block_index} ({template!r}) external "

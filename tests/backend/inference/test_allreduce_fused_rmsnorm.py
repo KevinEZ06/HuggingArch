@@ -92,7 +92,13 @@ class TestTPSwitchesBetweenNormFusions(unittest.TestCase):
             avg_input_tokens=1, avg_output_tokens=0,
             breakdown=False,
         )
-        return Counter(m["fused_op"] for m in result.fusion_matches)
+        # Launches within one layer: a launch across the layer seam pairs
+        # the previous layer's FFN exit with this layer's input norm, and
+        # whether an all-reduce precedes that add is the FFN's sharding
+        # (DeepSeek-V3's routed experts run unsharded here), not the
+        # attention-side chain these tests pin.
+        return Counter(m["fused_op"] for m in result.fusion_matches
+                       if not m["previous_iteration_aggregation_ids"])
 
     def test_tp1_fires_fused_add_rmsnorm_only(self):
         # Without comm injection, the 2-node chain matches; the
@@ -135,12 +141,9 @@ class TestTPSwitchesBetweenNormFusions(unittest.TestCase):
         # Llama has a clean 2-block (attn + ffn) template; the
         # all_reduce after o_proj is followed by add+rmsnorm
         # (post_attention_layernorm) and fuses cleanly. The
-        # all_reduce after down_proj feeds the next-block's
-        # input_layernorm, which crosses the template boundary —
-        # The fusion matcher operates within one template, so
-        # it stays as a bare all_reduce. Pin this asymmetry so a
-        # future cross-template fusion attempt doesn't silently
-        # change the count.
+        # all_reduce after down_proj feeds the next layer's
+        # input_layernorm across the layer seam, where vLLM's
+        # all-reduce + RMSNorm pass fuses it too (`fusion.Seams`).
         pc = ParallelConfig(tp_attention=8, tp_dense_ffn=8)
         result = analyze(
             self.resolved_by_id["meta-llama/Llama-2-7b-hf"],
@@ -151,9 +154,10 @@ class TestTPSwitchesBetweenNormFusions(unittest.TestCase):
             breakdown=False,
         )
         matches = Counter(m["fused_op"] for m in result.fusion_matches)
-        # Exactly 1 fused (attention side) + 1 bare all_reduce
-        # surviving (ffn side) per block template.
-        self.assertEqual(matches.get("allreduce_fused_rmsnorm", 0), 1)
+        # One launch on the attention side, one across the seam from the
+        # FFN's all-reduce into the next layer's input norm, and one from
+        # the last layer's into the final norm: no all-reduce stays bare.
+        self.assertEqual(matches.get("allreduce_fused_rmsnorm", 0), 3)
         # Count the block-level FFN-exit all_reduce only; the top-level
         # vocab-parallel embedding all_reduce is a separate model-level
         # collective, not part of the per-block fusion pattern this pins.
@@ -163,7 +167,7 @@ class TestTPSwitchesBetweenNormFusions(unittest.TestCase):
             and node.op == "all_reduce"
             and "vocab_" not in node.aggregation_id
         )
-        self.assertEqual(bare_all_reduces, 1)
+        self.assertEqual(bare_all_reduces, 0)
 
     def test_hybrid_model_fuses_every_block_not_just_one(self):
         # Regression for the cross-template spec_id collision: DSv3's
@@ -202,11 +206,16 @@ class TestTPSwitchesBetweenNormFusions(unittest.TestCase):
                 f"{tmpl}: norm should fuse the TP-allreduce variant, "
                 f"got {marker!r} — a block was missed by the per-block pass",
             )
-        # No block fell back to the TP=1 two-node fusion.
+        across_seam = {m["fused_uid"] for m in result.fusion_matches
+                       if m["previous_iteration_aggregation_ids"]}
+        # No block fell back to the TP=1 two-node fusion within a layer (a
+        # launch across the seam out of the unsharded MoE FFN has no
+        # all-reduce to take).
         all_markers = Counter(
             n.fused_from
             for _meta, roots in result.post_tree.blocks
             for n in walk(roots)
+            if n.uid not in across_seam
         )
         self.assertEqual(all_markers.get("fused_add_rmsnorm", 0), 0)
 

@@ -15,9 +15,10 @@
 #   add :327, norm :332-345), from hyperconnection.py:190
 #   (`combine_and_mix`), called for the MLP read after attention inside a
 #   layer (model.py:344) and for a layer's attention read after the previous
-#   layer's MLP (model.py:322). Only the first lies in one component scope;
-#   the cross-layer one is the HC seam a match cannot cross, and stays billed
-#   unfused. Qwen4Exp only.
+#   layer's MLP (model.py:322). The first lies in one component scope; the
+#   cross-layer one is matched across the layer seam, the previous layer's
+#   members bound through the formal it hands on (`eval.fusion.Seams`).
+#   Qwen4Exp only.
 # sglang (v0.5.22): `hc_combine_apply_norm`
 #   (kernels/ops/elementwise/hc_combine_decode.py:41, kernel
 #   `hc_combine_norm_decode_kernel`, jit/csrc/elementwise/

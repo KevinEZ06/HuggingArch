@@ -47,7 +47,8 @@ from backend.arch.ops import (
 
 from dataclasses import dataclass, field
 from typing import (
-    Any, ClassVar, Dict, FrozenSet, Iterator, List, Mapping, Optional, Sequence, Tuple,
+    Any, ClassVar, Dict, FrozenSet, Iterator, List, Mapping, Optional,
+    Sequence, Tuple,
 )
 
 import sympy as sp
@@ -58,8 +59,10 @@ from .analysis import OwnCopies
 from .cache import (Edges, cached_node_uids, is_view, main_port,
                     state_carrier_uids)
 from .dim import exact, is_whole, same_law, value_of, where
+
 from .launch import FusedNode
 from .layer import Layer, Rewrite
+from .occurrence import Occurrence
 from .traffic import TensorReaders, reader_format
 from .values import Cost, Moved, Shape, product
 from backend.code_trace.memo import memo_property
@@ -91,6 +94,10 @@ class FusedProgram:
     base: Any
     fused: Tuple[FusedNode, ...] = ()
     absorbed: FrozenSet[int] = frozenset()
+    #: This pass's rewrite: which runs of each node each of its launches
+    #: took (`Rewrite.taken`), the one statement every run count here is
+    #: read off.
+    rewrite: Rewrite = field(default_factory=Rewrite)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.base, name)
@@ -171,7 +178,11 @@ class FusedProgram:
 
         def slot_of(fused: FusedNode) -> Tuple[int, int]:
             if fused.uid not in slots:
-                slot = min(index[uid] for uid in fused.origins)
+                # A launch across a seam runs where the reading iteration
+                # starts it: its previous-iteration members ran a layer
+                # earlier, and their position says nothing of this one.
+                slot = min(index[uid] for uid in fused.origins
+                           if uid not in fused.previous_iteration)
                 depth = 0
                 for ref in fused.inputs_obj:
                     if ref.src is None:
@@ -202,21 +213,125 @@ class FusedProgram:
                 return node
         return self.base.by_uid(uid)
 
+    def occurrence_layers(self, uid: int) -> Tuple[Optional[int], ...]:
+        """The iterations a node runs at, read off this pass's one statement
+        of which runs it took (`Rewrite.taken`): a launch's own, a node a
+        launch took only some runs of the ones it has left, and any other
+        node as before."""
+        if uid in self.rewrite.taken:
+            return _ordered(self.rewrite.iterations(uid))
+        if self.rewrite.partly(uid):
+            return _ordered(frozenset(self.base.occurrence_layers(uid))
+                            - self.rewrite.taken_at(uid))
+        return self.base.occurrence_layers(uid)
+
     def block_of(self, uid: int) -> Optional[int]:
-        """A fused kernel runs in the layer its origins ran in; a match
-        never spans two block invocations."""
+        """A fused kernel runs in the layer its home ran in
+        (`FusedNode.home`) — the reading iteration's, for a launch across a
+        seam; a match never spans two block invocations otherwise."""
         for node in self.fused:
             if node.uid == uid:
-                return self.base.block_of(node.origins[0])
+                return self.base.block_of(node.home)
         return self.base.block_of(uid)
 
     def repeated_in(self, uid: int) -> Tuple[int, ...]:
         """And it repeats as they did — a match never spans two repeat
-        scopes either, so the first origin answers for all of them."""
+        scopes either, so its home origin answers for all of them."""
         for node in self.fused:
             if node.uid == uid:
-                return self.base.repeated_in(node.origins[0])
+                return self.base.repeated_in(node.home)
         return self.base.repeated_in(uid)
+
+
+def _ordered(iterations: Any) -> Tuple[Optional[int], ...]:
+    return tuple(sorted(iterations, key=lambda it: (it is None, it or 0)))
+
+
+@dataclass(frozen=True)
+class _Taken:
+    """What one match takes: the launch's home and the iterations of it the
+    launch runs at, and per member which of its iterations each of the
+    launch's runs takes (the same one, or for a member of the previous
+    layer the writing one) — `Rewrite.taken`."""
+
+    home: int
+    iterations: FrozenSet[Optional[int]]
+    by_member: Mapping[int, Mapping[Optional[int], Optional[int]]]
+
+
+@dataclass
+class _Runs:
+    """The iterations each node still runs at on its own within one
+    rewrite — the one statement of how often a node runs, from which every
+    count is read (`Rewrite.taken`, `FusedProgram.occurrence_layers`).
+
+    A launch within one iteration takes every run its members have left. A
+    launch across a seam takes the runs of the seams it spans
+    (`_Binding.pairs`): the reading layer's members at the reading
+    iterations, the previous layer's at the writing ones. A member of a
+    layer whose first iteration has no seam before it — the norm that opens
+    a stack — keeps that run, and so stays in the graph; the next match (or
+    pass) takes what is left. Node-level all-or-nothing is what made a seam
+    impossible to fuse; this is that answer at iteration grain."""
+
+    program: Any
+    left: Dict[int, FrozenSet[Optional[int]]]
+
+    @classmethod
+    def of(cls, program: Any) -> "_Runs":
+        return cls(program, {})
+
+    def has(self, uid: int) -> FrozenSet[Optional[int]]:
+        """The iterations `uid` still runs at on its own."""
+        if uid in self.left:
+            return self.left[uid]
+        return frozenset(self.program.occurrence_layers(uid))
+
+    def take(self, match: _Binding, members: Sequence[int],
+             seams: Seams) -> Optional[_Taken]:
+        """What `match` takes, None for a match with no run left to take
+        or whose members do not run as one launch."""
+        if match.pairs is None:
+            took = frozenset.intersection(*(self.has(uid) for uid in members))
+            if not took:
+                return None
+            return _Taken(members[0], took, {
+                uid: {it: it for it in took} for uid in members})
+        # The reading members of one launch run at one set of iterations:
+        # each formal read the binding crossed is read by them.
+        readers = {seams.readers[key] for key in match.crossed}
+        if len({frozenset(self.program.occurrence_layers(uid))
+                for uid in readers}) != 1:
+            return None
+        writers = {source.uid for _it, source in match.pairs}
+        if len(writers) != 1:
+            return None
+        previous = match.previous
+        reading = frozenset.intersection(
+            *(self.has(uid) for uid in members if uid not in previous))
+        writing = frozenset.intersection(
+            *(self.has(uid) for uid in members if uid in previous))
+        pairs = [(it, source) for it, source in match.pairs
+                 if it in reading and source.iteration in writing]
+        if not pairs:
+            return None
+        home = min(uid for uid, _index in match.crossed)
+        return _Taken(home, frozenset(it for it, _source in pairs), {
+            uid: ({it: source.iteration for it, source in pairs}
+                  if uid in previous else {it: it for it, _source in pairs})
+            for uid in members})
+
+    def commit(self, taken: _Taken) -> FrozenSet[int]:
+        """Take `taken`'s runs; the members it took every run of."""
+        whole: set = set()
+        for uid, at in taken.by_member.items():
+            rest = self.has(uid) - frozenset(at.values())
+            if rest:
+                self.left[uid] = rest
+            else:
+                self.left.pop(uid, None)
+                whole.add(uid)
+        return frozenset(whole)
 
 
 # -- matching -------------------------------------------------------------
@@ -513,6 +628,7 @@ def _writing_leaves(program: Any, node: Any) -> Iterator[Tuple[Any, str]]:
 def _external_inputs(members: Sequence[Any],
                      edges: Optional[Mapping[int, Tuple]] = None,
                      internal: FrozenSet[int] = frozenset(),
+                     crossed: FrozenSet[Tuple[int, int]] = frozenset(),
                      ) -> List[Tuple[int, int, Any]]:
     """`(member_uid, input_index, ref)` for every edge entering the match from
     outside, in member order, one entry per distinct outside producer.
@@ -525,6 +641,9 @@ def _external_inputs(members: Sequence[Any],
     the kernel exists. `internal` names further nodes inside the launch
     that no pattern node binds — the views a quantised write was read
     through (`ViewChains.through`) — so an edge out of them is no input.
+    `crossed` names the formal reads a match bound across a seam
+    (`_Binding.crossed`): their producer is a member of the previous
+    iteration, so they are no input either.
     """
     inside = {n.uid for n in members} | set(internal)
     seen: set = set()
@@ -532,6 +651,8 @@ def _external_inputs(members: Sequence[Any],
     for member in sorted(members, key=lambda n: n.uid):
         resolved = (edges or {}).get(member.uid)
         for index, ref in enumerate(tuple(member.inputs_obj or ())):
+            if (member.uid, index) in crossed:
+                continue
             src = ref.src
             # Membership is judged on the view's producer — the leaf that
             # writes what this input reads — while the ref stays the one the
@@ -691,12 +812,172 @@ class OperandRoles:
         return self._memo[uid]
 
 
+@dataclass(frozen=True)
+class SeamEdge:
+    """One writer a formal read resolves to across the seam between two
+    iterations of a layer loop: `producer`'s `port` is what input `index`
+    of the reader reads, at the iterations `pairs` names — each
+    `(reader iteration, source occurrence)` one seam."""
+
+    producer: int
+    port: str
+    pairs: FrozenSet[Tuple[Optional[int], Occurrence]]
+
+
+@dataclass(frozen=True)
+class Seams:
+    """Where a formal of a layer template is written by the previous
+    iteration, read off the walk's references (`Analysis.reference_table`):
+    `(reader uid, input) -> SeamEdge` per writer, the iterations it writes
+    for in its edge.
+
+    The walk evaluates a template once and binds, beside each value an
+    input reads, the occurrences that produced it at every iteration
+    (`occurrence.Reference`). The residual a layer reads is the previous
+    layer's exit (`Program.threads_loop`), so the norm that opens layer i+1
+    and the add that closed layer i are one producer–consumer edge at
+    iterations 1..c−1 of a segment, the previous segment's exit at its
+    first, and the stack's last exit for the model-level reader after it.
+    Nothing here is new: the edge is the walk's, and the matcher follows it
+    as it follows a sibling edge (`_dag_bindings`).
+
+    A seam whose two occurrences run on different pipeline stages is a cut,
+    not a seam: the value is sent there, and the add runs where it was
+    made. The stage is the walk's placement (`Rule.stage_of`), read here
+    and asked of no caller."""
+
+    edges: Mapping[Tuple[int, int], Tuple[SeamEdge, ...]]
+    #: The walked node whose iterations a reader's runs are: the reader
+    #: itself, or the reader a grafted cast reads for.
+    readers: Mapping[Tuple[int, int], int] = field(default_factory=dict)
+
+    @classmethod
+    def of(cls, program: Any, analysis: Any, nodes: Sequence[Any],
+           graft: Any = None) -> "Seams":
+        # The walk's bound references; a rewrite with no walk behind it (a
+        # test's bare program) has no iteration to cross into.
+        table = None if analysis is None else analysis.reference_table
+        if table is None:
+            return cls({}, {})
+        # Which pipeline stage each occurrence runs on is the walk's
+        # placement (`Rule.stage_of`): a seam a cut separates is a hop, so
+        # no caller can make one by forgetting to say where the cut is.
+        stage_of = analysis.rule.stage_of(analysis)
+        present = {node.uid for node in nodes}
+
+        out: Dict[Tuple[int, int], Tuple[SeamEdge, ...]] = {}
+        readers: Dict[Tuple[int, int], int] = {}
+        for node in nodes:
+            for index, ref in enumerate(node.inputs_obj or ()):
+                if ref.src is not None:
+                    continue
+                key = (node.uid, index)
+                if not table.covers(node.uid):
+                    # A grafted cast reads what its first reader's input
+                    # was bound to (`CastGraft.rewrite`).
+                    key = (graft.inputs.get(key) if graft is not None
+                           else None)
+                    if key is None or not table.covers(key[0]):
+                        continue
+                if key[1] >= table.arity[key[0]]:
+                    continue
+                reference = table.at(*key)
+                found: Dict[Tuple[int, str], set] = {}
+                for it in sorted(program.occurrence_layers(key[0]),
+                                 key=lambda i: (i is None, i)):
+                    for source in reference.at(it):
+                        if not program.threads_loop(key[0], source):
+                            continue
+                        written, port = source.occurrence, source.port
+                        writer = program.by_uid(written.uid)
+                        if writer is not None and writer.children:
+                            # A layer whose exit is a component's port:
+                            # the leaf that writes it (`_writing_leaves`).
+                            leaf, leaf_port = program.output_leaf(
+                                writer, port or "out")
+                            written = Occurrence(leaf.uid, written.iteration)
+                            port = leaf_port or "out"
+                        if written.uid not in present:
+                            continue
+                        if stage_of(program, source.occurrence.uid,
+                                    written.iteration) \
+                                != stage_of(program, node.uid, it):
+                            continue
+                        found.setdefault((written.uid, port),
+                                         set()).add((it, written))
+                if found:
+                    readers[(node.uid, index)] = key[0]
+                    out[(node.uid, index)] = tuple(
+                        SeamEdge(uid, port, frozenset(pairs))
+                        for (uid, port), pairs in sorted(found.items()))
+        return cls(out, readers)
+
+    def consumers(self) -> Dict[int, List[Tuple[int, str]]]:
+        """`_consumers`' entries for the reads across a seam: a writer of
+        the previous iteration is read by the formal's readers."""
+        out: Dict[int, List[Tuple[int, str]]] = {}
+        for (reader, _index), found in self.edges.items():
+            for edge in found:
+                out.setdefault(edge.producer, []).append((reader, edge.port))
+        return out
+
+
+@dataclass
+class _Binding:
+    """One partial binding of a pattern: the graph node per pattern node,
+    the external operands, which side of a seam each pattern node is on
+    (0 the reading iteration, 1 the previous one), and the seams crossed —
+    the formal reads bound to a previous-iteration writer and the
+    iteration pairs every one of them agrees on."""
+
+    bound: Dict[str, Any] = field(default_factory=dict)
+    external: Dict[str, Any] = field(default_factory=dict)
+    side: Dict[str, int] = field(default_factory=dict)
+    crossed: FrozenSet[Tuple[int, int]] = frozenset()
+    pairs: Optional[FrozenSet[Tuple[Optional[int], Occurrence]]] = None
+
+    def copy(self) -> "_Binding":
+        return _Binding(dict(self.bound), dict(self.external),
+                        dict(self.side), self.crossed, self.pairs)
+
+    def across(self, key: Tuple[int, int], edge: SeamEdge
+               ) -> Optional["_Binding"]:
+        """This binding with the seam `key` bound to `edge`'s writer: the
+        iterations it spans are those every crossed seam spans."""
+        pairs = (edge.pairs if self.pairs is None
+                 else self.pairs & edge.pairs)
+        if not pairs:
+            return None
+        out = self.copy()
+        out.crossed = self.crossed | {key}
+        out.pairs = pairs
+        return out
+
+    @property
+    def previous(self) -> FrozenSet[int]:
+        """The members of the previous iteration."""
+        return frozenset(node.uid for name, node in self.bound.items()
+                         if self.side.get(name, 0))
+
+
 def _dag_matches(pattern: Any, nodes: Sequence[Any],
                  scopes: Mapping[int, Any],
                  operands: OperandRoles,
                  edges: Optional[Mapping[int, Tuple]] = None,
                  views: Optional[ViewChains] = None,
                  ) -> List[Dict[str, Any]]:
+    """`_dag_bindings`' member maps, within one iteration (no seams)."""
+    return [binding.bound for binding in _dag_bindings(
+        pattern, nodes, scopes, operands, edges, views)]
+
+
+def _dag_bindings(pattern: Any, nodes: Sequence[Any],
+                  scopes: Mapping[int, Any],
+                  operands: OperandRoles,
+                  edges: Optional[Mapping[int, Tuple]] = None,
+                  views: Optional[ViewChains] = None,
+                  seams: Optional[Seams] = None,
+                  ) -> List[_Binding]:
     """Every occurrence of a declared node-and-edge subgraph.
 
     Anchored on the pattern's SINKS — the nodes no other pattern node
@@ -734,6 +1015,13 @@ def _dag_matches(pattern: Any, nodes: Sequence[Any],
     other end of those views: quantising after them is quantising before
     them. The views themselves are no pattern node; the rewrite takes them
     into the launch (`ViewChains.through`).
+
+    An input that reads a formal of a layer template the previous iteration
+    wrote (`Seams`) binds that writer as a producer, as a sibling edge
+    would: the writer and what the pattern binds above it are the previous
+    iteration's side of the match, confined to one scope of their own, and
+    the binding records the iteration pairs it spans. One seam deep — the
+    previous side follows no further seam.
     """
     declared = dict(pattern.nodes or {})
     if len(declared) < 2:
@@ -758,119 +1046,141 @@ def _dag_matches(pattern: Any, nodes: Sequence[Any],
     if not sinks:
         return []                       # cyclic: not a subgraph
     by_uid = {n.uid: n for n in nodes}
+    crossing = {} if seams is None else seams.edges
 
-    def _bind(pattern_name: str, node: Any,
-              bound: Dict[str, Any], external: Dict[str, Any]) -> bool:
+    def _bind(pattern_name: str, node: Any, state: _Binding,
+              side: int) -> List[_Binding]:
         spec = declared[pattern_name]
         if not spec.accepts_op(node.op):
-            return False
+            return []
         if spec.feeds is not None and (
                 spec.feeds not in operands.of_node(node.uid)
                 or operands.of_node(node.uid) & (fed - {spec.feeds})):
-            return False
-        if bound.get(pattern_name) not in (None, node):
-            return False
-        if any(n.uid == node.uid for k, n in bound.items()
+            return []
+        if state.bound.get(pattern_name) not in (None, node):
+            return []
+        if state.side.get(pattern_name, side) != side:
+            return []                   # one node, one iteration
+        if any(n.uid == node.uid for k, n in state.bound.items()
                if k != pattern_name):
-            return False                # one graph node per pattern slot
-        bound[pattern_name] = node
+            return []                   # one graph node per pattern slot
+        state = state.copy()
+        state.bound[pattern_name] = node
+        state.side[pattern_name] = side
         refs = list(spec.inputs)
         optional = list(spec.optional_inputs)
         actual = _producer_ids(node, edges)
         if len(actual) < len(refs) or len(actual) > len(refs) + len(optional):
-            return False
+            return []
+        states = [state]
         for index, (ref, (producer, port)) in enumerate(zip(
                 refs + optional[:len(actual) - len(refs)], actual,
                 strict=True)):
             head, _, tail = ref.partition(".")
-            if head == "external":
-                if external.setdefault(tail, producer) != producer:
-                    return False        # two operands claim one producer
-                continue
-            if _bind_edge(head, tail, producer, port, bound, external):
-                continue
-            root = None if views is None else views.root(node, index)
-            if root is None or not _bind_edge(head, tail, root[0], root[1],
-                                              bound, external):
-                return False
-        return True
+            following: List[_Binding] = []
+            for current in states:
+                if head == "external":
+                    if current.external.get(tail, producer) != producer:
+                        continue        # two operands claim one producer
+                    current = current.copy()
+                    current.external[tail] = producer
+                    following.append(current)
+                    continue
+                found = _bind_edge(head, tail, producer, port, current, side)
+                if not found:
+                    root = None if views is None else views.root(node, index)
+                    if root is not None:
+                        found = _bind_edge(head, tail, root[0], root[1],
+                                           current, side)
+                if not found and side == 0:
+                    for edge in crossing.get((node.uid, index), ()):
+                        for across in _bind_edge(head, tail, edge.producer,
+                                                 edge.port, current, 1):
+                            joined = across.across((node.uid, index), edge)
+                            if joined is not None:
+                                found.append(joined)
+                following.extend(found)
+            states = following
+            if not states:
+                return []
+        return states
 
     def _bind_edge(head: str, tail: str, producer: Any, port: str,
-                   bound: Dict[str, Any], external: Dict[str, Any]) -> bool:
+                   state: _Binding, side: int) -> List[_Binding]:
         """Bind the pattern edge `head.tail` to the graph edge
         `(producer, port)`. A node declared `optional` that the producer
         is not is read through: the edge binds to the node's own internal
         input instead, and the node is absent from the match."""
         if not isinstance(producer, int) or producer not in by_uid:
-            return False
-        trial_bound, trial_external = dict(bound), dict(external)
-        if (not tail or port == tail) and _bind(
-                head, by_uid[producer], trial_bound, trial_external):
-            bound.update(trial_bound)
-            external.update(trial_external)
-            return True
+            return []
+        if not tail or port == tail:
+            found = _bind(head, by_uid[producer], state, side)
+            if found:
+                return found
         spec = declared[head]
-        if not spec.optional or head in bound:
-            return False
+        if not spec.optional or head in state.bound:
+            return []
         (through,) = spec.internal_inputs()
         through_head, _, through_tail = through.partition(".")
         return _bind_edge(through_head, through_tail, producer, port,
-                          bound, external)
+                          state, side)
 
-    def _extend(index: int, bound: Dict[str, Any],
-                external: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _extend(index: int, state: _Binding) -> List[_Binding]:
         if index == len(sinks):
-            if not required <= set(bound):
+            if not required <= set(state.bound):
                 return []
-            # One launch, one scope — the views a member was read through
-            # included (`ViewChains.through`): each is placed by its own
-            # outermost node, the one whose parent is not itself a view of
-            # the chain.
+            # One launch, one scope per iteration it spans — the views a
+            # member was read through included (`ViewChains.through`): each
+            # is placed by its own outermost node, the one whose parent is
+            # not itself a view of the chain.
             chain = (frozenset() if views is None
-                     else views.through(tuple(bound.values())))
-            placed = {scopes.get(n.uid) for n in bound.values()} | {
-                scopes.get(uid) for uid in chain
-                if scopes.get(uid, (None, None))[1] not in chain}
-            if len(placed) > 1:
-                return []
-            return [dict(bound)]
-        return _anchor(sinks[index], index, bound, external)
+                     else views.through(tuple(state.bound.values())))
+            for side in set(state.side.values()):
+                placed = {scopes.get(n.uid)
+                          for name, n in state.bound.items()
+                          if state.side[name] == side}
+                if side == 0:
+                    placed |= {
+                        scopes.get(uid) for uid in chain
+                        if scopes.get(uid, (None, None))[1] not in chain}
+                if len(placed) > 1:
+                    return []
+            return [state]
+        return _anchor(sinks[index], index, state)
 
-    def _anchor(name: str, index: int, bound: Dict[str, Any],
-                external: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _anchor(name: str, index: int, state: _Binding) -> List[_Binding]:
         """Bind the pattern sink `name` to every candidate, then the next
         sink. An optional sink may also be absent: the chain then ends at
         its one internal input, anchored in its place — after the
         candidates WITH the sink, so the larger match is met first."""
-        if name in bound:
-            return _extend(index + 1, bound, external)
+        if name in state.bound:
+            return _extend(index + 1, state)
         spec = declared[name]
-        out: List[Dict[str, Any]] = []
-        taken = {n.uid for n in bound.values()}
+        out: List[_Binding] = []
+        taken = {n.uid for n in state.bound.values()}
         for node in nodes:
             if node.uid in taken or not spec.accepts_op(node.op):
                 continue
-            trial_bound, trial_external = dict(bound), dict(external)
-            if _bind(name, node, trial_bound, trial_external):
-                out.extend(_extend(index + 1, trial_bound, trial_external))
+            for found in _bind(name, node, state, 0):
+                out.extend(_extend(index + 1, found))
         if spec.optional:
             (through,) = spec.internal_inputs()
-            out.extend(_anchor(through.rsplit(".", 1)[0], index,
-                               bound, external))
+            out.extend(_anchor(through.rsplit(".", 1)[0], index, state))
         return out
 
-    matches = _extend(0, {}, {})
+    matches = _extend(0, _Binding())
     # The members are what a fusion IS, so one member set is one match —
     # and it must bind one way. Two bindings of the same set put the port
     # names on whichever the enumeration met first.
     seen: Dict[FrozenSet[int], Dict[str, int]] = {}
-    unique: List[Dict[str, Any]] = []
-    for bound in matches:
+    unique: List[_Binding] = []
+    for match in matches:
+        bound = match.bound
         key = frozenset(n.uid for n in bound.values())
         binding = {name: n.uid for name, n in bound.items()}
         if key not in seen:
             seen[key] = binding
-            unique.append(bound)
+            unique.append(match)
         elif seen[key] != binding:
             names = {n.uid: n.name for n in bound.values()}
             raise ValueError(
@@ -1252,26 +1562,40 @@ class Fusion:
         is_parallel = pattern.parallel is not None
         views = (None if is_parallel
                  else ViewChains.of(program, analysis, local_shapes, graft))
-        matches = (_parallel_matches(pattern.parallel, nodes, scopes,
-                                     program, edges)
+        # The seams a binding may cross: a formal a layer reads, written by
+        # the iteration before it (`Seams`). A parallel form groups siblings
+        # of one iteration and crosses none.
+        seams = (Seams({}, {}) if is_parallel
+                 else Seams.of(program, analysis, nodes, graft))
+        matches = ([_Binding(bound=bound) for bound in _parallel_matches(
+                       pattern.parallel, nodes, scopes, program, edges)]
                    if is_parallel
-                   else _dag_matches(pattern, nodes, scopes,
-                                     OperandRoles.of(program), edges, views))
+                   else _dag_bindings(pattern, nodes, scopes,
+                                      OperandRoles.of(program), edges, views,
+                                      seams))
         if self.condition is not None:
             head, _, port = str(pattern.io_mapping.get("output", "")
                                 ).partition(".")
-            matches = [bound for bound in matches
+            matches = [match for match in matches
                        if self.condition.admits_match(
-                           bound, analysis,
-                           output=_walked_output(pattern, bound, head, port))]
+                           match.bound, analysis,
+                           output=_walked_output(pattern, match.bound, head,
+                                                 port))]
         if not matches:
             return program, Rewrite()
 
         consumers = _consumers(nodes, edges)
+        for producer, readers in seams.consumers().items():
+            consumers.setdefault(producer, []).extend(readers)
         origins: Dict[int, Tuple[int, ...]] = {}
         fused: List[FusedNode] = []
         absorbed: set = set()
         inputs: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        # The iterations each node still runs at on its own (`_Runs`), and
+        # each launch's (`Rewrite.taken`, `Rewrite.homes`).
+        runs = _Runs.of(program)
+        taken: Dict[int, Mapping[int, Mapping[Any, Any]]] = {}
+        homes: Dict[int, int] = {}
         # A fresh uid past every node of the graph, walked or not: an encode
         # walk's nodes are not the graph's last. It must also clear the
         # TREE's high-water mark: `materialize_tree` asks the tree for each
@@ -1283,7 +1607,8 @@ class Fusion:
             max((n.uid for n in program.nodes()), default=0) + 1,
             _tree_high_water(program))
 
-        for bound in matches:
+        for match in matches:
+            bound = match.bound
             # The views a quantised member was read through join the launch
             # (`ViewChains`): they are members, priced at nothing as every
             # view is, and the launch writes the tensor they re-index.
@@ -1306,7 +1631,14 @@ class Fusion:
                     ports=(_exposed_ports(pattern, bound)
                            if view is not None else None)):
                 continue
-            members = tuple(sorted(inside))
+            took = runs.take(match, tuple(sorted(inside)), seams)
+            if took is None:
+                continue
+            # The home first: every layer that takes a launch's value from
+            # one origin (`_first`: its frame, its definitions) takes it
+            # from the origin the launch runs with, as `block_of` does.
+            members = (took.home, *(uid for uid in sorted(inside)
+                                    if uid != took.home))
             member_nodes = tuple(bound.values())
             sink, _exposed = _boundary_outputs(member_nodes, consumers)
             ordered_members = tuple(sorted(member_nodes, key=lambda n: n.uid))
@@ -1367,24 +1699,67 @@ class Fusion:
             sink_node = (
                 program.by_uid(named) if named is not None else None
             )
-            external = _external_inputs(member_nodes, edges, chain)
+            external = _external_inputs(member_nodes, edges, chain,
+                                        match.crossed)
             inputs.update(((next_uid, position), (member, index))
                           for position, (member, index, _ref)
                           in enumerate(external))
+            previous = match.previous
+            refs = tuple(ref for _m, _i, ref in external)
+            if previous:
+                # A launch across a seam stands in the reading iteration and
+                # reads, on the graph, the formal it read there: what the
+                # previous iteration's members read is each position's
+                # `Rewrite.inputs`, as for any input no node of this graph
+                # writes (`cache.Edges.reads`). An edge drawn to the previous
+                # iteration's nodes would close a cycle in the template.
+                (formal,) = {
+                    tuple(program.by_uid(uid).inputs_obj)[index].external_sid
+                    for uid, index in match.crossed}
+                # Each is a tensor of its own the loop carries across the
+                # seam — vLLM's `hidden_states` and `residual` — so each is
+                # named for the formal and the writer it carries: one name
+                # for two tensors would be one block input of two sizes.
+                refs = tuple(
+                    type(ref)(src=None, port=ref.port,
+                              external_sid=(
+                                  f"{formal}:{ref.src.display_path or ref.src.name}"
+                                  if ref.src is not None
+                                  else ref.external_sid),
+                              grafted=True)
+                    if member in previous else ref
+                    for (member, _i, ref) in external)
+            name = anchor.name
+            display_path = anchor.display_path or anchor.name or ""
+            if previous:
+                # Named for the seam it spans: the reading member may keep
+                # runs of its own (the norm that opens a stack), and one
+                # reader can close two seams — the layer before it in its
+                # own template, and the last layer of the template before
+                # (DeepSeek-V3's dense → MoE junction) — so the reader's
+                # name alone would be two rows' name.
+                writers = {program.by_uid(uid).template or ""
+                           for uid in previous}
+                (writer,) = writers
+                suffix = ("__seam" if writer == (anchor.template or "")
+                          else f"__seam@{writer or 'model'}")
+                name, display_path = name + suffix, display_path + suffix
             node = FusedNode(
                 uid=next_uid, op=self.scheme_name, origins=members,
-                name=anchor.name,
+                name=name,
                 role=sink_node.role if sink_node is not None else None,
                 template=anchor.template or "",
-                display_path=anchor.display_path or anchor.name or "",
+                display_path=display_path,
                 stack_name=anchor.stack_name or "",
                 component_path=tuple(anchor.component_path or ()),
                 component_scope=anchor.component_scope,
                 boundary_role=anchor.boundary_role,
                 ports={k: (n.uid, "out") for k, n in bound.items()},
                 output_ports=output_ports,
-                inputs_obj=tuple(ref for _m, _i, ref in external),
+                inputs_obj=refs,
                 sink=sink,
+                previous_iteration=previous,
+                home_uid=took.home,
                 is_comm_op=any(
                     m.op in OP_REGISTRY and OP_REGISTRY[m.op].is_comm_op
                     for m in member_nodes),
@@ -1400,7 +1775,9 @@ class Fusion:
                 output_dtype=output_dtype)
             fused.append(node)
             origins[next_uid] = members
-            absorbed |= inside
+            absorbed |= runs.commit(took)
+            taken[next_uid] = took.by_member
+            homes[next_uid] = took.home
             next_uid += 1
 
         if not fused:
@@ -1410,10 +1787,11 @@ class Fusion:
         # Leaving it empty keeps the absorbed nodes in every layer alongside the
         # node that replaced them, which double-counts any consumer that sums
         # leaves.
+        rewrite = Rewrite(origins=origins, dropped=frozenset(absorbed),
+                          inputs=inputs, taken=taken, homes=homes)
         return (FusedProgram(base=program, fused=tuple(fused),
-                             absorbed=frozenset(absorbed)),
-                Rewrite(origins=origins, dropped=frozenset(absorbed),
-                        inputs=inputs))
+                             absorbed=frozenset(absorbed), rewrite=rewrite),
+                rewrite)
 
     # -- closure ---------------------------------------------------------
 
@@ -1548,6 +1926,15 @@ def fusion_matches(source: Any, program: Any, rewrite: Rewrite,
             "is_parallel": bool(
                 pattern is not None and pattern.is_parallel()
             ),
+            # A launch across a seam: the members that ran a layer earlier,
+            # and those it took only some runs of — each keeps a row of its
+            # own beside the launch (`Rewrite.taken`).
+            "previous_iteration_aggregation_ids": tuple(
+                source.by_uid(uid).aggregation_id
+                for uid in sorted(node.previous_iteration)),
+            "kept_aggregation_ids": tuple(
+                source.by_uid(uid).aggregation_id for uid in origins
+                if rewrite.partly(uid)),
         })
     return tuple(rows)
 
@@ -1581,6 +1968,7 @@ def materialize_tree(source: Any, program: Any, rewrite: Rewrite) -> Any:
     ]
     replacements: Dict[int, Any] = {}
     absorbed_by: Dict[int, int] = {}
+    leaving: set = set()
 
     def descends_from(node: Any, roots: Sequence[Any]) -> bool:
         while node is not None:
@@ -1622,7 +2010,10 @@ def materialize_tree(source: Any, program: Any, rewrite: Rewrite) -> Any:
         )
 
     for fused in sorted(fused_nodes, key=lambda node: node.uid):
-        origins = set(rewrite.sources(fused.uid))
+        # A launch across a seam stands among the reading iteration's
+        # members; the previous iteration's are another layer's nodes.
+        origins = set(rewrite.sources(fused.uid)) - set(
+            fused.previous_iteration)
         if not origins:
             continue
         siblings, parent = root_siblings(origins)
@@ -1696,26 +2087,31 @@ def materialize_tree(source: Any, program: Any, rewrite: Rewrite) -> Any:
                 f"fusion tree allocated uid {replacement.uid}, expected "
                 f"rewrite uid {fused.uid}"
             )
-        first = min(indices)
-        if crossing:
-            # Each member leaves the component instance it was in. The
-            # instances themselves STAY, even one whose every leaf the launch
-            # took: a component's cost and bytes are its children's, so an
-            # empty one contributes nothing, while removing it would strand
-            # every ref that names it — a component reference names the
-            # wrapper, which is the whole reason this view exists.
-            for uid in origins:
-                holder = copied[uid].parent
-                bucket = holder.children if holder is not None else siblings
-                bucket[:] = [c for c in bucket if c.uid != uid]
-        else:
-            for index in reversed(indices):
-                del siblings[index]
-        siblings.insert(min(first, len(siblings)), replacement)
+        siblings.insert(min(indices), replacement)
         replacement.parent = parent
         replacements[fused.uid] = replacement
-        for uid in origins:
+        # A member leaves the tree once a launch took every run of it —
+        # after every launch has found its place, since one a launch across
+        # a seam took only some runs of (`Rewrite.taken`) stays where it
+        # was, and the next launch that takes the rest stands beside it.
+        # Each member leaves the component instance it was in. The
+        # instances themselves STAY, even one whose every leaf a launch
+        # took: a component's cost and bytes are its children's, so an
+        # empty one contributes nothing, while removing it would strand
+        # every ref that names it — a component reference names the
+        # wrapper, which is the whole reason a boundary-crossing view exists.
+        for uid in set(rewrite.sources(fused.uid)) & rewrite.dropped:
             absorbed_by[uid] = fused.uid
+            leaving.add(uid)
+
+    for uid in leaving:
+        holder = copied[uid].parent
+        if holder is not None:
+            holder.children[:] = [c for c in holder.children
+                                  if c.uid != uid]
+            continue
+        for roots in (tree.top_level, *(roots for _m, roots in tree.blocks)):
+            roots[:] = [c for c in roots if c.uid != uid]
 
     source_by_uid = {node.uid: node for node in program.nodes()}
     live = {node.uid: node for node in walk()}
@@ -2202,6 +2598,10 @@ def rebase_analysis(analysis: Any, program: Any, rewrite: Rewrite) -> Any:
         analysis,
         program=program,
         cost=analysis.cost.rebase(rewrite, program, Cost.combine),
+        # How often each node runs, off the rewrite's one statement of it
+        # (`Rewrite.taken`): a launch across a layer seam runs once per seam,
+        # and a member it took only some runs of keeps the rest.
+        instances=analysis.instances.rebase_counts(rewrite, program),
         shapes=shapes,
         roles=analysis.roles.rebase(rewrite, program, lambda parts: parts[0]),
         consts=analysis.consts.rebase(rewrite, program, union_consts),

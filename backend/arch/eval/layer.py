@@ -43,7 +43,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import (
-    TYPE_CHECKING, Any, Callable, Dict, Generic, Iterator, Mapping, Optional,
+    TYPE_CHECKING, Any, Callable, Dict, FrozenSet, Generic, Iterator, Mapping, Optional,
     Sequence, Tuple, TypeVar,
 )
 
@@ -100,6 +100,23 @@ class Rewrite:
     #: input, what the member whose edge it took over read there.
     inputs: Mapping[Tuple[int, int], Tuple[int, int]] = field(
         default_factory=dict)
+    #: Which runs of each old node each NEW node took: `new uid -> {old
+    #: uid -> {iteration of the new node -> iteration of the old one}}`.
+    #: A launch within one iteration takes the same iteration of every
+    #: member; one across a layer seam takes the reading iteration of the
+    #: reading layer's members and the writing iteration of the previous
+    #: layer's. The new node's own iterations are its home's keys. An old
+    #: node with runs no new node took keeps them as a node of its own (not
+    #: `dropped`) — the norm that opens a stack keeps its layer-0 run. Every
+    #: count (`Layer.rebase_counts`) and every "which launch writes this
+    #: tensor at this iteration" (`launch_at`) is read off this one map.
+    #: Absent for a rewrite with no walk behind it: then a new node took
+    #: every run of each origin.
+    taken: Mapping[int, Mapping[int, Mapping[Optional[int], Optional[int]]]] \
+        = field(default_factory=dict)
+    #: Each new node's home: the old node whose iterations its own index
+    #: (`FusedNode.home`). An old node is its own.
+    homes: Mapping[int, int] = field(default_factory=dict)
 
     @property
     def added(self) -> frozenset:
@@ -110,7 +127,110 @@ class Rewrite:
         return tuple(self.origins.get(uid, ()))
 
     def is_identity(self) -> bool:
-        return not self.origins and not self.dropped and not self.inputs
+        return (not self.origins and not self.dropped and not self.inputs
+                and not self.taken)
+
+    def home(self, uid: int) -> int:
+        """The old node whose iterations `uid`'s own index."""
+        return self.homes.get(uid, uid)
+
+    def whole(self, old_uid: int) -> bool:
+        """Whether new nodes took every run of `old_uid` (it is gone)."""
+        return old_uid in self.dropped
+
+    def partly(self, old_uid: int) -> bool:
+        """Whether a new node took some runs of `old_uid` and it keeps the
+        rest as a node of its own. In a composed rewrite (`then`) the old
+        nodes are the first graph's: a launch an intermediate rewrite made
+        and a later one took in part is a NEW node of the composition, its
+        own runs restricted to the ones it kept, and not asked here."""
+        return old_uid not in self.dropped and old_uid in self._taken_olds
+
+    @property
+    def _taken_olds(self) -> FrozenSet[int]:
+        """Every old node some new node took a run of, built once."""
+        cached = self.__dict__.get("_taken_olds_cache")
+        if cached is None:
+            cached = frozenset(old for olds in self.taken.values()
+                               for old in olds)
+            object.__setattr__(self, "_taken_olds_cache", cached)
+        return cached
+
+    def taken_by(self, old_uid: int) -> Tuple[int, ...]:
+        """The new nodes that took runs of `old_uid`."""
+        return tuple(new for new, olds in self.origins.items()
+                     if old_uid in olds)
+
+    def iterations(self, new_uid: int) -> FrozenSet[Optional[int]]:
+        """The iterations a new node runs at, in its home's space."""
+        return frozenset(self.taken[new_uid][self.home(new_uid)])
+
+    def taken_at(self, old_uid: int) -> FrozenSet[Optional[int]]:
+        """The iterations of `old_uid` new nodes took."""
+        return frozenset(it for olds in self.taken.values()
+                         for it in olds.get(old_uid, {}).values())
+
+    def launch_at(self, old_uid: int, iteration: Optional[int]
+                  ) -> Optional[int]:
+        """The new node that runs `old_uid`'s iteration `iteration` — which
+        launch writes that run's tensor — None when no new node took it.
+        Without a walk behind the rewrite, the one that took the node."""
+        if not self.taken:
+            found = [new for new, olds in self.origins.items()
+                     if old_uid in olds and old_uid in self.dropped]
+            return found[0] if found else None
+        return self._run_by.get((old_uid, iteration))
+
+    def iteration_classes(self, program: Any, block: int
+                          ) -> Tuple[FrozenSet[Optional[int]], ...]:
+        """The iterations of block invocation `block` grouped by what runs
+        there: two iterations are one class when every node of the block a
+        launch took a run of is run by the same launch at both (or by none
+        at both). A template's layers can differ in this — DeepSeek-V3's
+        first MoE layer opens with the dense → MoE seam, the others with
+        the MoE → MoE one, and the last closes into the final norm — and a
+        consumer that simulates or prices one layer does so once per class
+        (`activation_peak`, `traffic.derive`). Read off `taken` alone; one
+        class, the whole block, where no launch took a run of it."""
+        # Kept beside the program it answers for: an entry holds its
+        # program, so a later program at a reused address is no hit.
+        cache = self.__dict__.setdefault("_classes_cache", {})
+        held = cache.get(id(program))
+        if held is None or held[0] is not program:
+            held = cache[id(program)] = (program, {})
+        cache = held[1]
+        key = block
+        if key not in cache:
+            iterations = program.blocks[block].layer_indices
+            members = sorted({old for olds in self.taken.values()
+                              for old in olds
+                              if program.block_of(old) == block})
+            groups: Dict[Tuple[Any, ...], list] = {}
+            for it in iterations:
+                groups.setdefault(tuple(
+                    self.launch_at(member, it) for member in members),
+                    []).append(it)
+            cache[key] = tuple(frozenset(its) for its in groups.values())
+        return cache[key]
+
+    @property
+    def _run_by(self) -> Mapping[Tuple[int, Any], int]:
+        """`(old uid, iteration) -> new uid`, built once: one run is one
+        launch."""
+        cached = self.__dict__.get("_run_by_cache")
+        if cached is None:
+            cached = {}
+            for new, olds in self.taken.items():
+                for old, at in olds.items():
+                    for it in at.values():
+                        other = cached.setdefault((old, it), new)
+                        if other != new:
+                            raise ValueError(
+                                f"iteration {it!r} of uid {old} is run by "
+                                f"{sorted((other, new))!r}; one run is one "
+                                f"launch")
+            object.__setattr__(self, "_run_by_cache", cached)
+        return cached
 
     def then(self, other: "Rewrite") -> "Rewrite":
         """Compose two rewrites applied in order, flattening origins through the
@@ -131,8 +251,41 @@ class Rewrite:
         for key, old in self.inputs.items():
             if key not in inputs and key[0] not in other.dropped:
                 inputs[key] = old
+        # A node made from another takes runs of that one's origins: the
+        # iteration of the old node behind each of its own (`taken`).
+        homes: Dict[int, int] = {
+            new: self.home(mid) for new, mid in other.homes.items()}
+        for new, home in self.homes.items():
+            if new in origins and new not in homes:
+                homes[new] = home
+        if other.taken and not self.taken and self.origins:
+            # Which runs of the first graph's nodes the intermediate one's
+            # stand for is unstated: composing would name an intermediate
+            # node as an old one.
+            raise ValueError(
+                "a rewrite that states its runs composes only after one "
+                "that states its own")
+        taken: Dict[int, Dict[int, Dict[Any, Any]]] = {}
+        for new, mids in other.taken.items():
+            flat: Dict[int, Dict[Any, Any]] = {}
+            for mid, at in mids.items():
+                for old, behind in self.taken.get(mid, {mid: None}).items():
+                    flat.setdefault(old, {}).update(
+                        at if behind is None else
+                        {it: behind[mid_it] for it, mid_it in at.items()
+                         if mid_it in behind})
+            taken[new] = flat
+        for new, olds in self.taken.items():
+            if new in other.dropped:
+                continue
+            # A node of this rewrite a later one took in part keeps the runs
+            # the later one did not take.
+            kept = (frozenset(olds[self.home(new)])
+                    - other.taken_at(new))
+            taken[new] = {old: {it: at[it] for it in at if it in kept}
+                          for old, at in olds.items()}
         return Rewrite(origins=origins, dropped=self.dropped | other.dropped,
-                       inputs=inputs)
+                       inputs=inputs, taken=taken, homes=homes)
 
 
 @dataclass(frozen=True)
@@ -266,6 +419,84 @@ class Layer(Generic[T]):
             present = tuple(self.values[s] for s in srcs if s in self.values)
             if present:
                 out[new_uid] = combine(present)
+        return Layer(program if program is not None else self.program, out)
+
+    def rebase_counts(self, rw: Rewrite, program: Optional["Program"],
+                      held: Optional[Callable[[int, Optional[int]], bool]]
+                      = None) -> "Layer[T]":
+        """Carry a COUNT layer — how many times each node runs — across a
+        transform, read off the one statement of which runs each node took
+        (`Rewrite.taken`): a new node runs its home's count per iteration
+        times its iterations, and an old node it took some runs of keeps the
+        rest. `held(uid, iteration)` says which iterations this
+        layer counts (one pipeline stage's), all of them when None.
+
+        A count is a number on this path: a symbolic count has no runs to
+        take a share of, and is refused rather than branched on."""
+        source = self.program
+
+        def runs_of(value: Any, uid: int) -> int:
+            try:
+                count = int(value)
+            except TypeError:
+                raise ValueError(
+                    f"uid {uid}: a count crosses a rewrite only as a number "
+                    f"of runs, not {value!r}") from None
+            if count != value:
+                raise ValueError(
+                    f"uid {uid}: {value!r} is no whole number of runs")
+            return count
+
+        def counted(uid: int, its: Any) -> list:
+            return [it for it in its if held is None or held(uid, it)]
+
+        def per_run(uid: int) -> Optional[int]:
+            counted_runs = counted(uid, source.occurrence_layers(uid))
+            count = runs_of(self.values[uid], uid)
+            if not counted_runs:
+                if count:
+                    raise ValueError(
+                        f"uid {uid} runs {count} times at no iteration")
+                return None
+            if count % len(counted_runs):
+                raise ValueError(
+                    f"uid {uid}: {count} runs over {len(counted_runs)} "
+                    f"iterations is no whole count per iteration")
+            return count // len(counted_runs)
+
+        def count_of(home: int, its: Any) -> int:
+            each = per_run(home)
+            return 0 if each is None else each * len(counted(home, its))
+
+        out: Dict[int, T] = {}
+        for uid, value in self.values.items():
+            if uid in rw.dropped or uid in rw.origins:
+                continue
+            out[uid] = (count_of(uid, frozenset(
+                source.occurrence_layers(uid)) - rw.taken_at(uid))
+                if rw.partly(uid) else value)
+        for new_uid, srcs in rw.origins.items():
+            present = [s for s in srcs if s in self.values]
+            if not present:
+                continue
+            if new_uid not in rw.taken:
+                counts = {self.values[s] for s in present}
+                if len(counts) > 1:
+                    raise ValueError(
+                        f"fusion spans unequal per-step facts: uid "
+                        f"{new_uid} runs {sorted(counts)} times by its "
+                        f"origins")
+                out[new_uid] = counts.pop()
+                continue
+            # A launch runs once per run of its home; every origin it took
+            # runs as often per iteration, or the launch is no one kernel.
+            each = {per_run(s) for s in present} - {None}
+            if len(each) > 1:
+                raise ValueError(
+                    f"fusion spans unequal per-step facts: uid {new_uid}'s "
+                    f"origins run {sorted(each)} times per iteration")
+            out[new_uid] = count_of(rw.home(new_uid),
+                                    rw.iterations(new_uid))
         return Layer(program if program is not None else self.program, out)
 
     # -- building --------------------------------------------------------

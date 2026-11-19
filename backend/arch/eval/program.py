@@ -296,10 +296,19 @@ class OpStage(Stage):
 
     node: SpecIRNode
     prelude: Tuple[SpecIRNode, ...] = ()
+    #: The top-level nodes a pass grafted after the walk to run in this
+    #: stage (`SpecIRNode.runs_with_op`), in the tree's order around the op.
+    grafted: Tuple[SpecIRNode, ...] = ()
+
+    #: Each root's position among the tree's top-level nodes, which orders
+    #: the grafted nodes around the op.
+    order: Mapping[int, int] = field(default_factory=dict)
 
     @property
     def roots(self) -> Sequence[SpecIRNode]:
-        return (*self.prelude, self.node)
+        return (*self.prelude, *sorted(
+            (*self.grafted, self.node),
+            key=lambda n: self.order.get(n.uid, 0)))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1635,6 +1644,14 @@ class Program:
         """
         by_layer = {tuple(n.layer_path): n for n in self.ir.top_level
                     if n.layer_path}
+        # The nodes a pass grafted at the top level after the walk, by the
+        # op whose stage it declares runs them (`SpecIRNode.runs_with_op`).
+        grafted: Dict[int, Tuple[SpecIRNode, ...]] = {}
+        for n in self.ir.top_level:
+            if n.runs_with_op is not None:
+                grafted[n.runs_with_op] = (*grafted.get(n.runs_with_op, ()),
+                                           n)
+        top_order = {n.uid: i for i, n in enumerate(self.ir.top_level)}
         # What the whole-stream lowering placed ahead of each model-level op
         # (`Program.lowered`): the model root holds them just before it.
         prelude: Dict[Tuple[int, ...], Tuple[SpecIRNode, ...]] = {}
@@ -1706,7 +1723,9 @@ class Program:
                             f"{list(path)}) has no node in the IR tree")
                     _add(OpStage(entry=entry, stack=stack,
                                  aux_kind=aux_kind, upstream=declared,
-                                 node=node, prelude=prelude.get(path, ())))
+                                 node=node, prelude=prelude.get(path, ()),
+                                 grafted=grafted.get(node.uid, ()),
+                                 order=top_order))
                     continue
                 own = _carry(entry, group)
                 for template in by_path.get(tuple(entry.layer_path), ()):
@@ -1716,6 +1735,17 @@ class Program:
                                     template=template))
 
         _walk(self.ir.spine, "", None, group=None)
+        # A grafted node names the model-level op whose stage runs it; one
+        # that names anything else (a stack's component, another graft) has
+        # no stage, and is refused here rather than run nowhere.
+        ops = {stage.node.uid for stages in stacks.values()
+               for stage in stages if isinstance(stage, OpStage)}
+        stray = sorted(uid for uid in grafted if uid not in ops)
+        if stray:
+            raise ValueError(
+                f"{self.spec.name}: nodes grafted at the top level name uids "
+                f"{stray} as the op whose stage runs them, and no model-level "
+                f"stage is that op")
         encoders = self.spec.encoder_groups()
         named = {tuple(entry.layer_path): entry.name
                  for entry in self.ir.spine}
@@ -2413,6 +2443,30 @@ class Program:
         expanded from the same `BlockMeta`."""
         return next(index for index, block in enumerate(self.blocks)
                     if block.meta is template.meta)
+
+    def threads_loop(self, reader: int, source: Any) -> bool:
+        """Whether input `source` (`occurrence.Source`) of node `reader` is
+        the value a stack's layer loop hands from one layer to the next — a
+        seam a launch may span (`fusion.Seams`): the carried stream, read
+        from the previous layer of the same stack (`carry`), or the stack's
+        last exit read by the model-level op after it (`named`). Not the
+        stack's own input (the embedding, read by layer 0: no layer wrote
+        it), not a read from another stack (an MTP stack reading the
+        backbone), and not a model-level read of a layer before the last
+        (an auxiliary hidden-state tap): none is a step of this loop."""
+        written = source.occurrence.uid
+        if self.block_of(written) is None:
+            return False
+        stack = self.stack_of(self.by_uid(written))
+        if stack != self.stack_of(self.by_uid(reader)):
+            return False
+        if source.via == "carry":
+            return True
+        if source.via == "named":
+            depth = self.stack_depth(stack)
+            return (self.block_of(reader) is None and depth is not None
+                    and source.occurrence.iteration == depth - 1)
+        return False
 
     def block_of(self, uid: int) -> Optional[int]:
         """The block invocation (`blocks` ordinal) a node's body belongs to,

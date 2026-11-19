@@ -113,6 +113,7 @@ from .dim import (algebra, Dim, ceil_div, exact, exact_div, expr_of, minimum,
                   ratio, same_law, value_of, names_of, where)
 from .launch import FusedNode, score_matrix_owner
 from .layer import Layer, Rewrite
+from .activation_edges import iteration_classes
 from .refusal import SpecRefusal
 from .values import Extent, product
 from .node import Identified
@@ -848,8 +849,9 @@ def declared_output(node: Identified, program: Any = None,
                 inside: bool = False) -> Optional[Written]:
         # `inside`: resolving a member of the launch already asked for. Its
         # own reads are of other members, never of the launch's ports.
-        if not inside and launch_of and node.uid in launch_of:
-            launch = launch_of[node.uid]
+        launch = (launch_of.get(node.uid)
+                  if not inside and launch_of is not None else None)
+        if launch is not None:
             if node.uid not in launch.output_ports:
                 raise ValueError(
                     f"node {node.uid} is read outside the launch "
@@ -1401,11 +1403,6 @@ def derive(analysis: Any, *,
         for tensor in entry.tensors if tensor.recurrent)
     effective_rewrite = analysis.rewrite if rewrite is None else rewrite
     origins = dict(effective_rewrite.origins or {})
-    # The launch that writes each absorbed node's output now: a reader's
-    # edge still names the member (`declared_width`).
-    launch_of = {member: program.by_uid(fused)
-                 for fused, members in origins.items() for member in members
-                 if program.by_uid(fused) is not None}
     read_aliases = program.read_aliases or {}
     borrowed_by = _borrowed_sources(program)
     # Each walked matmul whose weight is held wider than its activation —
@@ -1419,6 +1416,12 @@ def derive(analysis: Any, *,
     # cached tensor under (YOCO / CLA shared KV), not the node: its layers'
     # `reads_from` name the producers, as `cache.kv_access` traces them.
     edges = Edges(analysis, program, effective_rewrite)
+    # The launch that writes an absorbed node's output now, for the reader
+    # asking: a reader's edge still names the member (`declared_width`),
+    # and which launch runs the run it reads is `Edges.writer_at` of that
+    # run (`_RunLaunches`). A member a launch took only some runs of
+    # writes its own output on the rest.
+    launches = _RunLaunches(edges, effective_rewrite, program)
     context_srcs = _context_sources(edges)
 
     # The declared cache nodes. A reader's ref names that child
@@ -1452,6 +1455,8 @@ def derive(analysis: Any, *,
     # rather than filtered after it: a kept row that reads a cache would
     # otherwise be billed a second read of it in `_settle_cache_reads`.
     live = {node.uid for node in program.nodes()}
+    # Each leaf's launches, as it was priced (`_RunLaunches.check`).
+    priced: Dict[int, _ReaderLaunches] = {}
 
     for uid, shape in shapes.values.items():
         node = program.by_uid(uid)
@@ -1468,6 +1473,7 @@ def derive(analysis: Any, *,
             components.append(node)
             continue
 
+        launch_of = priced[uid] = launches.read_by(uid)
         # A fused node reads what its origins read, and that includes any
         # parameter threaded into one of them. Its OWN uid is in the union,
         # not an `or` alternative to the members: once a match is absorbed
@@ -1671,15 +1677,16 @@ def derive(analysis: Any, *,
                     for member in (origins.get(uid) or (uid,)))),
         )
 
-    _settle_conversions(out, conversions, program, origins)
+    for uid, launch_of in priced.items():
+        launches.check(uid, launch_of)
+    _settle_conversions(out, conversions, program, launches)
     _settle_gathered_live_reads(out, analysis=analysis, program=program,
                                 shapes=shapes)
-    launch_uid = {member: launch.uid for member, launch in launch_of.items()}
     _settle_cache_reads(out, reads_cache, cache_laws, state_carriers,
-                        launch_of=launch_uid,
+                        rows_of=launches.rows_of,
                         gathered_laws=gathered_laws, gatherers=gatherers)
     _settle_state_writes(out, _state_writes(analysis, cache_layer=cache_layer),
-                         launch_of=launch_uid)
+                         rows_of=launches.rows_of)
 
     for node in components:
         out[node.uid] = Traffic.sum(out[c.uid] for c in node.children
@@ -2053,8 +2060,14 @@ def _table_read_fractions(analysis: Any, program: Any, shapes: Layer[Any],
                 f"a fused kernel absorbed {len(absorbed)} lookups "
                 f"{sorted(analysis.program.by_uid(m).name for m in absorbed)}; "
                 "a launch bills one table's gathered rows")
-        if absorbed:
-            launch[absorbed[0]] = fused
+        if absorbed and launch.setdefault(absorbed[0], fused) != fused:
+            # A lookup's gathered rows are billed to the one launch that
+            # runs it: one two launches each took some runs of would need
+            # its rows split between them.
+            raise ValueError(
+                f"lookup uid {absorbed[0]} is taken by launches "
+                f"{sorted((launch[absorbed[0]], fused))!r}; its gathered "
+                f"rows are one launch's")
     out: Dict[int, Tuple[Extent, Extent, int]] = {}
     for uid, site in sites.items():
         node = analysis.program.by_uid(uid)
@@ -2287,12 +2300,21 @@ def _activation_reads(node: Identified, uid: int, shape, *, in_override,
         # cache law (`_one_cache_law`), so the first prices the read: the law
         # is charged once per kernel call, not once per producer.
         src = None
+        # The port the read lands on: the ref's own, or — for a ref that
+        # names a tensor rather than a node — the port the walk's writer
+        # publishes it on, which a launch that absorbed the writer may
+        # rename (`cache.Edges.reads`: a fused add+norm's `residual_out`).
+        read_port = refs[index].port if index < len(refs) else ""
         if index < len(refs):
             found = edges.sources(node, index)
             if len(found) > 1:
                 _one_cache_law(node, found, cached_uids, context_srcs,
                                cache_laws, edges)
             src = found[0] if found else None
+            if src is not None and refs[index].src is None:
+                read_port = next((port for producer, port
+                                  in edges.reads(node, index)
+                                  if producer.uid == src.uid), read_port)
         # A weight arriving on an edge is a WEIGHT read, priced at the
         # width it is stored in, and `_weight_traffic` has already billed
         # it to this node. Pricing it here as well counted the same tensor
@@ -2419,7 +2441,7 @@ def _activation_reads(node: Identified, uid: int, shape, *, in_override,
                         src, program, launch_of, cached=writers,
                         shapes=shapes)
                 if branch is None:
-                    port = refs[index].port if index < len(refs) else ""
+                    port = read_port
                     branch = Written(
                         produced_width(src, port, precision, program),
                         produced_dtype(src, port, precision, program))
@@ -2555,7 +2577,7 @@ def _activation_reads(node: Identified, uid: int, shape, *, in_override,
             spanned = where(sp.Lt, (rows, elements), False, spanned)
             elements = minimum(elements, rows)
         carried = in_override
-        port = refs[index].port if index < len(refs) else ""
+        port = read_port
         if carried is None and src is not None:
             carried = declared_output(src, program, launch_of,
                                       "" if port == "out" else port,
@@ -2571,7 +2593,7 @@ def _activation_reads(node: Identified, uid: int, shape, *, in_override,
         # `act_in_elems`), and the rest say who else reads their producer.
         edge_reads.append(_EdgeRead(
             producer=None if src is None else src.uid,
-            port=(refs[index].port if index < len(refs) else ""),
+            port=read_port,
             elements=elements, width=width, dtype=carried.dtype,
             inner=(dims[-1] if dims else None),
             index=index, fanout=divided_by, headless_store=headless_store,
@@ -2651,8 +2673,16 @@ class CastLaunch:
     consumer: int
     #: Which of its inputs (`Shape.ins` position).
     index: int
-    #: The launch and port that wrote the edge, None for a model input.
-    producer: Optional[Tuple[int, str]]
+    #: What wrote the edge, per class of the consumer's iterations
+    #: (`activation_edges.iteration_classes`): `(iterations, (launch uid,
+    #: port))`, the writer None for a model input. A template's layers can
+    #: read their operand from different launches — DeepSeek-V3's first
+    #: MoE layer from the dense → MoE seam, the others from the MoE → MoE
+    #: one — and each class names its own. The bytes below are per run and
+    #: the same in every class: they are the operand's and the target
+    #: format's (`_format_width`), and no writer enters them.
+    producers: Tuple[Tuple[FrozenSet[Optional[int]],
+                           Optional[Tuple[int, str]]], ...]
     #: `quantise`, `requantise` or `dequantise` (`precision.Conversion.kind`).
     kind: str
     #: The format written, None when the cast lands on a plain dtype.
@@ -2832,10 +2862,142 @@ def _conversion_to_bill(wanted: Any, operand: "_EdgeRead",
     return None if _holds(held, wanted, writer) else wanted
 
 
+class _RunLaunches:
+    """Which launch writes an absorbed node's tensor where a reader reads it,
+    read off the one entry that answers it (`cache.Edges.runs`): each run
+    of the reader's inputs names its writer's occurrence and what writes it
+    now, and a node further up the reader's own layer is reached through
+    the runs of the nodes between. A template's iterations can differ in
+    what runs there (`activation_edges.iteration_classes`), so a reader is
+    priced against one class's launches, and every other class it runs in
+    must hand it the same tensors (`check`) — a row prices one run."""
+
+    def __init__(self, edges: Any, rewrite: Any, program: Any) -> None:
+        self.edges = edges
+        self.rewrite = rewrite
+        self.program = program
+
+    def classes(self, reader: int) -> Tuple[FrozenSet[Optional[int]], ...]:
+        """The iteration classes `reader` runs in."""
+        return iteration_classes(self.program, self.rewrite, reader)
+
+    def read_by(self, reader: int) -> "_ReaderLaunches":
+        """The launches `reader` reads in the first class it runs in."""
+        return _ReaderLaunches(self, reader, self.classes(reader)[0])
+
+    def check(self, reader: int, priced: "_ReaderLaunches") -> None:
+        """Every other class `reader` runs in hands it, for each member it
+        was priced reading, the same tensor: at the same declared width and
+        record format. Different launches may (the dense → MoE seam and the
+        MoE → MoE one both publish the residual); different tensors cannot
+        share one row."""
+        for iterations in self.classes(reader)[1:]:
+            other = _ReaderLaunches(self, reader, iterations)
+            for member, node in priced.looked_up.items():
+                there = other.get(member)
+                if _published(node, member, self.program) != _published(
+                        there, member, self.program):
+                    raise ValueError(
+                        f"uid {reader} reads uid {member}'s tensor as two "
+                        f"different tensors in two classes of its "
+                        f"iterations; one row prices one run")
+
+    def rows_of(self, member: int) -> Tuple[int, ...]:
+        """The rows that run `member`: each launch that took some of its
+        runs, and the member itself where it kept some."""
+        rows = tuple(uid for uid in self.rewrite.taken_by(member)
+                     if self.program.by_uid(uid) is not None)
+        if not rows or self.rewrite.partly(member):
+            rows = (*rows, member)
+        return rows
+
+
+def _published(node: Any, member: int, program: Any) -> Any:
+    """What a reader of `member` is handed by `node` (a launch, or None for
+    the member writing its own tensor): the width its writer declares for
+    it and the record format it lands as. Which node writes it and on
+    which port is no part of the tensor."""
+    writer, port = ((program.by_uid(member), "") if node is None
+                    else (node, node.output_ports.get(member, "") or ""))
+    return ((writer.output_dtype or {}).get(port),
+            _written_formats(writer, program).get(port))
+
+
+class _ReaderLaunches:
+    """`member -> launch` for one reader in one iteration class, read off
+    `Edges.runs`: the runs of the reader's inputs at those iterations, and
+    for a node further up the reader's own layer the runs of the nodes
+    between, at the iteration each was read at. A member no launch took a
+    run of here has no launch: the reader reads its own tensor. Each member
+    is looked up once (`looked_up`, which `check` reads)."""
+
+    def __init__(self, launches: _RunLaunches, reader: int,
+                 iterations: FrozenSet[Optional[int]]) -> None:
+        self._launches = launches
+        self._reader = reader
+        self.looked_up: Dict[int, Any] = {}
+        # The writers found so far per member, and the reads still to
+        # follow: `(node, the iteration it was read at)`.
+        self._writers: Dict[int, Dict[int, Any]] = {}
+        self._pending: List[Tuple[Any, Any]] = [
+            (launches.program.by_uid(reader), it) for it in iterations]
+        self._seen: set = set()
+        self._first = True
+
+    def _follow(self, member: int) -> None:
+        """Follow reads until `member`'s writers are found or there is
+        nothing more to follow. The reader's own inputs are read at any
+        iteration they name; further up, only reads in the same iteration
+        are this layer's, and the search stays inside it."""
+        edges = self._launches.edges
+        while member not in self._writers and self._pending:
+            node, it = self._pending.pop()
+            if node is None or (node.uid, it) in self._seen:
+                continue
+            self._seen.add((node.uid, it))
+            first = node.uid == self._reader
+            for index in range(len(node.inputs_obj or ())):
+                for run in edges.runs(node, index):
+                    if (run.iteration if first else run.at) != it:
+                        continue
+                    written = run.written.uid
+                    self._writers.setdefault(written, {})[
+                        run.node.uid] = run.node
+                    if first or run.written.iteration == it:
+                        self._pending.append(
+                            (self._launches.program.by_uid(written),
+                             run.written.iteration))
+
+    def get(self, member: int) -> Any:
+        """The launch that writes `member`'s tensor where this reader
+        reads it, None where the member writes it itself."""
+        if member not in self.looked_up and not self._launches.rewrite.partly(
+                member) and not self._launches.rewrite.whole(member):
+            # No launch took a run of it: it writes its own tensor.
+            self.looked_up[member] = None
+        if member not in self.looked_up:
+            self._follow(member)
+            writers = [node for uid, node in
+                       self._writers.get(member, {}).items() if uid != member]
+            if len(writers) > 1:
+                raise ValueError(
+                    f"uid {self._reader} reads uid {member} from launches "
+                    f"{sorted(node.uid for node in writers)!r} in one class "
+                    f"of its iterations; one class is one set of launches")
+            self.looked_up[member] = writers[0] if writers else None
+        return self.looked_up[member]
+
+    def __contains__(self, member: object) -> bool:
+        return isinstance(member, int) and self.get(member) is not None
+
+    def __bool__(self) -> bool:
+        return True
+
+
 def _settle_conversions(out: Dict[int, Traffic],
                         conversions: Dict[int, Tuple[Any, "_EdgeRead"]],
                         program: Any,
-                        origins: Mapping[int, Tuple[int, ...]]) -> None:
+                        launches: "_RunLaunches") -> None:
     """Price each leaf's input conversion as the launch that makes it.
 
     Invariant 3 of the design: one format change is one price. A
@@ -2847,31 +3009,33 @@ def _settle_conversions(out: Dict[int, Traffic],
     is left is recorded as a launch (`CastLaunch`) for the graft to read.
 
     The producer an edge names is the node the WALK ran, which a rewrite may
-    since have absorbed into a launch (`origins`), so each edge is resolved
-    to the launch that actually writes it.
+    since have absorbed into a launch, so each edge is resolved to the
+    launch that writes the run its reader reads (`_RunLaunches`).
     """
-    launch_of = {member: fused for fused, members in origins.items()
-                 for member in members}
-
-    def written_by(read: "_EdgeRead") -> Optional[Tuple[int, str]]:
-        """The launch and port that writes what this edge reads, None for an
-        edge with no producer (a model input, a block's own input)."""
-        if read.producer is None:
-            return None
-        launch = launch_of.get(read.producer)
-        if launch is None:
-            return (read.producer, read.port)
-        node = program.by_uid(launch)
-        if node is None:
-            return (read.producer, read.port)
-        # The launch renames its members' outputs to its own ports.
-        return (launch, node.output_ports.get(read.producer, read.port))
+    def written_by(reader: int, read: "_EdgeRead") -> Tuple[
+            Tuple[FrozenSet[Optional[int]], Optional[Tuple[int, str]]], ...]:
+        """The launch and port that wrote what this edge reads, per class of
+        the reader's iterations: different classes may read different
+        launches (that is what tells them apart), one class reads one."""
+        out = []
+        for iterations in launches.classes(reader):
+            if read.producer is None:
+                out.append((iterations, None))
+                continue
+            node = _ReaderLaunches(launches, reader, iterations).get(
+                read.producer)
+            # The launch renames its members' outputs to its own ports.
+            out.append((iterations, (read.producer, read.port)
+                        if node is None else
+                        (node.uid, node.output_ports.get(read.producer,
+                                                         read.port))))
+        return tuple(out)
 
     for uid, (conversion, edge) in conversions.items():
         traffic = out.get(uid)
         if traffic is None:
             continue
-        tensor = written_by(edge)
+        producers = written_by(uid, edge)
         # The copy is written once and read back once, each at the width
         # the record it lands as has: a quantised format's elements and
         # scales by the one law the grafted cast's write and its readers
@@ -2885,7 +3049,7 @@ def _settle_conversions(out: Dict[int, Traffic],
         narrow = edge.elements * width
         launch = CastLaunch(
             consumer=uid, index=edge.index,
-            producer=tensor,
+            producers=producers,
             kind=conversion.kind, target=conversion.target,
             target_dtype=conversion.target_dtype,
             wide_read=edge.elements * edge.width,
@@ -3074,7 +3238,7 @@ def _settle_cache_reads(out: Dict[int, Traffic],
                         state_carriers: FrozenSet[int], *,
                         gathered_laws: Optional[Mapping[int, Extent]] = None,
                         gatherers: Optional[Mapping[int, Extent]] = None,
-                        launch_of: Optional[Mapping[int, int]] = None,
+                        rows_of: Any = None,
                         ) -> None:
     """Bill every kernel that reads a cache its own read of it.
 
@@ -3119,21 +3283,23 @@ def _settle_cache_reads(out: Dict[int, Traffic],
     # streams it, its law is keyed on that carrier, and the carrier is its
     # one reader — the scan for the recurrent matrix, the causal conv for
     # its window. A carrier a fused kernel absorbed is read by that launch
-    # (`launch_of`, member → fused uid): the law stays keyed on the carrier,
-    # the row it lands on is the launch's.
-    launch_of = launch_of or {}
+    # (`rows_of`: each row that runs the carrier — every launch that took
+    # some of its runs, and the carrier for the runs it kept; each row's
+    # law is per run, so each bills one read): the law stays keyed on the
+    # carrier, the rows it lands on are the launches'.
     for seed in state_carriers:
         if seed in readers:
             raise ValueError(
                 f"uid {seed} carries a recurrent state and is also a cached "
                 f"node some edge reads; one tensor's read would be billed "
                 f"twice")
-        reader = launch_of.get(seed, seed)
-        if reader not in out:
+        rows = (seed,) if rows_of is None else rows_of(seed)
+        missing = [row for row in rows if row not in out]
+        if missing:
             raise ValueError(
                 f"uid {seed} carries a recurrent state but has no traffic row "
                 f"to bill its read to")
-        readers[seed] = {reader: 1}
+        readers[seed] = {row: 1 for row in rows}
     for seed, flags in readers.items():
         gathered = gathered_laws.get(seed)
         for uid, reads in flags.items():
@@ -3253,29 +3419,28 @@ def _state_writes(analysis: Any, *,
 def _settle_state_writes(
         out: Dict[int, Traffic],
         writes: Mapping[int, Tuple[Tuple[Any, Extent], ...]], *,
-        launch_of: Optional[Mapping[int, int]] = None) -> None:
+        rows_of: Any = None) -> None:
     """Bill each recurrent state's write-back to the launch that runs its
     carrier — the carrier's own row, or the fused launch that absorbed it,
     as for its read (`_settle_cache_reads`). One write term per state, at
     the width its format lands it (`CachedTensor.written_width`), named for
     the state and marked as the cached tensor it is."""
-    launch_of = launch_of or {}
     for carrier, states in writes.items():
-        row = launch_of.get(carrier, carrier)
-        if row not in out:
-            raise ValueError(
-                f"uid {carrier} carries a recurrent state but has no traffic "
-                f"row to bill its write to")
-        traffic = out[row]
-        terms = tuple(_PortWrite(tensor.name, elements, tensor.written_width,
-                                 spanned=False, dtype=tensor.dtype,
-                                 cached=tensor)
-                      for tensor, elements in states)
-        out[row] = replace(
-            traffic,
-            act_writes=traffic.act_writes + sum(
-                term.elements * term.width for term in terms),
-            out_terms=traffic.out_terms + terms)
+        for row in ((carrier,) if rows_of is None else rows_of(carrier)):
+            if row not in out:
+                raise ValueError(
+                    f"uid {carrier} carries a recurrent state but has no "
+                    f"traffic row to bill its write to")
+            traffic = out[row]
+            terms = tuple(_PortWrite(tensor.name, elements,
+                                     tensor.written_width, spanned=False,
+                                     dtype=tensor.dtype, cached=tensor)
+                          for tensor, elements in states)
+            out[row] = replace(
+                traffic,
+                act_writes=traffic.act_writes + sum(
+                    term.elements * term.width for term in terms),
+                out_terms=traffic.out_terms + terms)
 
 
 def _gathered_reads(analysis: Any, *,

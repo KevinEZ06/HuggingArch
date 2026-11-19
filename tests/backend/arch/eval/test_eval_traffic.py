@@ -150,6 +150,21 @@ def _leaf_traffic(analysis: Any) -> Traffic:
         if not analysis.program.by_uid(uid).children)
 
 
+def _run_traffic(analysis: Any) -> Traffic:
+    """The leaves' traffic, each at how many times it runs
+    (`Analysis.instances`, which a rewrite carries by `Rewrite.taken`). A
+    per-node sum is no conserved quantity once a launch takes only some runs
+    of a node: Llama's input norm keeps its layer-0 run beside the launch
+    across the seam that runs the other 15, and both rows read its weight
+    once per run — the per-node sum counts that weight twice, the per-run
+    sum sixteen times either way."""
+    layer = derive(analysis)
+    return Traffic.sum(
+        value.scaled(analysis.instances.values[uid])
+        for uid, value in layer.values.items()
+        if not analysis.program.by_uid(uid).children)
+
+
 def _model_traffic(analysis: Any) -> Traffic:
     """The model's accounting roots, each scaled by how many of it there are.
 
@@ -373,8 +388,8 @@ class TestFusionShowsUpInBytesAndOnlyThere(unittest.TestCase):
         for name in self.MODELS:
             with self.subTest(model=name):
                 d = Deployment(_program(name)).at(batch=1, input_tokens=2048)
-                naive = _leaf_traffic(shared_walk(d))
-                fused = _leaf_traffic(shared_walk(d.fused(framework)))
+                naive = _run_traffic(shared_walk(d))
+                fused = _run_traffic(shared_walk(d.fused(framework)))
                 self.assertEqual(naive.weight_reads, fused.weight_reads,
                                  "a fused QKV still reads three matrices")
                 self.assertLess(fused.act_reads + fused.act_writes,

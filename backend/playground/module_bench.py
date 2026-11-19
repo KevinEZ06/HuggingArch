@@ -1831,6 +1831,28 @@ def _fused_graph(
     return fused, _fused_l1(fused, op_table)
 
 
+def _runs_of_row(rewrite: Any, pre_program: Any, row: int, member: int,
+                 copies: int, *, through: Optional[int] = None) -> int:
+    """How many of `member`'s `copies` the row `row` stands for, read off
+    which runs each launch took (`Rewrite.taken`): a launch the runs it
+    took of the member, a member a launch took some runs of the rest, any
+    other row all of them. A parameter folded into its one reader counts
+    as that reader runs (`through`)."""
+    whose = member if through is None else through
+    iterations = pre_program.occurrence_layers(whose)
+    if row in rewrite.taken:
+        runs = len(rewrite.taken[row].get(whose, {}))
+    elif rewrite.partly(whose):
+        runs = len(frozenset(iterations) - rewrite.taken_at(whose))
+    else:
+        return copies
+    if copies % len(iterations):
+        raise ValueError(
+            f"uid {member}: {copies} copies over {len(iterations)} "
+            f"iterations is no whole count per iteration")
+    return copies // len(iterations) * runs
+
+
 def _runtime_op_table(
     served: AnalysisResult,
     *,
@@ -1892,6 +1914,10 @@ def _runtime_op_table(
     total_act_reads = 0
     total_act_writes = 0
     total_kv_reads = 0
+    # How many runs of each pre-fusion member the rows stand for, summed:
+    # every run once, whether a launch took it or the member's own row kept
+    # it (checked after the rows; `Σ per-unit × count` closes then).
+    member_runs: Dict[int, int] = {}
     for timed in served.per_op_timing:
         uid = int(timed["uid"])
         if uid in absorbed_sources:
@@ -1906,15 +1932,24 @@ def _runtime_op_table(
             for source_uid in source_uids
         ]
         cost_members = (*members, *folded_sources)
+        owner_of = {source_uid: owner
+                    for owner, source_uids in absorbed_by_owner.items()
+                    if owner in row_owns for source_uid in source_uids}
         # Presentation costs are per instance; a fused row sums its
-        # pre-fusion members (a grafted cast among them).
+        # pre-fusion members (a grafted cast among them), each at the runs
+        # of it this row stands for (`_runs_of_row`), and a parameter
+        # folded into a member at that member's.
         n_params = 0
         n_active = 0
         flop_parts: List[tuple] = []
         param_parts: List[tuple] = []
         for member in cost_members:
             member_cost = pre_cost.values[member]
-            count = int(copy_counts.values.get(member, 1))
+            count = _runs_of_row(
+                rewrite, pre_program, uid, member,
+                int(copy_counts.values.get(member, 1)),
+                through=owner_of.get(member))
+            member_runs[member] = member_runs.get(member, 0) + count
             # A leaf's cost already holds the share of it a token runs (an
             # expert bank's `n_experts_active / n_route_targets` of its
             # expert axis); what multiplies it is the share of its copies
@@ -2020,6 +2055,13 @@ def _runtime_op_table(
         total_act_writes += act_writes
         total_kv_reads += kv_reads
 
+    unclosed = {member: (runs, int(copy_counts.values.get(member, 1)))
+                for member, runs in member_runs.items()
+                if runs != int(copy_counts.values.get(member, 1))}
+    if unclosed:
+        raise ValueError(
+            f"the op table counts members' runs other than the step runs "
+            f"them (rows, step): {unclosed!r}")
     for row in rows:
         row["params_share"] = (row["params"] / total_params) if total_params else 0.0
         row["flops_share"] = (row["flops"] / total_flops) if total_flops else 0.0

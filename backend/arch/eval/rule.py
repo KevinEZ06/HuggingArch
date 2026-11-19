@@ -12,7 +12,7 @@ projection.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterator, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
 from ..ops import DISPATCH_OP
 from .capacity import UnpricedTensor, Weights
@@ -60,6 +60,14 @@ class Rule:
         rule that is not trivial, as `history_state` is."""
         raise NotImplementedError(
             "the identity rule places nothing; the walk does not ask it")
+
+    def stage_of(self, analysis: Any
+                 ) -> Callable[[Any, int, Optional[int]], int]:
+        """`(program, uid, iteration) -> stage`: the pipeline stage node
+        `uid` of `program` — the walked graph, or one a rewrite built over
+        it — runs on at `iteration`. The one answer to which stage a run is
+        on. One stage here: nothing is cut."""
+        return _one_stage
 
     def rank_shapes(self, analysis: Any) -> Any:
         """The rank's tensor shapes — the walk's own, undivided."""
@@ -186,3 +194,7 @@ class Rule:
                                        buffer, axis,
                                        where=node.display_path)
         return out
+
+
+def _one_stage(_program: Any, _uid: int, _iteration: Optional[int]) -> int:
+    return 0

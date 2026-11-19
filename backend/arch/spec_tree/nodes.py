@@ -807,6 +807,12 @@ class SpecIRNode:
     # (`inference.materialize_casts`, after the walk).
     provenance: Literal["spec", "fusion", "comm", "site", "lowering",
                         "cast"] = "spec"
+    # A node a pass grafted at the model's top level after the walk (a
+    # collective after the vocabulary-parallel embedding, a cast before a
+    # model-level reader): the uid of the model-level op whose stage runs
+    # it, as the pass that grafted it declares (`OpStage.grafted`). None
+    # for every node the spec declared.
+    runs_with_op: Optional[int] = None
 
     @property
     def resolved_inputs(self) -> Tuple[Tuple[str, str], ...]:

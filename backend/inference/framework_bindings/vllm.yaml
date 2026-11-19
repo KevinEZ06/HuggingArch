@@ -596,12 +596,11 @@ op_implementations:
   # (models/kimi_k3/nvidia/model.py:1050-1068), and the one launch adds it,
   # combines and applies `post_attention_layernorm` (ops/attn_res.py:72-85,
   # :96-150, :154-167; Triton kernel :35 launched :222, or the native
-  # `kimi_k3_attn_res` on SM100, :192-213). Both phases. The other AttnRes
-  # launches are not bound: before attention the same kernel also takes the
-  # previous layer's FFN add (and every 12 layers the history write), and
-  # at the exit it takes the last FFN add but not the final norm — each a
-  # set of nodes across a layer occurrence, which no launch here can span —
-  # so those readouts are billed unfused (see the plan).
+  # `kimi_k3_attn_res` on SM100, :192-213). Both phases. Before attention
+  # the same kernel takes the previous layer's FFN add with the input norm
+  # (model.py:1024-1035), matched across the layer seam; at the exit vLLM
+  # leaves the final norm to `compute_logits`, which the graph cannot tell
+  # (see the plan).
   add_attn_res_combine_norm:
     source_anchor: "vllm.models.kimi_k3.nvidia.ops.attn_res.attn_res with a delta (vllm/models/kimi_k3/nvidia/ops/attn_res.py:170, add vllm/models/kimi_k3/nvidia/ops/attn_res.py:72-85), from KimiDecoderLayer._post_attn_norm (vllm/models/kimi_k3/nvidia/model.py:1050-1068)"
     when:

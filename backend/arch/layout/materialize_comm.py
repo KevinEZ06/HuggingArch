@@ -448,6 +448,18 @@ class _CommGraft:
         return f"comm{seq}__{event.op}__on__{placement.name}"
 
     def _insert(self, event, comm_node, placement, structural_anchor) -> None:
+        self._place(event, comm_node, placement)
+        if comm_node.parent is None and any(
+                root is comm_node for root in self.tree.top_level):
+            # At the model's top level the collective runs in the stage of
+            # the op it is placed at, as declared here
+            # (`SpecIRNode.runs_with_op`), not inferred later from where it
+            # stands.
+            comm_node.runs_with_op = (
+                placement.uid if placement.runs_with_op is None
+                else placement.runs_with_op)
+
+    def _place(self, event, comm_node, placement) -> None:
         if event.tree_anchor_event is not None:
             tree_anchor = self.nodes_by_event.get(event.tree_anchor_event)
             if tree_anchor is None:

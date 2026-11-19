@@ -20,18 +20,16 @@
 # :154-167) — the Triton `_attn_res_kernel` launched at :222, or on SM100
 # with hidden 7168 the native `kimi_k3_attn_res` (:192-213). Both phases.
 #
-# The other AttnRes launches have no plan, because none of them is a set of
-# nodes one launch here can hold. Before attention the same kernel takes the
-# previous layer's FFN residual add as its `delta` (model.py:1024-1035) and,
-# every 12 layers, writes the prefix into the history (`WRITE_BLOCK`,
-# ops/attn_res.py:86-93, the graph's `stack_append`); at the network exit it
-# takes the last FFN add and the combine but not the final norm, which runs
-# later in `compute_logits` (model.py:1383-1394, :1413-1414). Each of those
-# adds is a node of another layer occurrence, and a launch cannot span two
-# (`eval.fusion.BoundaryView`). A plan of the combine and the norm alone
-# would stand for part of one launch and, at the exit, parts of two, so
-# those readouts stay unfused: billed as separate launches, more than vLLM
-# runs, rather than as a launch it does not run.
+# Before attention the same kernel takes the previous layer's FFN residual
+# add as its `delta` and applies `input_layernorm` (model.py:1024-1035): the
+# same subgraph across the layer seam, which this plan matches there too
+# (`eval.fusion.Seams`; every 12 layers the launch also writes the prefix
+# into the history, `WRITE_BLOCK`, ops/attn_res.py:86-93, which the graph
+# keeps as its own `stack_append`). At the network exit vLLM takes the last
+# FFN add and the combine but runs the final norm later, in
+# `compute_logits` (model.py:1383-1394, :1413-1414); the graph has no fact
+# for where that norm is called, so the pattern takes it in: one launch a
+# step fewer than vLLM runs, a known gap.
 
 fused_op: add_attn_res_combine_norm
 

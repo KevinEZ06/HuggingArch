@@ -350,6 +350,189 @@ format, experts that take unquantised input) the default serving path is
 priced; DeepEP low latency quantises inside its dispatch kernel, a fusion
 recorded in `docs/known_limitations.md` §3.2.
 
+### A launch across the seam between two layers
+
+vLLM (v0.32.0, `models/llama.py:313-330`, `models/deepseek_v2.py:1367-1371`)
+and sglang (v0.5.22, `layer_boundary/residual/add_norm.py:259-270`) never
+finish a layer with its residual add. A layer returns `(hidden, residual)`,
+and the next layer's input norm adds them in the same launch
+(`fused_add_rmsnorm`, with its quantised output when a quantised GEMM reads
+it). The model's final norm does the same for the last layer
+(`llama.py:452`, sglang `residual/batch.py:59-114`). Our graph keeps the HF
+shape, in which every layer closes its own add, and a template is held once
+for all its layers. So the add (layer *i*'s tail) and the norm (layer
+*i+1*'s head) never met in one scope, and every model billed two launches
+per layer where the frameworks run one.
+
+**What crosses.** When the matcher walks an edge upward and meets a formal
+the layer loop hands from one iteration to the next, it asks the walk who
+wrote that formal at the previous iteration and keeps matching from that
+writer (`eval.fusion.Seams`). Such a formal is either the stream carried
+from the previous layer of the same stack, or the stack's last exit as read
+by the model-level op after it (`Program.threads_loop`). Three reads look
+similar and are not seams: the stack's own input (the embedding into
+layer 0), a read from another stack (the backbone into MTP), and a
+model-level read of a layer before the last (an auxiliary hidden-state
+tap). The answer
+is the walk's own: beside every value an input reads, the walk binds the
+occurrence that produced it at each iteration (`occurrence.Reference`). No plan states
+anything new and none opts in. A pattern that matches across the seam
+fuses across it: `fused_add_rmsnorm` with its optional cast,
+`allreduce_fused_rmsnorm` at TP > 1, and any sandwich-norm plan whose
+pattern meets the same edge.
+
+**How many.** A seam is one pair of occurrences, so a launch across seams
+runs once per pair:
+
+- *c − 1* within a segment of *c* layers (iterations 1..c−1 read the
+  previous one);
+- one at each junction between two segments (DeepSeek-V3's dense layer 2
+  → MoE layer 3). This is its own launch, priced on its own, not folded
+  into either segment (`CLAUDE.md` §2.5);
+- one from the stack's exit to the model-level reader after it (the final
+  norm).
+
+Under pipeline parallelism only the pairs whose two occurrences run on one
+stage count. A pipeline cut is a hop and not a seam: the add runs where it
+was made, and one tensor crosses, as before. The stage is the walk's
+placement (`Rule.stage_of`), which `Seams` reads for itself. It is the one
+answer to which stage a run is on, and serving's per-stage counts ask it
+too. No caller says where a cut is, so no caller can forget to.
+
+**Taking some runs of a node.** A member keeps the runs no seam took. The
+norm that opens a stack reads the embedding at layer 0, so 1 of its *c*
+runs stays a bare `rmsnorm`, while the closing add of every layer is taken
+whole (by the next layer, or by the final norm).
+
+How often a node runs is stated once, as the iterations it runs at:
+
+- a launch states its own (`FusedNode.iterations`), indexed in the
+  iteration space of the origin it runs with (`FusedNode.home`);
+- a node a launch took only some runs of states the ones it has left
+  (`FusedProgram.left`);
+- `FusedProgram.occurrence_layers` answers from these.
+
+The rewrite publishes the correspondence behind them once, as `Rewrite.taken`:
+for each launch and each member, which iteration of the member each of the
+launch's runs took. That is the reading iteration for a member of the
+reading layer, and the writing one (i − 1) for a member of the previous
+layer. Everything is read off that one map:
+
+- every count (`Layer.rebase_counts`, on the serving path and in
+  `rebase_analysis`): a node runs its home's count per iteration times its
+  iterations, one pipeline stage's included;
+- the op table's count of each member in each row
+  (`module_bench._runs_of_row`);
+- which launch writes the run a reader reads. That has one entry,
+  `cache.Edges.runs`. For each run of a reader's input it gives the
+  reader's iteration, the iteration of the node whose input it is, the
+  writer's own occurrence (from the walk's references), and what writes
+  that occurrence now (`Edges.writer_at`, over `Rewrite.launch_at`). A
+  residual read at layer i resolves to the launch that took layer
+  i − 1's add. Traffic and the activation edges read it too.
+
+**Iteration classes.** One template's layers can run different launches.
+DeepSeek-V3's first MoE layer opens with the dense → MoE seam, the others
+with the MoE → MoE one, and the last closes into the final norm. That is a
+fact of its own, derived from `taken`: the template's iterations grouped by
+which launch runs each of its taken nodes there
+(`Rewrite.iteration_classes`). Consumers use it in three ways:
+
+- The activation peak simulates each class as a group of its own and takes
+  the worst.
+- The activation edges answer per class.
+- Traffic prices a reader against one class and checks that every other
+  class hands it the same tensors. Different launches are fine; different
+  tensors cannot share one row.
+
+Nothing votes. A run two launches claim is refused (`Rewrite._run_by`).
+
+**Top-level grafts.** A node a pass grafts at the model's top level (the
+vocabulary-parallel embedding's all-reduce, a cast before the MTP head)
+declares the model-level stage that runs it (`SpecIRNode.runs_with_op`,
+`OpStage.grafted`). `occurrence_layers`, `evaluating_stage` and
+`Rule.stage_of` then give it one answer.
+
+The rewrite's accessors tell the two kinds of member apart (`Rewrite.whole`,
+`Rewrite.partly`). A node whose every run was taken is
+`dropped`, as always. One with runs left stays in the graph. The per-run
+values (cost, shape, bytes) of every node are untouched.
+
+A later pass takes what is left: DeepSeek-V3's layer-0 norm and its cast
+become one `fused_rmsnorm_quant`. A launch made by an earlier pass can be
+taken in part the same way, since its runs are iterations like any other
+node's.
+
+**Where it stands.** The launch stands in the reading layer's template,
+named `<reader>__seam` (`__seam@<template>` at a junction or at the stack
+exit). Its graph inputs are what the loop carries across the seam, named
+for the reader's formal and the writer of each (`x:down_proj`,
+`x:post_attn_add`, vLLM's `hidden_states` and `residual`). They are formals
+and not edges to the previous layer's nodes, so the template is still a DAG.
+What each one reads is its `Rewrite.inputs`, as for any input no node of the
+graph writes (`cache.Edges.reads`). `FusedNode.previous_iteration` names the members
+that ran a layer earlier. The computation graph expands the launch with its
+reading-layer members. A member with runs left keeps its own node beside the
+launch, its row ×(n − k) and the launch's ×k. The fusion records name the
+previous layer's members (`previous_iteration_aggregation_ids`). The web
+view does not draw them yet.
+
+**What it changed beyond add + norm.** Every plan whose pattern meets the
+seam now crosses it, since the matcher has no per-plan switch:
+
+- DeepSeek-V4's hyper-connection boundary from one layer's FFN into the
+  next layer's attention is the fused post+pre in decode, as vLLM calls it
+  (`models/deepseek_v4/nvidia/model.py:1236`). Layer 0's attention pre
+  (a GEMM alone) and the stack's exit post stay standalone.
+- Kimi-K3's AttnRes readout before attention takes the previous layer's
+  FFN add (`models/kimi_k3/nvidia/model.py:1024-1035`).
+- Qwen4Exp's cross-layer `hc_combine_norm` is fused.
+- At TP > 1, `allreduce_fused_rmsnorm` takes the FFN's all-reduce, the add
+  and the next input norm.
+
+**Not migrated: DeepSeek-V4.1's shifted spec.** V4.1's blocks are written
+at an offset (the carried pre-mix, `mhc_shifted_post_pre`). That is a
+statement about V4.1's own schedule, and its counts are unchanged
+(`TestTheShiftedSeamIsTheSameLaunchesOverACarriedPre`). Writing its blocks
+unshifted would let this mechanism carry the seam instead. That is a spec
+edit for when V4.1's spec is next revised, and nothing in the matcher
+stands in its way.
+
+**The concepts this added, and Occam's four questions (`CLAUDE.md` §1.4).**
+
+| New | Could an existing concept express it? | Observable at SOL? | Dimension or cell? | Literature name |
+|---|---|---|---|---|
+| `Seams` (a formal's writer at the previous iteration) | No new fact: it reads the walk's `Reference` table and adds no store of its own. | Yes: launch count and bytes. | One relation. | Loop-carried dependence. |
+| `Program.threads_loop` | It reads facts the program already holds (the stack and block of each end) to say which bound reads are the loop's own. | — | A predicate. | — |
+| `Rule.stage_of` | A rule hook beside the other per-rank answers: the identity rule has one stage, and layout's says which stage each occurrence runs on. | Yes: which seams exist. | One function. | Stage placement. |
+| `FusedNode.iterations` / `home`, `Rewrite.taken` / `homes`, `launch_at`, `Layer.rebase_counts` | No: `dropped` is all-or-nothing per node, and that is exactly why a seam could not be fused. The iteration set is the one statement of how often a node runs; counts are derived from it, never carried beside it. | Yes: counts. | A set of iterations, not a per-case flag. | Partial (iteration-grain) absorption. |
+| `FusedNode.previous_iteration` | No: the origins say *what* was absorbed, not *which layer* it ran in. | Display only. | One set. | — |
+| `__seam` row names | Same convention as the existing `__cast` / `__comm` suffixes. | Row identity. | — | — |
+
+**Why the bug existed (§1.3).**
+
+1. *The essence.* The fact "the norm that opens layer i+1 reads what layer
+   i's last add wrote" had a producer: the walk binds it at every
+   iteration. But the one consumer that needed it, the fusion matcher,
+   could not ask. Its edges stop at a template's formal, and its
+   absorption is one whole node or nothing.
+2. *The cause.* A template is held once for all its layers, and the
+   matcher was written over that one copy. Following a formal into the
+   previous iteration meant a count other than the template's, and the
+   rewrite had no way to say "some runs of this node". So a competent
+   reader of the graph met a dead end at `x` and stopped there. A spec
+   that wanted a cross-layer launch had to shift its own blocks (the mHC
+   spec does).
+3. *The structure.* The fix lets the matcher read the walk's existing
+   loop-carried edge, and lets the rewrite state absorption at
+   iteration grain. The iterations a node runs at are its one statement of
+   how often it runs (`FusedNode.iterations`, `FusedProgram.left`,
+   `Rewrite.taken`, which also says which run of each member each launch
+   took), and every count and every reader's launch is derived from them
+   (`rebase_counts`). The stage each occurrence runs on is an input of the
+   walk (`Rule.stage_of`) and not a caller's argument. No plan, binding or model is named, and no
+   second statement of the seam exists.
+
 ## The MoE exchange sends a token once per destination
 
 Every other collective's per-rank bytes are a function of its group's size:

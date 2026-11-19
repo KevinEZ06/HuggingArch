@@ -238,8 +238,8 @@ def kernel_rows(program: Any, node: Any, shape: Any) -> Any:
     if decl is None:
         # A leaf with no declaration of its own is a fused kernel
         # (`fusion.FusedNode.declaration`), and its operands are the member's
-        # its shape took.
-        member = program.by_uid(node.origins[0])
+        # its shape took: the one it runs with (`FusedNode.home`).
+        member = program.by_uid(node.home)
         decl, through = member.declaration, f" (through {member.op})"
     labels = tuple(decl.shape_in or ())
     couples = tuple(decl.couples_on or ())

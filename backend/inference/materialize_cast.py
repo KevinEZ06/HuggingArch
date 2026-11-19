@@ -388,6 +388,12 @@ def _insert(tree: Any, node: Any, home: Any, *, before: bool) -> None:
     following = _after(siblings, home, before=before)
     siblings.insert(len(siblings) if following is None
                     else siblings.index(following), node)
+    if siblings is tree.top_level:
+        # At the model's top level the node runs in its home's stage, as
+        # declared here (`SpecIRNode.runs_with_op`), not inferred later
+        # from where it stands.
+        node.runs_with_op = (home.uid if home.runs_with_op is None
+                             else home.runs_with_op)
 
 
 def _make(tree: Any, *, name: str, op: str, home: Any, producer: Any,

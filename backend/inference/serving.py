@@ -128,15 +128,6 @@ def _on_program(layer: Layer[Any], program: Any, extra: Layer[Any] | None = None
     return Layer(program, values)
 
 
-def _same(parts: Tuple[Any, ...]) -> Any:
-    if not parts:
-        raise ValueError("cannot combine an empty layer origin")
-    first = parts[0]
-    if any(value != first for value in parts[1:]):
-        raise ValueError(f"fusion spans unequal per-step facts {parts!r}")
-    return first
-
-
 def _node_definitions(analysis: Any) -> Layer[Any]:
     """The declared definition of each name a node's frame binds by one
     (`binding.Definition`): what the node's op rebinds (`Analysis.
@@ -531,7 +522,13 @@ def build_serving_layers(cell: Any, *,
             rewrite,
             preserve=frozenset(cached),
         )
-        instances = pre_instances.rebase(rewrite, program, _same)
+        # A launch across a seam runs once per seam, and a member it took
+        # only some runs of keeps the rest (`Rewrite.taken`).
+        stage_of = analysis.rule.stage_of(analysis)
+        instances = pre_instances.rebase_counts(
+            rewrite, program,
+            None if view is None else (
+                lambda uid, it: stage_of(pre_program, uid, it) == view.stage))
         pre_ratios = _ratios(
             _on_program(analysis.active_share, pre_program),
             pre_program,

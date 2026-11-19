@@ -42,8 +42,11 @@ def test_an_fp8_gemm_reads_fp8_and_writes_the_activation_dtype(decode_rows):
 
 def test_every_input_has_its_own_slot(decode_rows):
     """One dtype per input tensor, in `shape_in` order: a residual add
-    states both operands, not the first one's for the pair."""
-    add = _row(decode_rows, "out__block")
+    states both operands, not the first one's for the pair. Each layer's
+    closing add runs in the launch across the seam into the next layer's
+    norm (`fusion.Seams`), which reads both: the sublayer's output and the
+    residual."""
+    add = _row(decode_rows, "input_layernorm__seam")
     assert add["input_dtypes"] == ["BF16", "BF16"]
     for row in decode_rows:
         shape_in = row.get("shape_in")

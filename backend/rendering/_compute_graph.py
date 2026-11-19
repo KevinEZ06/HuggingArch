@@ -594,8 +594,15 @@ def serialize_post_tree(post_tree, resolved_spec, *,
                     if scheme and scheme.naive_pattern.is_parallel():
                         for i, c in enumerate(d["children"]):
                             c["output_port"] = f"output_{i}"
-                    # Other matched siblings (not this anchor) → prune.
-                    prune.update(m for m in matched if m != sid)
+                    # Other matched siblings (not this anchor) → prune,
+                    # except a member the launch took only some runs of: it
+                    # keeps a node of its own for the rest.
+                    match = next(
+                        (m for m in fusion_matches
+                         if m["fused_uid"] == d.get("uid")), {})
+                    kept = set(match.get("kept_aggregation_ids", ()))
+                    prune.update(m for m in matched
+                                 if m != sid and m not in kept)
                     continue  # children are the absorbed subgraph, don't recurse
             if d.get("children"):
                 d["children"] = _expand_fused(d["children"], pre_idx)
