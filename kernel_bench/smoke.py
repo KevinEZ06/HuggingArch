@@ -159,6 +159,11 @@ MINIMAL_DIMS: Dict[str, int] = {
     "d_reduce": 256,
     "d_out": 256,
     "d_rope": 64,
+    # MLA's per-head non-rope width beside `d_rope` in the `q_b_proj` row:
+    # the DSA query launch reads q_pe as that row's rope tail, so this sizes
+    # its stride. DeepSeek-V3.2's 128, unequal to `d_rope`, so a build that
+    # took the wrong half of the row does not pass.
+    "d_qk_nope": 128,
     "d_v_head": 64,
     # Three-axis MRoPE at the minimal rotary width: [11, 11, 10] owns all 32
     # pairs of a 64-channel rotation; smoke takes the interleaved lane layout,

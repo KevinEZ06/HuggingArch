@@ -1955,3 +1955,161 @@ def _register_dsa_norm_rope() -> None:
 
 
 _register_dsa_norm_rope()
+
+
+# --- fused_dsa_q_rope_quant: the DSA query preparation -----------------------
+#
+# vLLM v0.32.0 `fused_q` (models/deepseek_v32/common/kernels.py:953, one
+# `_fused_q_kernel` launch :1063 over (tokens, 3, heads) programs, kernel
+# :732), as `DeepseekV32Attention.forward` calls it on an indexer layer
+# (deepseek_v32/attention.py:433-447): pid 0 rotates the main q_pe, pid 1
+# rotates each indexer head and quantises it to FP8 with a power-of-two
+# scale (`_fp8_ue8m0_quantize` :62, called :930), folding that scale, the
+# indexer softmax scale and n_heads^-1/2 into the head weights (:944-950).
+#
+# The timed launch is the BF16-query path the plan bills
+# (`quantize_mqa=False`: q_pe_out a buffer of its own, :1032; pid 2
+# returns at once, :794-797). Its operands are the ones serving passes:
+#   * q_pe the rope tail of the `q_b_proj` row viewed per head and split
+#     nope|rope (attention.py:420-421) — a strided view whose row is
+#     `d_qk_nope + d_rope` wide, the cell's structural `d_qk_nope`;
+#   * ql_nope the nope half of that same row. On this path the kernel only
+#     shape-checks it (:982-983) and sizes a constexpr off it (:1088-1089);
+#     pid 2 never reads it, so which nope serving hands it (`W_UK`-absorbed
+#     or not, attention.py:422-425) moves no byte;
+#   * the indexer query the contiguous `wq_b` row viewed per head
+#     (attention.py:428-429), and the head weights the trailing slice of the
+#     fused wk/weights row (attention.py:310-312), as the sglang query
+#     provider builds them;
+#   * q_scale the fp32 one-element scale (`self._q_scale`), unread here.
+# Both rotations read one table: serving's two (`rotary_emb`,
+# `indexer_rope_emb`) are the same d_rope-wide rows at one position.
+
+
+def _vllm_dsa_q_rope_quant_build(inv: Invocation, env: Env,
+                                 inputs: Dict[str, Any]) -> BenchCase:
+    _require_cuda()
+    import torch
+    from vllm.models.deepseek_v32.common.kernels import fused_q
+    dt = _torch_dtype(inv.dtype)
+    q_pe0, index_q0 = inputs["q_pe"].to(dt), inputs["index_q"].to(dt)
+    tokens, heads, dr = (int(n) for n in q_pe0.shape)
+    dn = int(inputs["d_qk_nope"])
+    q = torch.empty(tokens, heads, dn + dr, dtype=dt, device=q_pe0.device)
+    q[..., dn:] = q_pe0
+    ql_nope, q_pe = q.split([dn, dr], dim=-1)
+    index_q = index_q0.contiguous()
+    index_heads, index_dim = int(index_q.shape[1]), int(index_q.shape[2])
+    kw = torch.empty(tokens, index_dim + index_heads, dtype=dt,
+                     device=q_pe0.device)
+    kw[:, index_dim:] = inputs["weights"].to(dt)
+    weights = kw[:, index_dim:]
+    softmax_scale = index_dim ** -0.5
+    head_scale = index_heads ** -0.5
+    table = inputs["cos_sin_cache"]
+    q_scale = torch.ones(1, dtype=torch.float32, device=q_pe0.device)
+
+    def to_canonical(out):
+        index_q_fp8, weights_out, q_pe_out = out
+        scale = weights_out.float() / (weights.float() * softmax_scale
+                                       * head_scale)
+        index = index_q_fp8.float() * scale.unsqueeze(-1)
+        return torch.cat([q_pe_out.float().flatten(1), index.flatten(1)],
+                         dim=-1)
+
+    return BenchCase(
+        run=Launch(fused_q, inputs["positions"], q_pe, table, index_q, table,
+                   ql_nope, q_scale, weights, softmax_scale, head_scale,
+                   has_indexer=True,
+                   index_rope_interleave=bool(inputs["index_rope_interleave"]),
+                   quantize_mqa=False),
+        to_canonical=to_canonical)
+
+
+def _vllm_dsa_q_rope_quant_reference(inputs: Dict[str, Any]) -> Any:
+    """vLLM's audited deviation from the cell's record: the indexer query's
+    FP8 scale is rounded UP to a power of two (`_fp8_ue8m0_quantize`,
+    kernels.py:62-74: `exp2(ceil(log2(max(amax, 1e-4) / 448)))`) where the
+    cell's record keeps the exact fp32 `amax / 448`. The rotations are the
+    shared oracle's; the indexer row is placed on the power-of-two grid the
+    launch writes, in the same `[q_pe | index_q]` basis."""
+    import dataclasses
+    import torch
+    from ..quant import FORMATS, quantise_groups
+    from ..refs import _dsa_q_rope
+    q_pe, index_q = _dsa_q_rope(inputs)
+    rows = index_q.flatten(0, 1)
+    fmt = dataclasses.replace(FORMATS["fp8_e4m3"], pow2_scale=True)
+    values, scale = quantise_groups(rows, fmt, rows.shape[-1], "exact",
+                                    inputs["index_q"].dtype, eps=1e-4)
+    index = (values.float() * scale.unsqueeze(-1)).reshape(index_q.shape)
+    return torch.cat([q_pe.flatten(1), index.flatten(1)], dim=-1)
+
+
+def _dsa_q_rope_quant_chain(i, torch):
+    """The plan's nodes as separate eager ops at the cell's dtype: the two
+    rotations, then the indexer query's cast where the cell has one."""
+    from ..refs import _rope_rotate
+    pos, table = i["positions"], i["cos_sin_cache"]
+    rd = int(table.shape[-1])
+    q_pe = _rope_rotate(i["q_pe"], pos, table, rd,
+                        is_neox=False).to(i["q_pe"].dtype)
+    index_q = _rope_rotate(i["index_q"], pos, table, rd,
+                           is_neox=not i["index_rope_interleave"]
+                           ).to(i["index_q"].dtype)
+    cast = i.get("cast")
+    if cast is not None:
+        index_q = cast.on_grid(index_q.flatten(0, 1))
+    return q_pe, index_q.reshape(q_pe.shape[0], -1)
+
+
+def _register_dsa_q_rope_quant() -> None:
+    from .norm_act import _cell_floor
+    sig = "fused_dsa_q_rope_quant"
+    register(Provider(
+        library="vllm", signature=sig, kernel_impl=f"vllm_{sig}",
+        import_name="vllm.models.deepseek_v32.common.kernels",
+        serves=KernelSignature(
+            signature=sig,
+            # `tl.arange(0, INDEX_Q_HEAD_DIM)` (:886) and the two
+            # `tl.arange(0, *_HALF_ROT_DIM)` (:42, :888): the indexer head
+            # and the rotation are powers of two.
+            enum=(("d_indexer_head", _POWERS_OF_TWO),
+                  ("d_rope", _POWERS_OF_TWO)),
+            # bf16, what both bound models (DeepSeek-V3.2, GLM-5.x) serve.
+            activation=("bf16",),
+            # The indexer query leaves the launch FP8 e4m3, one scale a head
+            # row (`per-token` over its `d_indexer_head` row) whatever the
+            # cell declares; a cell that keeps it unquantised is not this
+            # launch's to measure.
+            output=("fp8_e4m3",),
+            activation_granularity=("per-token",),
+            dtype_slots=(("metadata", ("fp32",)),),
+            # The launch's other writes: the rotated q_pe at the activation
+            # dtype (`torch.empty_like(q_pe)`, :1032) and the head weights
+            # fp32 with each head's scale folded in (:1037).
+            secondary_outputs=(("q_pe", "bf16"), ("weights", "fp32"))),
+        build=_vllm_dsa_q_rope_quant_build,
+        reference=_vllm_dsa_q_rope_quant_reference,
+        fused_op=sig,
+    ))
+    # The eager chain, in the two forms the plan's optional cast gives the
+    # span: the indexer query written as the cell's own record
+    # (`cast.on_grid`, the oracle's grid), or — where the index key is kept
+    # unquantised and no cast is grafted — the rotated row as it is.
+    for impl, quant in ((f"torch_{sig}", True),
+                        ("torch_fused_dsa_q_rope", False)):
+        register(Provider(
+            library="torch", signature=sig, kernel_impl=impl,
+            import_name="torch",
+            serves=KernelSignature(
+                signature=sig, activation=("bf16",),
+                **(dict(output=("fp8_e4m3",),
+                        activation_granularity=("per-token",),
+                        dtype_slots=(("metadata", ("fp32",)),))
+                   if quant else dict(output=("bf16",)))),
+            build=_cell_floor(_dsa_q_rope_quant_chain), fused_op=sig,
+        ))
+
+
+_register_dsa_q_rope_quant()

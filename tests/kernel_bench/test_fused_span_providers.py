@@ -90,6 +90,59 @@ def _floor_meets_the_oracle(sig, dims, output="bf16", env=None,
     return recording.trace
 
 
+class TestEveryPlanHasARouteToAMeasurement:
+    """The join between the two registries a fused launch is declared in:
+    the plan (`fusion_plans/*.yaml`, what the framework fuses) and its
+    measurement route (a signature's `binds_ops`, or a provider's
+    `fused_op`). Static and second-scale, so it runs in the default set: it
+    used to sit in `test_kernel_bench.py`, whose module-wide `regression`
+    mark kept it out of every push and deploy, and two plans landed with no
+    route while it was red and unseen."""
+
+    def test_a_span_with_no_route_to_a_measurement_is_named(self):
+        """A fusion span the cost model prices and nothing measures.
+
+        The span's saving is then a number nothing can check. Most of these
+        are not unmeasurable — the framework ships the kernel, so what is
+        missing is ours: a signature, a reference and a provider. The list
+        shrinks as each is wired up, and a span JOINING it is a boundary
+        that quietly went unchecked.
+        """
+        import glob
+        import os
+        from pathlib import Path
+        import yaml
+        from backend.inference.op_signatures import op_bindings
+        OP_TO_SIGNATURE = op_bindings()
+        from backend.inference import fusion_plans as FP
+        from kernel_bench.providers import all_providers
+        spans = {(yaml.safe_load(Path(p).read_text()) or {})["fused_op"]
+                 for p in glob.glob(os.path.join(os.path.dirname(FP.__file__),
+                                                 "*.yaml"))}
+        claimed = {p.fused_op for p in all_providers() if p.fused_op}
+        unreachable = sorted(spans - set(OP_TO_SIGNATURE) - claimed)
+        # `gated_act_ffn` is genuinely unmeasurable: neither framework ships
+        # a mega-FFN kernel. The six that joined with the Kimi-K3, Hy4 and
+        # DeepInfer plans are ours to wire — the frameworks ship each launch
+        # (the plans' own anchors say where), so what is missing is a
+        # signature, a reference and a provider. The list names what remains
+        # so the gap stays countable rather than reading as coverage.
+        assert unreachable == [
+            # Kimi-K3's AttnRes readout + sublayer norm, one launch.
+            "add_attn_res_combine_norm",
+            # K3's packed q|k|v short convolutions, one causal-conv launch.
+            "causal_conv1d_packed",
+            # No kernel in either framework.
+            "gated_act_ffn",
+            # Hy4's pre-gate reduction and first exchange mix.
+            "ihc_pre_gate_reduce", "ihc_pre_mix",
+            # K3 KDA's six input projections, one merged GEMM.
+            "merged_column_parallel_linear_wide",
+            # Absorbed-MLA decode's two latent concats, one DeepInfer launch.
+            "mla_q_concat_kv_insert",
+        ], f"the set of spans with no route to a measurement moved: {unreachable}"
+
+
 class TestCausalConv1d:
     """The short conv with its SiLU (`fusion_plans/causal_conv1d.yaml`)."""
 
@@ -4409,11 +4462,13 @@ class TestDsaPrologue:
         "fused_dsa_qkv_norm_rope_indexer": {"vllm", "torch"},
         "fused_indexer_k_norm_rope_store": {"sglang", "torch"},
         "fused_indexer_q_rope_first_quant": {"sglang", "torch"},
+        "fused_dsa_q_rope_quant": {"vllm", "torch"},
     }
     DIMS: ClassVar[dict] = {"B": 2, "s_query": 3, "d_q_lora": 96,
                             "d_kv_lora": 32, "d_rope": 16,
                             "d_indexer_head": 32, "n_indexer_heads": 4,
-                            "n_topk_keys": 64, "kv_block_size": 4}
+                            "n_topk_keys": 64, "kv_block_size": 4,
+                            "n_heads": 4, "d_qk_nope": 24}
 
     def test_each_span_binds_and_its_kernels_claim_it(self):
         from backend.inference.op_signatures import op_bindings
@@ -4562,6 +4617,98 @@ class TestDsaPrologue:
         assert sgl.capabilities()["secondary_outputs"] == [
             {"tensor": "weights", "dtype": "fp32"}]
 
+    QUANT_ENV: ClassVar[dict] = {"activation": "bf16", "output": "fp8_e4m3",
+                                 "activation_granularity": "per-token",
+                                 "metadata": "fp32"}
+
+    def test_the_dsa_query_floor_writes_the_cells_record(self):
+        """The query span's torch floor at its quantised cell — the indexer
+        query on the cell's per-head FP8 grid — beside the plain cell the
+        default floor test reads (an index key kept BF16 grafts no cast)."""
+        _floor_meets_the_oracle("fused_dsa_q_rope_quant", self.DIMS,
+                                output="fp8_e4m3", env=self.QUANT_ENV)
+
+    def test_vllm_hands_fused_q_the_serving_operands(self, monkeypatch):
+        """vLLM `fused_q` (deepseek_v32/common/kernels.py:953) as
+        `DeepseekV32Attention.forward` calls it (attention.py:433-447): q_pe
+        the rope tail of the per-head `q_b_proj` row, the indexer query
+        contiguous, the head weights the trailing slice of the wk/weights
+        row, the BF16-query path. A stand-in computing the kernel's own
+        arithmetic (GPT-J q_pe, the stated indexer pairing, the power-of-two
+        FP8 scale folded into the weights, :62-74, :930-950) must land on
+        the provider's declared oracle through the provider's canonical
+        reading — and off the cell's exact-scale record, which is why that
+        oracle exists."""
+        torch = pytest.importorskip("torch")
+        import kernel_bench.providers.rope as rope
+        from kernel_bench.refs import _rope_rotate, get_ref
+        seen = {}
+
+        def fused_q(positions, q_pe, q_pe_table, index_q, index_table,
+                    ql_nope, q_scale, weights, softmax_scale, head_scale, *,
+                    has_indexer, index_rope_interleave, quantize_mqa):
+            seen.update(q_pe=q_pe, ql_nope=ql_nope, index_q=index_q,
+                        weights=weights, has_indexer=has_indexer,
+                        quantize_mqa=quantize_mqa, positions=positions)
+            rd = int(q_pe_table.shape[-1])
+            q_out = _rope_rotate(q_pe.float(), positions, q_pe_table, rd,
+                                 is_neox=False).to(q_pe.dtype)
+            rows = _rope_rotate(index_q.float(), positions, index_table, rd,
+                                is_neox=not index_rope_interleave)
+            amax = rows.abs().amax(-1).clamp_min(1e-4)
+            scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+            fp8 = (rows / scale[..., None]).to(torch.float8_e4m3fn)
+            w_out = weights.float() * scale * softmax_scale * head_scale
+            return fp8, w_out, q_out
+
+        _fake_module(monkeypatch, "vllm.models.deepseek_v32.common.kernels",
+                     fused_q=fused_q)
+        monkeypatch.setattr(rope, "_require_cuda", lambda: None)
+        sig = "fused_dsa_q_rope_quant"
+        vllm = next(p for p in _providers(sig) if p.library == "vllm")
+        inv = Invocation(op=sig, signature=sig, phase="prefill", tp=1,
+                         dims={a: self.DIMS[a] for a in
+                               ("B", "s_query", "n_heads", "d_rope",
+                                "n_indexer_heads", "d_indexer_head",
+                                "d_qk_nope")},
+                         dtype_env=dict(self.QUANT_ENV))
+        assert vllm.serves.accepts(inv)
+        inputs = build_inputs(get_ref(sig), inv, "cpu")
+        case = vllm.build(inv, TORCH_ENV, inputs)
+        got = case.to_canonical(case.run()).float()
+        heads, nope, rd = 4, 24, 16
+        assert seen["q_pe"].stride()[1:] == (nope + rd, 1)
+        assert not seen["q_pe"].is_contiguous()
+        assert seen["ql_nope"].shape[-1] == nope
+        assert seen["index_q"].is_contiguous()
+        assert seen["weights"].stride() == (32 + heads, 1)
+        assert seen["has_indexer"] and not seen["quantize_mqa"]
+        assert seen["positions"].dtype == torch.int64
+        own = vllm.reference(inputs).float()
+        assert (got - own).abs().max() <= 1e-2 * own.abs().max()
+        exact = get_ref(sig).reference(inputs).float()
+        assert (own - exact).abs().max() > 0
+
+    def test_a_bare_norm_with_its_cast_is_the_norms_quantising_launch(self):
+        """`fused_rmsnorm_quant` (the residual-free norm taking its quantised
+        GEMM's cast) is measured under `rmsnorm`, told apart from the plain
+        norm by the cell's output record — the cell vLLM's
+        `rms_norm_per_block_quant` (rms_quant_fusion.py:463) serves, the
+        kernel `RMSNormGroupQuantPattern` rewrites the pair into."""
+        from backend.inference.op_signatures import op_bindings
+        assert op_bindings()["fused_rmsnorm_quant"] == "rmsnorm"
+        dims = {"B": 1, "s_query": 3, "d_model": 7168}
+        quant = Invocation(
+            op="fused_rmsnorm_quant", signature="rmsnorm", phase="prefill",
+            tp=1, dims=dims,
+            dtype_env={"activation": "bf16", "weight": "bf16",
+                       "output": "fp8_e4m3",
+                       "activation_granularity": "per-group:128",
+                       "metadata": "fp32"})
+        served = {p.kernel_impl for p in _providers("rmsnorm")
+                  if p.serves.accepts(quant)}
+        assert served == {"vllm_rms_norm_per_block_quant"}, served
+
     def test_the_cells_are_read_off_the_engine_operands(self):
         import json
         from backend.inference.benchmark_identity import (
@@ -4586,7 +4733,8 @@ class TestDsaPrologue:
                                                           get_binding)
         from kernel_bench.plan import build_jobs
         expect = (("deepseek-ai/DeepSeek-V3.2", "vllm",
-                   ("fused_dsa_qkv_norm_rope_indexer",)),
+                   ("fused_dsa_qkv_norm_rope_indexer",
+                    "fused_dsa_q_rope_quant")),
                   ("zai-org/GLM-5.2", "vllm",
                    ("fused_dsa_qkv_norm_rope",
                     "fused_dsa_qkv_norm_rope_indexer")),
@@ -4606,6 +4754,34 @@ class TestDsaPrologue:
                 got = {j["signature"] for j in jobs}
                 for sig in sigs:
                     assert sig in got, (model, fw, phase, sig)
+                if "fused_dsa_q_rope_quant" in sigs:
+                    self._dsa_query_cell_is_the_checkpoints(model, jobs)
+
+    @staticmethod
+    def _dsa_query_cell_is_the_checkpoints(model, jobs):
+        """The DSA query span's two rank-4 operands are zipped by position
+        (the engine hands a span's inputs over by member uid, not by the
+        plan's port names), and a swap would bind every axis without a
+        conflict. So its cell is read against the checkpoint config — a
+        route that shares nothing with the projection: q_pe carries the
+        attention heads and the MLA rope width, the indexer query the
+        indexer's heads and head width, and the rotation is narrower than
+        the indexer head it rotates the front of."""
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[2]
+        cfg = json.loads((root / "backend/arch/snapshots"
+                          / f"{model.replace('/', '__')}.json").read_text()
+                         )["config"]
+        cells = {tuple(sorted(j["dims"].items())) for j in jobs
+                 if j["signature"] == "fused_dsa_q_rope_quant"}
+        assert cells, model
+        for cell in map(dict, cells):
+            assert cell["n_heads"] == cfg["num_attention_heads"], cell
+            assert cell["d_rope"] == cfg["qk_rope_head_dim"], cell
+            assert cell["n_indexer_heads"] == cfg["index_n_heads"], cell
+            assert cell["d_indexer_head"] == cfg["index_head_dim"], cell
+            assert cell["d_qk_nope"] == cfg["qk_nope_head_dim"], cell
+            assert cell["d_rope"] < cell["d_indexer_head"], cell
 
 
 class TestSparseAttentionRoutes:

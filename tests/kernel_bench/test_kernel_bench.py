@@ -9200,48 +9200,6 @@ class TestGraphToOperatorIsAQuotient:
         with pytest.raises(KeyError, match="no signature measures"):
             BI._rewrite("linear", "a_kernel_nobody_measures")
 
-    def test_a_span_with_no_route_to_a_measurement_is_named(self):
-        """A fusion span the cost model prices and nothing measures.
-
-        The span's saving is then a number nothing can check. Most of these
-        are not unmeasurable — the framework ships the kernel, so what is
-        missing is ours: a signature, a reference and a provider. The list
-        shrinks as each is wired up, and a span JOINING it is a boundary
-        that quietly went unchecked.
-        """
-        import glob
-        import os
-        import yaml
-        from backend.inference.op_signatures import op_bindings
-        OP_TO_SIGNATURE = op_bindings()
-        from backend.inference import fusion_plans as FP
-        from kernel_bench.providers import all_providers
-        spans = {(yaml.safe_load(Path(p).read_text()) or {})["fused_op"]
-                 for p in glob.glob(os.path.join(os.path.dirname(FP.__file__),
-                                                 "*.yaml"))}
-        claimed = {p.fused_op for p in all_providers() if p.fused_op}
-        unreachable = sorted(spans - set(OP_TO_SIGNATURE) - claimed)
-        # `gated_act_ffn` is genuinely unmeasurable: neither framework ships
-        # a mega-FFN kernel. The six that joined with the Kimi-K3, Hy4 and
-        # DeepInfer plans are ours to wire — the frameworks ship each launch
-        # (the plans' own anchors say where), so what is missing is a
-        # signature, a reference and a provider. The list names what remains
-        # so the gap stays countable rather than reading as coverage.
-        assert unreachable == [
-            # Kimi-K3's AttnRes readout + sublayer norm, one launch.
-            "add_attn_res_combine_norm",
-            # K3's packed q|k|v short convolutions, one causal-conv launch.
-            "causal_conv1d_packed",
-            # No kernel in either framework.
-            "gated_act_ffn",
-            # Hy4's pre-gate reduction and first exchange mix.
-            "ihc_pre_gate_reduce", "ihc_pre_mix",
-            # K3 KDA's six input projections, one merged GEMM.
-            "merged_column_parallel_linear_wide",
-            # Absorbed-MLA decode's two latent concats, one DeepInfer launch.
-            "mla_q_concat_kv_insert",
-        ], f"the set of spans with no route to a measurement moved: {unreachable}"
-
 
 class TestTheKernelThatRanIsRecorded:
     """Layer 4. The first three layers prove a declaration is well formed,

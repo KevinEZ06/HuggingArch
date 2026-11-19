@@ -2612,6 +2612,72 @@ register_ref("fused_dsa_qkv_norm_rope_indexer",
              RefSpec(_dsa_norm_rope_inputs(True), _dsa_norm_rope_reference))
 
 
+# ---------------------------------------------------------------------------
+# DSA query preparation (`fused_dsa_q_rope_quant`): the main query's q_pe
+# rotated GPT-J style, and the indexer query's LEADING `d_rope` channels
+# rotated and the row cast to the cell's activation record. The indexer
+# pairing is the one `DSA_INDEX_ROPE_INTERLEAVE` states for the sibling
+# prologue (one cell, NeoX), for the same reason.
+# ---------------------------------------------------------------------------
+
+def _dsa_q_rope_quant_inputs(inv: Invocation, device: str,
+                             gen: Any) -> Dict[str, Any]:
+    import torch
+    dims = _dims(inv)
+    dt = _dtype(inv.dtype)
+    q_pe = torch.randn(*_shape(inv, "q_pe"), dtype=dt, device=device,
+                       generator=gen)
+    index_q = torch.randn(*_shape(inv, "index_q"), dtype=dt, device=device,
+                          generator=gen)
+    tokens = int(q_pe.shape[0])
+    positions = torch.arange(tokens, dtype=torch.int64, device=device)
+    return {
+        "q_pe": q_pe,
+        "index_q": index_q,
+        # Positive, so a launch that folds each head's scale into the head
+        # weights lets a provider read that scale back.
+        "weights": 0.5 + torch.rand(*_shape(inv, "weights"), dtype=dt,
+                                    device=device, generator=gen),
+        "positions": positions,
+        "cos_sin_cache": _rope_cos_sin_cache(positions, int(dims["d_rope"]),
+                                             10000.0),
+        "d_qk_nope": int(dims["d_qk_nope"]),
+        "index_rope_interleave": DSA_INDEX_ROPE_INTERLEAVE,
+        # The indexer query's record, one scale a head row (`per-token` over
+        # a `d_indexer_head` row); None on a cell whose index key is kept
+        # unquantised (the plan's `quant` member is optional).
+        "cast": _quant_output_cast(inv, index_q.shape[-1]),
+    }
+
+
+def _dsa_q_rope(inputs: Dict[str, Any]) -> Tuple[Any, Any]:
+    """The two rotations in fp32: q_pe whole (adjacent pairs), the indexer
+    query on its leading `d_rope` channels."""
+    pos, table = inputs["positions"], inputs["cos_sin_cache"]
+    rd = int(table.shape[-1])
+    q_pe = _rope_rotate(inputs["q_pe"].float(), pos, table, rd, is_neox=False)
+    index_q = _rope_rotate(inputs["index_q"].float(), pos, table, rd,
+                           is_neox=not inputs["index_rope_interleave"])
+    return q_pe, index_q
+
+
+def _dsa_q_rope_quant_reference(inputs: Dict[str, Any]) -> Any:
+    """`[tokens, n_heads·d_rope + n_indexer_heads·d_indexer_head]`: the
+    rotated q_pe beside the rotated indexer query as the cell's record holds
+    it. The head weights' rescale is what the record's scale is FOR and is
+    read back by a provider, not compared."""
+    import torch
+    q_pe, index_q = _dsa_q_rope(inputs)
+    cast = inputs.get("cast")
+    if cast is not None:
+        index_q = cast.on_grid(index_q.flatten(0, 1)).reshape(index_q.shape)
+    return torch.cat([q_pe.flatten(1), index_q.flatten(1)], dim=-1)
+
+
+register_ref("fused_dsa_q_rope_quant",
+             RefSpec(_dsa_q_rope_quant_inputs, _dsa_q_rope_quant_reference))
+
+
 def _rope_partial_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
     """`rope`'s operands with heads of `d_head` and a rotation of `d_rope`:
     the cache is `d_rope` wide, the heads keep their full width, and the

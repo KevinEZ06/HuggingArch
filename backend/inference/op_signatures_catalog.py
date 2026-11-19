@@ -905,9 +905,15 @@ register_signature(OpSignature(
          "gain. sglang `Mixer2RMSNormGated.forward_cuda`."),
 ))
 
+# `fused_rmsnorm_quant` is the same launch writing its row already quantised
+# (the plan's required `quantise_activation` member): one norm over the same
+# operands, told apart from the plain norm by the cell's `output` dtype and
+# activation granularity, exactly as `fused_add_rmsnorm`'s optional cast is.
+# vLLM's `rms_norm_per_block_quant` / `rms_norm_dynamic_per_token_quant`
+# providers below serve those cells; the plain ones serve the BF16 output.
 register_signature(OpSignature(
     name="rmsnorm",
-    binds_ops=('rmsnorm',),
+    binds_ops=('rmsnorm', 'fused_rmsnorm_quant'),
     inputs=(
         TensorLayout("x", (("B", "s_query"), "d_model")),
         TensorLayout("w", ("d_model",), role="weight"),
@@ -1285,6 +1291,50 @@ register_signature(OpSignature(
          "launch's second output, written fp32. sglang "
          "`dsv4.elementwise.fused_q_indexer_rope_first_quant`. "
          "Memory-bound."),
+))
+
+# vLLM's DSA query preparation (`fused_dsa_q_rope_quant`): the main MLA
+# query's rope channels rotated, and the indexer query rotated on its leading
+# `d_rope` channels and written FP8 with one power-of-two scale per head row,
+# one launch (`deepseek_v32.common.kernels.fused_q`). The indexer head
+# weights are read and written in the same launch (each head's scale folded
+# into them, written fp32) though the plan holds no node for them, as in
+# sglang's `fused_indexer_q_rope_first_quant` above. `q_pe` is the rope tail
+# of the `q_b_proj` row the walk splits per head, so the nope width beside it
+# (`d_qk_nope`) sizes the row stride the kernel reads it at — no tensor of
+# the span carries it.
+register_signature(OpSignature(
+    name="fused_dsa_q_rope_quant",
+    binds_ops=('fused_dsa_q_rope_quant',),
+    inputs=(
+        TensorLayout("q_pe", (("B", "s_query"), "n_heads", "d_rope")),
+        TensorLayout("index_q", (("B", "s_query"), "n_indexer_heads",
+                                 "d_indexer_head")),
+        TensorLayout("weights", (("B", "s_query"), "n_indexer_heads")),
+        TensorLayout("positions", (("B", "s_query"),), role="metadata"),
+        TensorLayout("cos_sin_cache", (None, "d_rope"), role="metadata"),
+    ),
+    # The fused node's operands arrive in the order the engine hands a span's
+    # external inputs over — by member uid (`fusion._external_inputs`), not by
+    # the plan's `io_mapping` port names. In both DSA attention components the
+    # main query's `q_pe_rope` is declared before the indexer's nodes, so the
+    # main q_pe is position 0 and the indexer's head-split query position 1.
+    # Nothing in this declaration would notice the two being swapped (both
+    # are rank 4); `TestDsaPrologue.test_the_plan_reaches_each_span` checks
+    # the projected cell against the checkpoint config instead.
+    engine_inputs=(
+        (0, TensorLayout("q_pe", ("B", "n_heads", "s_query", "d_rope"))),
+        (1, TensorLayout("index_q", ("B", "n_indexer_heads", "s_query",
+                                     "d_indexer_head"))),
+    ),
+    structural_axes=("d_qk_nope",),
+    dtype_slots=("activation", "output"),
+    doc=("DSA query preparation, one launch: the main query's q_pe rotated "
+         "(adjacent pairs) and written at the activation dtype, the indexer "
+         "query's leading d_rope channels rotated and the row written FP8 "
+         "e4m3 with one power-of-two scale per head, that scale folded into "
+         "the head weights (written fp32). vLLM "
+         "`deepseek_v32.common.kernels.fused_q`. Memory-bound."),
 ))
 
 register_signature(OpSignature(

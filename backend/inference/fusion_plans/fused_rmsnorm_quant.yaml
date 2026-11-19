@@ -58,6 +58,34 @@
 # of its own. The binding prices the better form all the same, as
 # `fused_add_rmsnorm`'s optional cast does: taking the cast into its one
 # writer is the graph's rule, not a per-framework fact.
+#
+# Measurement: the span is measured under the `rmsnorm` signature, keyed by
+# the record it writes (`output`, `activation_granularity`, `metadata`). Two
+# vLLM kernels serve it: `rms_norm_per_block_quant` (FP8 e4m3, fp32 scales
+# per 64 or 128, BF16 row and gain) and `rms_norm_dynamic_per_token_quant`
+# for an FP8 per-token record. The cells the shipped corpus plans at its
+# shipped precision (vLLM and sglang bindings, B200) and who serves them:
+#   * FP8 per-group:128, fp32 scales, BF16 gain — the block-FP8 checkpoints
+#     (DeepSeek-V3, MiniMax-M2.7, MiMo-V2*, …): `vllm_rms_norm_per_block_quant`.
+#   * FP8 per-token, fp32 scales — Ling-2.6-1T: `vllm_rms_norm_per_token_quant`.
+#   * MISSING — FP8 per-group:128 with UE8M0 scales (DeepSeek-V4-Flash / -Pro,
+#     both bindings). vLLM's kernel writes fp32 scales only: its signature has
+#     no scale-format argument (_custom_ops.py:443-452), and the pass replaces
+#     even its `is_e8m0` group patterns with the same op and no UE8M0 flag
+#     (rms_quant_fusion.py:526-537, registered :815-835), so it does not
+#     write this record and its provider (metadata fp32) declines the cell.
+#   * MISSING — FP8 per-group:32 with UE8M0 scales (DeepSeek-V4.1-Flash under
+#     sglang): no kernel declares a 32-wide group for this norm.
+#   * MISSING — FP8 per-group:128 behind an fp32-stored gain (DeepSeek-V3.2 /
+#     -Exp under sglang): the provider declares a BF16 gain.
+#   * MISSING when planned — NVFP4 and MXFP4 records (`fp4_e2m1` output): no
+#     provider writes FP4 from this norm. No shipped checkpoint plans one at
+#     its shipped precision; a deployment precision that quantises the GEMM
+#     input to FP4 would. (vLLM's NVFP4 norm fusion, FlashInfer's, is
+#     registered for the residual form only, rms_quant_fusion.py:680, :790-796.)
+# sglang ships no kernel for any of these cells (see above); its cells are
+# the same physical cells as vLLM's and are measured by vLLM's launch — the
+# better form the plan prices — where one serves them.
 
 fused_op: fused_rmsnorm_quant
 
