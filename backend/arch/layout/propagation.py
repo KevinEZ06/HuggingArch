@@ -59,8 +59,6 @@ from .layout import (
 )
 from .resolver import families_for, layout_for_symbol, pipeline_family_for
 from .stages import StagePlacement
-from backend.arch.eval.occurrence import Occurrence
-from backend.arch.eval.program import OpStage
 from .transfer_table import (
     CONTRACT,
     CellResult,
@@ -471,14 +469,11 @@ class LayoutPropagation(Rule):
         placement = StagePlacement.of(analysis)
 
         def stage(program: Any, uid: int, iteration: Any) -> int:
-            evaluating, root = program.evaluating_stage(uid)
-            if placement.partitioned(evaluating):
-                return placement.iteration_stage(evaluating, iteration)
-            # A model-level stage runs where its op does — the op the walk
-            # placed, whatever a pass grafted beside it (`OpStage.grafted`).
-            anchor = (evaluating.node if isinstance(evaluating, OpStage)
-                      else root)
-            return placement.stage(Occurrence(anchor.uid, iteration))
+            evaluating, _root = program.evaluating_stage(uid)
+            # Where the walk's stage runs that iteration: whatever a pass
+            # grafted into it (`OpStage.grafted`, a collective in an aux
+            # stack's block) runs there too.
+            return placement.stage_running(evaluating, iteration)
         return stage
 
     def _prepare_node(

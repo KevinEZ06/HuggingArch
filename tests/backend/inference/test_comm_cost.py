@@ -193,17 +193,35 @@ class TestCommCostInPipeline(unittest.TestCase):
         # lm_head all_gather are top-level (count_per_step=1, once per forward),
         # not multiplied through the 32 layers, so they're scoped out of the
         # "scales by layers" assertion below.
-        rows = {r["op"]: r for r in self._rows(tp_attention=8, tp_dense_ffn=8)
+        #
+        # Every TP all_reduce of a llama layer is absorbed by a fused norm
+        # (`allreduce_fused_rmsnorm`): the attention exit's by the layer's own
+        # post-attention norm, the FFN exit's across the seam by the next
+        # layer's input norm (31 launches) and, after the last layer, by the
+        # final norm (1). So the rows are read by the collective they carry
+        # (`comm_op`), not by op name, and the counts are checked to add up to
+        # two all_reduces per layer, each launch costing the same.
+        rows = [r for r in self._rows(tp_attention=8, tp_dense_ffn=8)
                 if r.get("comm_bytes_per_rank", 0) > 0
-                and "vocab_" not in str(r.get("aggregation_id", ""))}
-        # Both the bare FFN-exit all_reduce and the fused attention norm
-        # (which absorbed its all_reduce) carry comm.
-        self.assertIn("all_reduce", rows)
-        self.assertIn("allreduce_fused_rmsnorm", rows)
-        for r in rows.values():
+                and "vocab_" not in str(r.get("aggregation_id", ""))]
+        self.assertTrue(rows)
+        self.assertTrue(all(r["comm_op"] == "all_reduce" for r in rows))
+        # llama has 32 layers and two TP all_reduces in each.
+        self.assertEqual(sum(r["count_per_step"] for r in rows), 2 * 32)
+        # Each of them rides a fused norm, none runs bare.
+        self.assertEqual({r["op"] for r in rows}, {"allreduce_fused_rmsnorm"})
+        # The attention exit's, one per layer in its own layer; the FFN
+        # exit's, split at the seams: 31 into the next layer's input norm
+        # and 1, after the last layer, into the final norm.
+        self.assertEqual(sorted(r["count_per_step"] for r in rows),
+                         [1, 31, 32])
+        per_launch = [r["t_comm_s"] / r["count_per_step"] for r in rows]
+        for r in rows:
             self.assertGreater(r["t_comm_s"], 0)
-            # llama has 32 layers — the per-step comm is multiplied through.
-            self.assertEqual(r["count_per_step"], 32)
+        # Same bytes per launch everywhere: the time is multiplied through
+        # the layers, whichever row (in-layer or seam) carries the launch.
+        for t in per_launch:
+            self.assertAlmostEqual(t / per_launch[0], 1.0, places=9)
 
     def test_no_comm_no_cost_at_tp1(self):
         rows = self._rows(tp_attention=1, tp_dense_ffn=1)

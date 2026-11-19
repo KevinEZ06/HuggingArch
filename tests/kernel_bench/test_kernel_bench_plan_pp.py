@@ -91,6 +91,43 @@ def _rows(resolved, *, pp: int, stage, phase: str = "decode", knobs=None):
     return result
 
 
+def _held_runs(results):
+    """`{aggregation id: max over stages of the runs that stage holds}`,
+    read off what each row's node declares: the iterations it runs at
+    (`Program.occurrence_layers` — a launch across a layer seam runs at
+    every layer but the first of its stack, a node a launch took some runs
+    of at the rest) and the stage each of those runs is placed on
+    (`Rule.stage_of`). Not the rows' own counts: the plan folds those, so
+    reading them back would ask the fold about itself.
+
+    `results` is `{stage: analyze result}` for one deployment, the stage
+    None for the whole model."""
+    from backend.arch.eval.launch import FusedNode
+
+    held = {}
+    for stage, result in results.items():
+        program = result.program
+        stage_of = result.analysis.rule.stage_of(result.analysis)
+        for row in result.per_op_timing:
+            uid = int(row["uid"])
+            node = program.by_uid(uid)
+            # A launch is placed where the origin it runs with is.
+            placed = node.home if isinstance(node, FusedNode) else uid
+            runs = sum(1 for it in program.occurrence_layers(uid)
+                       if stage is None
+                       or stage_of(program, placed, it) == stage)
+            key = row["aggregation_id"]
+            held[key] = max(held.get(key, 0), runs)
+    return held
+
+
+def _stages(resolved, pp, **kwargs):
+    """`{stage: analyze result}` for every stage of `pp` (None at pp=1)."""
+    return ({None: _rows(resolved, pp=1, stage=None, **kwargs)} if pp == 1
+            else {s: _rows(resolved, pp=pp, stage=s, **kwargs)
+                  for s in range(pp)})
+
+
 def _by_key(jobs):
     """Jobs by the measurement key plus the kernel parameters, which is what
     one lake row is (the paged-KV fan-out writes one job per block size)."""
@@ -113,25 +150,45 @@ class TestAStageBillsItsOwnLayers(unittest.TestCase):
     def setUpClass(cls):
         cls.resolved = _resolved()
         cls.at = {pp: _by_key(_jobs(cls.resolved, pp=pp)) for pp in (1, 4, 8)}
+        cls.walked = {pp: _stages(cls.resolved, pp) for pp in (1, 4, 8)}
 
     def test_a_per_layer_kernel_counts_the_heaviest_stage(self):
-        # Every stage holds the same templates here (one dense block), so the
-        # count a job publishes is the heaviest stage's share of the 28.
+        # The count a job publishes is the runs of its launch the busiest
+        # stage holds. For a kernel of every layer that is the stage's share
+        # of the 28; a launch across a layer seam runs at every layer but
+        # the first of its stack, and a pipeline cut is no seam, so its runs
+        # are what each kernel declares (`_held_runs`), not one number for
+        # every per-layer kernel.
         for pp, expected in ((1, SMALL_LAYERS), (4, 7), (8, 4)):
             held = max(len(r) for r in stage_layer_ranges(SMALL_LAYERS, pp))
             self.assertEqual(
                 expected, held,
                 f"pp={pp}: the partition itself changed; the expectation "
                 f"below is written against `stage_layer_ranges`")
+            runs = _held_runs(self.walked[pp])
             per_layer = {key: job for key, job in self.at[pp].items()
                          if job["count_per_step"] > 1}
             self.assertTrue(per_layer, f"pp={pp}: no per-layer job at all")
+            # Most per-layer kernels still run at every layer a stage holds.
+            self.assertTrue(any(job["count_per_step"] == held
+                                for job in per_layer.values()))
+            # A second route, through no node's declaration: the partition
+            # alone. A kernel of every layer runs at each layer the busiest
+            # stage holds, and a launch across a seam at each but the
+            # stage's first (the stack's first layer, or the one a cut
+            # opens bare) — `held` or `held - 1`, nothing else.
+            for key, job in per_layer.items():
+                self.assertIn(
+                    job["count_per_step"], (held, held - 1),
+                    f"pp={pp}: {key[0]} [{key[1]}] bills "
+                    f"{job['count_per_step']}; a per-layer kernel of a "
+                    f"{held}-layer stage runs {held} or {held - 1} times")
             for key, job in per_layer.items():
                 self.assertEqual(
-                    held, job["count_per_step"],
+                    runs[key[1]], job["count_per_step"],
                     f"pp={pp}: {key[0]} [{key[1]}] bills "
                     f"{job['count_per_step']} launches per rank per step, "
-                    f"but the busiest stage holds {held} layers")
+                    f"but its busiest stage runs it {runs[key[1]]} times")
 
     def test_the_split_adds_the_hop_and_moves_nothing_else(self):
         # Splitting the layers across ranks does not change what any kernel
@@ -139,16 +196,35 @@ class TestAStageBillsItsOwnLayers(unittest.TestCase):
         # ONE job can stand for every stage — a measurement key names no
         # stage. The one thing a pipeline ADDS is its own hop, which has no
         # pp=1 counterpart because there is no cut to send across.
+        #
+        # And the runs a cut leaves to a layer's own nodes. A pipeline cut
+        # is a hop, not a layer seam (`fusion.Seams`): the residual add of
+        # the last layer before it runs where it was made and the norm after
+        # it opens its stage bare, so the add a launch across the seam takes
+        # whole at pp=1 keeps a run of its own at the cut. Such a measurement
+        # is no new kernel: its node is one a launch took some runs of
+        # (`Rewrite.partly`). Anything else the split adds is the defect this
+        # test exists for.
         base = self.at[1]
         for pp in (4, 8):
             added = {key: self.at[pp][key] for key in set(self.at[pp]) - set(base)}
+            left_at_a_cut = {
+                row["aggregation_id"]
+                for result in self.walked[pp].values()
+                for row in result.per_op_timing
+                if result.rewrite.partly(int(row["uid"]))}
             self.assertEqual(
-                [], sorted(key[0] for key in added if key[0] != "send_recv"),
-                f"pp={pp}: the split added a measurement that is not a hop")
+                [], sorted(key[0] for key in added
+                           if key[0] != "send_recv"
+                           and key[1] not in left_at_a_cut),
+                f"pp={pp}: the split added a measurement that is neither a "
+                f"hop nor a run a cut left to a layer's own node")
             self.assertEqual(
                 [], sorted(set(base) - set(self.at[pp])),
                 f"pp={pp}: the split dropped a measurement")
             for key, job in added.items():
+                if key[0] != "send_recv":
+                    continue
                 # One hop per rank per step, whatever the stage count: a
                 # rank sends once across its own exit cut. Its world is the
                 # pipeline group the cut spans.
@@ -197,10 +273,34 @@ class TestTheStagesAccountForTheWholeModel(unittest.TestCase):
             out[key] = int(row["count_per_step"])
         return out
 
+    def _member_runs(self, pp, stage):
+        """How many times each pre-fusion node runs on `stage`, over every
+        row that runs it: its own row, and each launch that took runs of it
+        (`fusion_matches`, one run of each member per run of the launch)."""
+        result = _rows(self.resolved, pp=pp, stage=stage)
+        members = {match["fused_aggregation_id"]:
+                   match["matched_aggregation_ids"]
+                   for match in result.fusion_matches}
+        out = {}
+        for row in result.per_op_timing:
+            count = int(row["count_per_step"])
+            for member in members.get(row["aggregation_id"],
+                                      (row["aggregation_id"],)):
+                out[member] = out.get(member, 0) + count
+        return out
+
     def test_every_rows_counts_sum_over_the_stages(self):
-        whole = self._counts(1, None)
+        # What a split conserves is how often each of the model's kernels'
+        # work runs, not how the rows group it: a pipeline cut is no layer
+        # seam (`fusion.Seams`), so the add before a cut and the norm after
+        # it run as rows of their own at pp>1 where pp=1 runs them inside a
+        # launch across the seam. Counted per pre-fusion node, over every
+        # row that runs it, Σ over the stages is the whole model — a run
+        # lost, or counted on two stages, is the defect this test exists
+        # for.
+        whole = self._member_runs(1, None)
         for pp in (2, 4, 8):
-            per_stage = [self._counts(pp, s) for s in range(pp)]
+            per_stage = [self._member_runs(pp, s) for s in range(pp)]
             for path, total in whole.items():
                 summed = sum(stage.get(path, 0) for stage in per_stage)
                 self.assertEqual(
@@ -300,12 +400,48 @@ class TestTwoTemplatesAreTwoAccounts(unittest.TestCase):
         for job in jobs:
             counts.setdefault(job["count_per_step"], []).append(job)
         # The MoE template (58 layers, busiest stage 16) and the dense one
-        # (3 layers, all on stage 0). Nothing bills 58 or 61.
-        self.assertEqual({1, 3, 16}, set(counts),
-                         "a job bills a layer count no rank runs")
+        # (3 layers, all on stage 0): kernels of every layer bill those.
+        # Nothing bills 58 or 61 — the assignment is not flattened.
         for count in (3, 16):
             self.assertTrue(counts[count],
                             f"no job bills {count} launches per step")
+        self.assertFalse({58, 61} & set(counts),
+                         "a job bills a whole template's or the model's layers")
+        # A second route, through no node's declaration: the checkpoint's
+        # config (which layers are dense) and the partition alone. A job
+        # runs once per step (a model-level op, the dense → MoE junction),
+        # or at each layer of one template its busiest stage holds, or — a
+        # launch across a seam — at each but that stage's first.
+        from tests.snapshots import snapshot_config
+        config = snapshot_config("deepseek-ai/DeepSeek-V3")
+        n_layers = config["num_hidden_layers"]
+        dense = range(config["first_k_dense_replace"])
+        templates = (set(dense), set(range(len(dense), n_layers)))
+        allowed = {1}
+        for layers in templates:
+            busiest = max(len(layers & set(r))
+                          for r in stage_layer_ranges(n_layers, 4))
+            allowed |= {busiest, busiest - 1}
+        self.assertEqual({1, 2, 3, 15, 16}, allowed)
+        for job in jobs:
+            self.assertIn(
+                job["count_per_step"], allowed,
+                f"{job['signature']} [{job['node_spec_id']}] bills "
+                f"{job['count_per_step']} launches per rank per step")
+        # A launch across a layer seam runs at every layer of its template
+        # but the first (the dense → MoE junction runs once, at layer 3),
+        # and a pipeline cut is no seam, so every job bills the runs its
+        # kernel declares on its busiest stage (`_held_runs`).
+        runs = _held_runs(_stages(resolved, 4, knobs={
+            "tp_attention": 8, "ep_moe": 8}))
+        for job in jobs:
+            if job["signature"] == "send_recv":
+                continue    # the pipeline's hop: once per step, per cut
+            self.assertEqual(
+                runs[job["node_spec_id"]], job["count_per_step"],
+                f"{job['signature']} [{job['node_spec_id']}] bills "
+                f"{job['count_per_step']} launches per rank per step, but "
+                f"its busiest stage runs it {runs[job['node_spec_id']]} times")
 
 
 class TestCollectivesFoldLikeAnythingElse(unittest.TestCase):
@@ -408,10 +544,20 @@ class TestWithoutAPipelineNothingChanges(unittest.TestCase):
     It therefore also moves for a legitimate reason: a change to what the
     plan exports a numerator FROM, or to this model's spec, re-pins it.
     Re-pin with `python <this file> --repin` and say in the commit what moved
-    and why. It was last re-pinned when every job began to state its leaf's
-    variant facts beside its key: all 13 jobs gained `variant: {}`, and no
-    other field, shape, numerator, dtype environment or dropped entry moved.
-    Before that, no dtype slot borrowed a
+    and why. It was last re-pinned when a fusion began to match across the
+    seam between two layers (`fusion.Seams`): the closing `add` job and the
+    final `norm` job left (every layer's add now runs inside the launch into
+    the next layer's input norm, the last one inside the launch into the
+    final norm), `input_layernorm` bills 1 launch (layer 0, which reads the
+    embedding) instead of 28, and two `fused_add_rmsnorm` jobs arrived —
+    `input_layernorm__seam` at 27 and `norm__seam@block` at 1 — with the
+    per-launch numerators of the in-layer `fused_add_rmsnorm`. Before that,
+    the fusion plans began to be tried in one structural order, which swapped
+    the order of the `silu_and_mul` and `post_attention_layernorm` jobs and
+    moved nothing in either. Before that, every job began to state its
+    leaf's variant facts beside its key: all 13 jobs gained `variant: {}`,
+    and no other field, shape, numerator, dtype environment or dropped entry
+    moved. Before that, no dtype slot borrowed a
     model-level value any more: a job that streams no weight omits `weight`
     (it was the activation's), one that touches no cache omits `kv` (it was
     the step's widest cache), which moved `dtype_env` and `physical_key` on

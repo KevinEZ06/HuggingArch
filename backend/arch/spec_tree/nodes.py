@@ -813,6 +813,10 @@ class SpecIRNode:
     # it, as the pass that grafted it declares (`OpStage.grafted`). None
     # for every node the spec declared.
     runs_with_op: Optional[int] = None
+    # The iterations of its stage a node grafted after the walk runs at,
+    # where its pass declares fewer than all (a pipeline hop: the one its
+    # cut separates). None: every iteration of the stage that evaluates it.
+    runs_at: Optional[Tuple[Optional[int], ...]] = None
 
     @property
     def resolved_inputs(self) -> Tuple[Tuple[str, str], ...]:

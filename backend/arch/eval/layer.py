@@ -186,12 +186,15 @@ class Rewrite:
         """The iterations of block invocation `block` grouped by what runs
         there: two iterations are one class when every node of the block a
         launch took a run of is run by the same launch at both (or by none
-        at both). A template's layers can differ in this — DeepSeek-V3's
-        first MoE layer opens with the dense → MoE seam, the others with
-        the MoE → MoE one, and the last closes into the final norm — and a
+        at both), and every node of the block runs at both or at neither.
+        A template's layers can differ in this — DeepSeek-V3's first MoE
+        layer opens with the dense → MoE seam, the others with the MoE →
+        MoE one, and the last closes into the final norm; a pipeline hop
+        runs at its cut's layer alone (`Program.occurrence_layers`) — and a
         consumer that simulates or prices one layer does so once per class
-        (`activation_peak`, `traffic.derive`). Read off `taken` alone; one
-        class, the whole block, where no launch took a run of it."""
+        (`activation_peak`, `traffic.derive`). One class, the whole block,
+        where every node runs at every layer and no launch took a run of
+        it."""
         # Kept beside the program it answers for: an entry holds its
         # program, so a later program at a reused address is no hit.
         cache = self.__dict__.setdefault("_classes_cache", {})
@@ -205,11 +208,16 @@ class Rewrite:
             members = sorted({old for olds in self.taken.values()
                               for old in olds
                               if program.block_of(old) == block})
+            whole = frozenset(iterations)
+            runs = [its for its in (
+                frozenset(program.occurrence_layers(node.uid))
+                for node in program.blocks[block].nodes()
+                if not node.children) if its != whole]
             groups: Dict[Tuple[Any, ...], list] = {}
             for it in iterations:
-                groups.setdefault(tuple(
-                    self.launch_at(member, it) for member in members),
-                    []).append(it)
+                groups.setdefault((
+                    tuple(self.launch_at(member, it) for member in members),
+                    tuple(it in its for its in runs)), []).append(it)
             cache[key] = tuple(frozenset(its) for its in groups.values())
         return cache[key]
 

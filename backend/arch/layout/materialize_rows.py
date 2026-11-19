@@ -373,7 +373,6 @@ def send_row(mat: Any, record: Redistribute, world: str) -> PhysicalCollective:
         op="send_recv",
         group_size=family.group_size,
         count_uid=record.producer,
-        count=1,
         world=world,
         flow_in_shape=flow,
         collective_in_shape=flow,
@@ -383,6 +382,9 @@ def send_row(mat: Any, record: Redistribute, world: str) -> PhysicalCollective:
         payload_dtype_bytes=width,
         family=family,
         meta=crossing_meta(mat, record),
+        # A cut is crossed by one occurrence's value: the hop runs there,
+        # once (its count is its iterations').
+        iterations=(record.crossing.source_iteration,),
     )
 
 def endpoint_rows(mat: Any, record: Redistribute, *, anchor_uid: int, meta: Tuple[Tuple[str, Any], ...] = ()

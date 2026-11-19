@@ -32,7 +32,7 @@ from backend.arch.eval.dim import minimum, ratio
 from backend.arch.eval.layer import Layer
 from backend.arch.eval.occurrence import (Occurrence, OccurrenceGraph,
                                           StageCrossing)
-from backend.arch.eval.program import BlockStage, Program, Stage
+from backend.arch.eval.program import BlockStage, OpStage, Program, Stage
 from backend.arch.eval.transition import Redistribute, RedistributeSite
 from backend.arch.ops import is_identity_source
 
@@ -243,6 +243,22 @@ class StagePlacement:
     def stage(self, occurrence: Occurrence) -> int:
         """The stage an occurrence runs on."""
         return self._stages[self.unit(occurrence)]
+
+    def stage_running(self, stage: Stage, iteration: Optional[int]) -> int:
+        """The pipeline stage the walk's `stage` runs `iteration` on — the
+        unit it places, read off the stage itself: an iteration of a
+        partitioned block, a whole aux stack, or a model-level op's root.
+        Any node of a graph built over the walk that the stage evaluates
+        (a collective or cast a pass grafted into it) runs there too."""
+        if self.partitioned(stage):
+            return self.iteration_stage(stage, iteration)
+        if stage.stack in self._aux:
+            return self._stages[("stack", stage.stack)]
+        if not isinstance(stage, OpStage):
+            raise ValueError(
+                f"stage {stage.name!r} is no partitioned block, aux stack or "
+                f"model-level op; no unit places it")
+        return self._stages[("root", stage.node.uid)]
 
     # -- crossings -----------------------------------------------------------
 

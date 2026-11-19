@@ -343,3 +343,124 @@ def test_a_seam_moves_no_weight_read() -> None:
     assert any(fused.rewrite.partly(node.uid)
                for node in naive.program.nodes())
     assert weight_reads(naive) == weight_reads(fused)
+
+
+def _no_seam_launch_takes_a_run_its_own_layer_reads(
+        model: str, parallel: dict) -> None:
+    """A launch across a seam runs in the reading layer, after the layer its
+    previous-layer members belong to, so no other node of that layer may
+    read the run it took: that reader would read a tensor not yet written,
+    and the activation liveness of its layer would name a tensor no node of
+    the layer writes."""
+    from backend.arch.eval.cache import Edges
+    from backend.inference.activation_peak import activation_peak_at
+    from backend.inference.serving import rewrite_serving_graph
+    from backend.inference.step_eval import evaluate_step
+
+    step = evaluate_step(
+        resolve_snapshot(model), ParallelConfig.from_dict(parallel)
+        if parallel else ParallelConfig(), phase="prefill", batch=1,
+        input_tokens=512, output_tokens=8)
+    binding = get_binding("vllm").deployed(ServingDeployment.at(
+        gpu_sku="H100-SXM", activation_dtype="bf16"))
+    served = rewrite_serving_graph(step.analysis, framework_binding=binding)
+    program, rewrite = served.program, served.rewrite
+    taken = {}
+    for launch in program.nodes():
+        if isinstance(launch, FusedNode) and launch.previous_iteration:
+            for member in launch.previous_iteration:
+                for at in rewrite.taken[launch.uid][member].values():
+                    taken[(member, at)] = launch
+    assert taken, "no launch across a seam to check"
+    edges = Edges(step.analysis, program, rewrite)
+    for reader in program.walked_nodes():
+        if reader.children:
+            continue
+        for index in range(len(reader.inputs_obj or ())):
+            for run in edges.runs(reader, index):
+                launch = taken.get((run.written.uid, run.written.iteration))
+                if launch is None or run.at != run.written.iteration:
+                    continue    # not a taken run, or read across the seam
+                assert reader.uid == launch.uid, (
+                    reader.display_path, run.written, launch.display_path)
+    # And the liveness of every layer closes.
+    activation_peak_at(step, framework_binding=binding)
+
+
+def test_a_walked_reader_in_its_own_layer_keeps_its_run() -> None:
+    """Step-3.7's MTP layer: its shared-head norm reads the layer's closing
+    add inside the layer, a reference the walk bound (`Seams.of`, walked
+    readers)."""
+    _no_seam_launch_takes_a_run_its_own_layer_reads(
+        "stepfun-ai/Step-3.7-Flash", {})
+
+
+def test_a_grafted_reader_in_its_own_layer_keeps_its_run() -> None:
+    """Kimi-K3 at TP 8: in its first (dense) layer an all-reduce a pass
+    grafted on the MLP residual reads it inside the layer, a reader the walk
+    never bound (`Seams.of`, grafted readers at the runs they declare)."""
+    _no_seam_launch_takes_a_run_its_own_layer_reads(
+        "moonshotai/Kimi-K3", {"tp_attention": 8, "tp_dense_ffn": 8,
+                               "tp_moe_expert": 8})
+
+
+def test_a_reader_in_some_layers_keeps_only_their_seams(monkeypatch) -> None:
+    """A reader inside some layers only — EAGLE-3's auxiliary taps read the
+    hidden state of layers 2, L/2 and L-3 — keeps the closing add of those
+    layers out of the seam launch, and only of those: every other seam
+    fuses, and the layers that differ fall into iteration classes of their
+    own. The tap is added to the walk's in-layer reads (`Seams.in_layer`)
+    on Llama-3.2-3B; the layers expected are counted from the checkpoint's
+    `config.json`, not from the walk."""
+    import dataclasses
+
+    from backend.arch.eval import fusion
+    from backend.inference.serving import rewrite_serving_graph
+    from backend.inference.step_eval import evaluate_step
+
+    model = "meta-llama/Llama-3.2-3B"
+    n_layers = _config(model)["num_hidden_layers"]
+    taps = {2, n_layers // 2, n_layers - 3}
+    binding = get_binding("vllm").deployed(ServingDeployment.at(
+        gpu_sku="H100-SXM", activation_dtype="bf16"))
+
+    def served():
+        step = evaluate_step(resolve_snapshot(model), ParallelConfig(),
+                             phase="decode", batch=2, input_tokens=64,
+                             output_tokens=8)
+        out = rewrite_serving_graph(step.analysis, framework_binding=binding)
+        (launch,) = [node for node in out.program.nodes()
+                     if isinstance(node, FusedNode)
+                     and node.previous_iteration
+                     and out.program.block_of(node.uid) is not None]
+        return out, launch
+
+    plain, launch = served()
+    (add,) = launch.previous_iteration
+    assert set(plain.program.occurrence_layers(launch.uid)) == set(
+        range(1, n_layers))
+    # The tap: a node of the layer that is no member of the launch.
+    members = set(plain.rewrite.origins[launch.uid])
+    block = plain.program.block_of(add)
+    tap = min(node.uid for node in plain.program.blocks[block].nodes()
+              if not node.children and node.uid not in members)
+
+    real = fusion.Seams.of.__func__
+
+    def tapped(cls, *args, **kwargs):
+        seams = real(cls, *args, **kwargs)
+        return dataclasses.replace(seams, in_layer={
+            **seams.in_layer,
+            **{(add, it): seams.read_in_layer(add, it) | {tap}
+               for it in taps}})
+
+    monkeypatch.setattr(fusion.Seams, "of", classmethod(tapped))
+    served_tapped, launch = served()
+    program, rewrite = served_tapped.program, served_tapped.rewrite
+    # Every seam but the ones after a tapped layer is one launch.
+    assert set(program.occurrence_layers(launch.uid)) == (
+        set(range(1, n_layers)) - {it + 1 for it in taps})
+    # The tapped layers' adds run on their own there, and nowhere else.
+    assert set(rewrite.taken[launch.uid][add].values()) == (
+        set(range(n_layers - 1)) - taps)
+    assert rewrite.partly(add)

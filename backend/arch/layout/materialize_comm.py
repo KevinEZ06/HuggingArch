@@ -186,8 +186,17 @@ class PhysicalCollective:
     dedup_key: Optional[Tuple[Any, ...]] = field(
         default=None, compare=False, repr=False
     )
+    #: The iterations of the node it stands at that it runs at, where it
+    #: runs at fewer than all of them: a pipeline hop sends the value of
+    #: one occurrence, the one its cut separates (`StageCrossing`). None:
+    #: every iteration, as every collective that moves a layer's tensor.
+    iterations: Optional[Tuple[Optional[int], ...]] = None
 
     def __post_init__(self) -> None:
+        if self.iterations is not None and self.count != len(self.iterations):
+            raise ValueError(
+                f"event {self.event_id} runs at {self.iterations!r} but "
+                f"counts {self.count}; it runs once at each")
         # Only an exchange has distinct destinations to dedup onto: a
         # reduction visits every member whatever the routing. One gate, so
         # a fan-out cannot reach a collective that is not a dispatch.
@@ -371,6 +380,9 @@ class _CommGraft:
             children=[],
             provenance="comm",
         )
+        # The runs it declares (`PhysicalCollective.iterations`): a hop
+        # runs at the occurrence its cut separates, not at every layer.
+        comm_node.runs_at = event.iterations
         self._insert(event, comm_node, placement, structural_anchor)
         self._apply_rewrites(
             event, comm_node, semantic_source,

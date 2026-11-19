@@ -311,8 +311,18 @@ class _Runs:
             *(self.has(uid) for uid in members if uid not in previous))
         writing = frozenset.intersection(
             *(self.has(uid) for uid in members if uid in previous))
+        # A launch across a seam runs in the reading layer, after the layer
+        # its previous-layer members belong to: a reader in that layer would
+        # read a tensor not yet written (the MTP layer's closing add, read by
+        # its own shared-head norm before the stack's exit). So a pair whose
+        # writing run its own layer reads, outside the launch, stays; the
+        # others are taken, and the layers that differ in this fall into
+        # iteration classes of their own (`Rewrite.iteration_classes`).
+        inside = frozenset(members)
         pairs = [(it, source) for it, source in match.pairs
-                 if it in reading and source.iteration in writing]
+                 if it in reading and source.iteration in writing
+                 and not any(seams.read_in_layer(uid, source.iteration)
+                             - inside for uid in previous)]
         if not pairs:
             return None
         home = min(uid for uid, _index in match.crossed)
@@ -850,6 +860,15 @@ class Seams:
     #: The walked node whose iterations a reader's runs are: the reader
     #: itself, or the reader a grafted cast reads for.
     readers: Mapping[Tuple[int, int], int] = field(default_factory=dict)
+    #: `(writing leaf, iteration) -> the nodes reading that run inside its
+    #: own iteration`, as the walk bound them (`Reference.local`).
+    in_layer: Mapping[Tuple[int, Any], FrozenSet[int]] = field(
+        default_factory=dict)
+
+    def read_in_layer(self, uid: int, iteration: Any) -> FrozenSet[int]:
+        """The nodes that read run `iteration` of `uid` inside its own
+        iteration."""
+        return self.in_layer.get((uid, iteration), frozenset())
 
     @classmethod
     def of(cls, program: Any, analysis: Any, nodes: Sequence[Any],
@@ -858,7 +877,7 @@ class Seams:
         # test's bare program) has no iteration to cross into.
         table = None if analysis is None else analysis.reference_table
         if table is None:
-            return cls({}, {})
+            return cls({}, {}, {})
         # Which pipeline stage each occurrence runs on is the walk's
         # placement (`Rule.stage_of`): a seam a cut separates is a hop, so
         # no caller can make one by forgetting to say where the cut is.
@@ -910,7 +929,39 @@ class Seams:
                     out[(node.uid, index)] = tuple(
                         SeamEdge(uid, port, frozenset(pairs))
                         for (uid, port), pairs in sorted(found.items()))
-        return cls(out, readers)
+        # Which runs a node's own layer reads, as the walk bound them: a
+        # local reference is a read of the same iteration.
+        in_layer: Dict[Tuple[int, Any], set] = {}
+        for node in nodes:
+            if not table.covers(node.uid):
+                # A node a pass grafted reads what its edge names in its own
+                # iteration (it stands in its producer's scope), at the runs
+                # it declares (`Program.occurrence_layers`: a pipeline hop
+                # only at its cut).
+                for ref in node.inputs_obj or ():
+                    if ref.src is None:
+                        continue
+                    leaf = (program.output_leaf(ref.src, ref.port or "out")[0]
+                            if ref.src.children else ref.src)
+                    for it in program.occurrence_layers(node.uid):
+                        in_layer.setdefault((leaf.uid, it), set()).add(
+                            node.uid)
+                continue
+            for index in range(table.arity[node.uid]):
+                reference = table.at(node.uid, index)
+                if not reference.local:
+                    continue
+                for it in program.occurrence_layers(node.uid):
+                    for source in reference.at(it):
+                        written = source.occurrence.uid
+                        writer = program.by_uid(written)
+                        if writer is not None and writer.children:
+                            written = program.output_leaf(
+                                writer, source.port or "out")[0].uid
+                        in_layer.setdefault((written, it), set()).add(
+                            node.uid)
+        return cls(out, readers, {key: frozenset(found)
+                                  for key, found in in_layer.items()})
 
     def consumers(self) -> Dict[int, List[Tuple[int, str]]]:
         """`_consumers`' entries for the reads across a seam: a writer of
@@ -1565,7 +1616,7 @@ class Fusion:
         # The seams a binding may cross: a formal a layer reads, written by
         # the iteration before it (`Seams`). A parallel form groups siblings
         # of one iteration and crosses none.
-        seams = (Seams({}, {}) if is_parallel
+        seams = (Seams({}, {}, {}) if is_parallel
                  else Seams.of(program, analysis, nodes, graft))
         matches = ([_Binding(bound=bound) for bound in _parallel_matches(
                        pattern.parallel, nodes, scopes, program, edges)]

@@ -436,24 +436,21 @@ class ActivationLiveness:
                     if key[1] == name}) > 1
         }
         # A block whose layers run different launches is simulated once per
-        # iteration class (`Rewrite.iteration_classes`), each a group.
-        classes_of = {}
-        for block_index, _name, _iterations in records_by_template:
-            classes_of[block_index] = classes_of.get(block_index, 0) + 1
+        # iteration class (`Rewrite.iteration_classes`), each a group of its
+        # own, and `at` publishes the worst class under the block's name.
         #: `(label, records, external bytes)` per block invocation, every
         #: byte count a number or its law.
         self._blocks: List[Tuple[str, List[dict], Dict[str, object]]] = []
         for key, records in records_by_template.items():
-            block_index, template, iterations = key
+            block_index, template, _iterations = key
             label = (
                 f"{template} (model-level ops)" if block_index == -1
                 else f"{template}#block={block_index}"
                 if template in duplicate_names else template
             )
-            if classes_of[block_index] > 1:
-                label = (f"{label} [layers {iterations[0]}-{iterations[-1]}]"
-                         if len(iterations) > 1
-                         else f"{label} [layer {iterations[0]}]")
+            # A block simulated once per iteration class publishes its worst
+            # class under the block's own name (`at`): the classes are how
+            # the liveness is computed, not a new kind of block.
             self._blocks.append((
                 label,
                 [{**record,
@@ -526,7 +523,7 @@ class ActivationLiveness:
         for label, records, external in self._blocks:
             external_bytes = {sid: value(nbytes)
                               for sid, nbytes in external.items()}
-            by_block[label] = _peak_for_leaves(
+            peak = _peak_for_leaves(
                 [{**record,
                   "out_bytes": value(record["out_bytes"]),
                   "outputs": {tensor: value(nbytes) for tensor, nbytes
@@ -534,7 +531,11 @@ class ActivationLiveness:
                  for record in records],
                 external_bytes,
             )
-            external_by_block[label] = external_bytes
+            # One entry per block: its worst iteration class.
+            if (label not in by_block
+                    or peak["peak_bytes"] > by_block[label]["peak_bytes"]):
+                by_block[label] = peak
+                external_by_block[label] = external_bytes
         if not by_block:
             return {"peak_activation_bytes_per_rank": 0, "peak_by_block": {},
                     "batch": batch, "seq_len": seq_len,

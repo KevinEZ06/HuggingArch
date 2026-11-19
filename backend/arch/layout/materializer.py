@@ -428,6 +428,7 @@ class _Session:
         dedup_key: Optional[Tuple[Any, ...]] = None,
         site: Optional[RedistributeSite] = None,
         family: Any = None,
+        iterations: Optional[Tuple[Optional[int], ...]] = None,
     ) -> PhysicalCollective:
         record_site, default_source, default_rewrites, default_placement_uid, \
             default_placement = self._record_topology(record)
@@ -440,6 +441,16 @@ class _Session:
             raise ValueError(
                 f"world {world!r} resolves degree {size}, not event group "
                 f"size {group_size}")
+        if iterations is not None:
+            # An event that runs at some iterations only runs once at each:
+            # its count is theirs, one declaration (`PhysicalCollective.
+            # iterations`), not a second the caller keeps in step.
+            if count is not None:
+                raise ValueError(
+                    f"event {event_id} declares its iterations "
+                    f"{iterations!r} and a count {count}; the count is "
+                    f"the iterations'")
+            count = len(iterations)
         if count is None:
             count = self._count(count_uid)
         dtype_bytes = (
@@ -531,6 +542,7 @@ class _Session:
             route_fanout=route_fanout,
             meta=meta,
             dedup_key=dedup_key,
+            iterations=iterations,
         )
         self._emitted[event_id] = event
         return event

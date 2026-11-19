@@ -2807,8 +2807,12 @@ class Program:
         node — the walk already knows which layers a template covers
         (`BlockTemplate.layer_indices`), and a sideband layer that needs the
         layer a weight sits at (`eval.formats`) reads it here rather than
-        carrying a layer of its own."""
+        carrying a layer of its own. A node a pass grafted that declares
+        fewer runs (`SpecIRNode.runs_at`, a pipeline hop) runs at those."""
         position, _parent, _root = self._frame(uid)
+        declared = self.by_uid(uid).runs_at
+        if declared is not None:
+            return tuple(declared)
         return self.stage_iterations(self._walk_sequence[position])
 
     def stack_depth(self, stack: Optional[str]) -> Optional[int]:
