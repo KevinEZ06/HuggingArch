@@ -55,7 +55,10 @@ from .pipeline import NoPeakForDtype
 from backend.arch.eval.analysis import Point
 from backend.measure.pool import map_cells
 from .card import Card
-from .frontier import POINT_DIMS, PointDim, frontier_view, line_view
+from .frontier import (POINT_DIMS, PointDim, frontier_view, line_view)
+# Callers that learned the label from this module keep it; it lives with
+# the point-cloud vocabulary it names a coordinate of.
+from .frontier import layout_label as layout_label
 from .point_cloud import parallel_cloud, point_coordinates
 from .gpu_specs import get_gpu, gpus_per_node, hbm_bytes, load_gpu_specs
 from .prefill_geometry import PrefillEndpointGeometry, PrefillChunkSchedule
@@ -311,16 +314,6 @@ def class_frontier_layouts(caps: SweepCaps, cards: Sequence[str]
     return out
 
 
-def layout_label(cfg: ParallelConfig) -> str:
-    """How a chart names a deployment: the degrees above one, short enough
-    to sit beside a point (`TP8`, `TP8·EP64·DP8`, `EP32·DP32`; one GPU is
-    `TP1`). The GPU count is said beside it."""
-    parts = [f"{name}{n}" for name, n in (
-        ("TP", cfg.tp_attention), ("CP", cfg.cp),
-        ("EP", cfg.ep_moe), ("DP", cfg.dp_attention)) if n > 1]
-    return "·".join(parts) or "TP1"
-
-
 def layout_verdict(resolved: Any, parallel: ParallelConfig) -> List[str]:
     """Whether the model deploys under `parallel`: the layout walk every
     estimate starts from (`capacity._capacity_walk`) either refuses —
@@ -370,7 +363,8 @@ CloudDim = PointDim
 def cloud_view(cloud: Sequence[dict], *, phase: str = "decode",
                form: str = "frontier", x: Optional[str] = None,
                fix: Mapping[str, Sequence[Any]],
-               group_by: Sequence[str]) -> dict:
+               group_by: Sequence[str],
+               envelope_by: Optional[Sequence[str]] = None) -> dict:
     """A view of the sweep's `throughput_cloud`: one `phase` of it as a
     Pareto frontier (`frontier.frontier_view`, `form="frontier"`) or as
     lines along `x` (`frontier.line_view`, `form="line"`) — the same holds,
@@ -379,12 +373,14 @@ def cloud_view(cloud: Sequence[dict], *, phase: str = "decode",
     which form is the request's to validate
     (`api._models.ParallelFrontierRequest`); a line view refuses an axis it
     does not know, and every view publishes which (phase, form) pairs this
-    cloud can answer (`frontier.view_forms`)."""
+    cloud can answer (`frontier.view_forms`). A frontier view may also
+    publish the envelope over coarser groups of the same lines
+    (`envelope_by`, `frontier.frontier_view`); a line along an X has none."""
     if form == "line":
         return line_view(cloud, dims=POINT_DIMS, x=x, fix=fix,
                          group_by=group_by, phase=phase)
     return frontier_view(cloud, dims=POINT_DIMS, fix=fix, group_by=group_by,
-                         phase=phase)
+                         phase=phase, envelope_by=envelope_by)
 
 
 def _point(x: int, parallel: ParallelConfig, result: Optional[dict],
@@ -779,11 +775,11 @@ class ParallelSweepPlan:
     def measurement(self) -> Dict[str, Any]:
         return dict(self.measured_under)
 
-    def coordinates(self, mode: str, num_gpus: int, gpu_sku: str, *,
+    def coordinates(self, parallel: ParallelConfig, gpu_sku: str, *,
                     context: int, batch_key: Any) -> Dict[str, Any]:
         """One grid point's every coordinate (`frontier.POINT_DIMS`)."""
         return point_coordinates(
-            mode=mode, num_gpus=num_gpus, gpu_sku=gpu_sku,
+            parallel=parallel, gpu_sku=gpu_sku,
             context=int(context), batch_key=batch_key,
             draft_tokens=self.draft_tokens, acceptance=self.acceptance,
             ep_load_factor=self.ep_load_factor)
@@ -898,7 +894,7 @@ class ParallelSweepPlan:
         # context and every batch of its ladder (`_decode_ladder`), each
         # point carrying its deployment's prefill too; every throughput
         # chart of the panel is a view of it (`cloud_view`).
-        cloud = parallel_cloud(self, results, layout_label).points
+        cloud = parallel_cloud(self, results).points
         buckets: Dict[str, Dict[str, List[dict]]] = {
             m: {g: [] for g in self.gpu_skus}
             for m in self.wanted if m not in self.skip_ep

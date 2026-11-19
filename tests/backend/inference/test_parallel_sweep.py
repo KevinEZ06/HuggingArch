@@ -491,7 +491,8 @@ class TestThroughputCloud(unittest.TestCase):
 
     def test_a_view_holds_its_dimensions_and_fronts_each_group(self):
         def pt(gpu, mode, n, c, user, per_gpu):
-            return {"mode": mode, "num_gpus": n, "gpu_sku": gpu,
+            return {"mode": mode, "num_gpus": n, "layout": f"{mode}{n}",
+                    "gpu_sku": gpu,
                     "context": 1024, "batch_key": f"b{c}",
                     "draft_tokens": 0, "acceptance": 1.0,
                     "ep_load_factor": 1.0, "concurrent_requests": c,
@@ -519,7 +520,7 @@ class TestThroughputCloud(unittest.TestCase):
                           for s in both["series"]},
                          {("B300", 8), ("B300", 16), ("H200", 8)})
         with self.assertRaises(ValueError):
-            cloud_view(cloud, fix={"layout": ["x"]}, group_by=[])
+            cloud_view(cloud, fix={"parallel": ["x"]}, group_by=[])
 
     def test_a_frontier_point_is_the_sweep_pinned_at_its_batch(self):
         # A second route: the same layout swept with its batch pinned (an

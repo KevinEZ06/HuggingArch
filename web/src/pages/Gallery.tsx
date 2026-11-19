@@ -617,7 +617,7 @@ export function Gallery() {
         ?? (front != null && !frontStale ? "no model serves this context on this GPU" : undefined)}
       stale={frontStale ? <span>Showing {front?.gpuSku} — {frontFailed ?? (frontState.phase === "loading" ? frontWaitingText : null)}</span> : undefined}
       title={`Decode Pareto frontier — ${fmtSeqLabel(Number(decCtx))} context · ${front?.gpuSku ?? gpuSku}`}
-      subtitle={`Each point is the best layout${maxGpus ? ` of up to ${maxGpus} GPUs` : ""} (TP / EP / DP / CP) at one batch per GPU, named where it changes (hover a curve for every point); up and to the right is better.${frontDraft
+      subtitle={`Each point is the best layout${maxGpus ? ` of up to ${maxGpus} GPUs` : ""} (TP / EP / DP / CP) at one batch per GPU, named where it changes (hover a curve for every point, click one to highlight it); up and to the right is better.${frontDraft
         ? ` Speculative decoding with the model's MTP draft, K = ${frontDraft.k} at acceptance α = ${frontDraft.alpha}: each step counts the K draft forwards and the verify over K + 1 positions, and keeps 1 + α·K tokens per request.`
         : ""} Solid is SOL; dashed is measured where Kernel Bench covers the step.${partialOn
           ? " Dotted is partial measured: measured ops at their measured time, the rest at SOL — hover a point for the share of its time that is measured." : ""}`}

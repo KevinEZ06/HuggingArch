@@ -932,7 +932,8 @@ async def parallel_frontier_response(req: ParallelFrontierRequest) -> dict:
     keys nothing and computes no point."""
     sweep = await _sweep_within_deadline(_PARALLEL, req.sweep, False)
     return cloud_view(sweep[_PARALLEL.cloud], phase=req.phase, form=req.form,
-                      x=req.x, fix=req.fix, group_by=req.group_by)
+                      x=req.x, fix=req.fix, group_by=req.group_by,
+                      envelope_by=req.envelope_by)
 
 
 #: The Compare page's views of its rows' cloud, each a grouping at every

@@ -1,5 +1,5 @@
 import type { EChartsOption, EChartsType } from "echarts";
-import { useEffect, useMemo, useRef, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { binaryUnit, escapeHtml, fmtCompact, formatGiB } from "../format";
 import { AXIS, HaChart, interactiveBits } from "../charts/HaChart";
 import { formulaHTML, type FormulaFields } from "../tooltip";
@@ -471,7 +471,10 @@ function at(p: FrontierPt, field: string): number | null {
 }
 
 export type FrontierSeries<P extends FrontierPt = FrontierPt> = {
+  /** The series' id on the chart: unique, and stable across updates. */
   key: string;
+  /** Series that share a label share one legend entry, which shows and
+   *  hides them together. */
   label: string;
   color: string;
   full?: string;
@@ -483,6 +486,15 @@ export type FrontierSeries<P extends FrontierPt = FrontierPt> = {
    *  layouts). */
   lineType?: "solid" | "dashed" | "dotted";
   symbol?: string;
+  /** An envelope over other series of the chart (a card's front over all
+   *  its deployments): drawn as a broad translucent band under the lines it
+   *  bounds, so it reads as their hull and not as one more line. */
+  envelope?: boolean;
+  /** Name the line at its most interactive end (the default). A line that
+   *  is one deployment is named on the curve already — its layout at its
+   *  first point — and turns it off: a second name at the crowded end of
+   *  forty lines names none. */
+  endLabel?: boolean;
 };
 
 /** Decode Pareto frontier: tokens/s one request sees (x) against tokens/s
@@ -521,6 +533,26 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
   const drawn = series.filter(
     (s) => s.points.some((p) => at(p, axes.sol[0]) != null
       && at(p, axes.sol[1]) != null));
+  // A click on a line pins it: the rest fade, it is drawn on top and named.
+  // A second click on it, or Esc, unpins; other lines unpin it too.
+  const [pin, setPin] = useState<string | null>(null);
+  // Other lines are another answer: nothing stays pinned across them.
+  const lineKeys = drawn.map((s) => s.key).join("\n");
+  useEffect(() => { setPin(null); }, [lineKeys]);
+  const pinned = drawn.some((s) => s.key === pin) ? pin : null;
+  // A series is found by its id, never its index: the chart merges an
+  // update into the series it has (`merge`), so a line that arrives later
+  // can take an index another held.
+  const byId = (id: unknown) => {
+    const key = String(id ?? "").replace(/\|(measured|partial|end)$/, "");
+    return drawn.find((s) => s.key === key);
+  };
+  useEffect(() => {
+    if (!pinned) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setPin(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pinned]);
   // A caller that draws its own header (the Scaling panel: one header for
   // every form of its section) passes neither, and gets no empty row.
   const head = title || controls ? (
@@ -547,7 +579,10 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
   }
   // The legend sits under the x-axis name: the plot gives up a row of
   // height per row past the ones the default margin holds.
-  const wrapped = drawn.map((s) => wrapChartLabel(s.label).split("\n"));
+  // Series that share a label share one legend entry, which shows and
+  // hides them together (several lines of one group, told apart by shade).
+  const names = [...new Set(drawn.map((s) => s.label))];
+  const wrapped = names.map((n) => wrapChartLabel(n).split("\n"));
   const rowH = wrapped.some((ls) => ls.length > 1) ? 28 : 16;
   const rows = legendRows(wrapped.map((ls) => ls.reduce((a, b) => (b.length > a.length ? b : a))),
     width, { iconPx: 10, gapPx: 10, charPx: 6 });
@@ -570,13 +605,15 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
     max: (v: { max: number }) => v.max * 1.05,
   };
   // The first `drawn.length` series are the SOL frontiers, in order.
-  const events = onPoint ? {
+  const events = {
     click: (raw: unknown) => {
-      const it = raw as { seriesIndex?: number; data?: { pt?: P } };
-      const s = it.seriesIndex != null ? drawn[it.seriesIndex] : undefined;
-      if (s && it.data?.pt) onPoint(s, it.data.pt);
+      const it = raw as { seriesId?: string; data?: { pt?: P } };
+      const s = byId(it.seriesId);
+      if (!s) return;
+      setPin((k) => (k === s.key ? null : s.key));
+      if (onPoint && it.data?.pt) onPoint(s, it.data.pt);
     },
-  } : undefined;
+  };
   const option: EChartsOption = {
     color: drawn.map((s) => s.color),
     ...interactiveBits({ name: title }),
@@ -584,10 +621,9 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
     tooltip: {
       trigger: "item",
       formatter: (item: unknown) => {
-        const it = item as { seriesIndex?: number; seriesName?: string; data?: { pt?: P } };
+        const it = item as { seriesId?: string; data?: { pt?: P } };
         // A measured or partial line is named as its model's SOL line.
-        const s = (it.seriesIndex != null ? drawn[it.seriesIndex] : undefined)
-          ?? drawn.find((d) => d.label === it.seriesName);
+        const s = byId(it.seriesId);
         const p = it.data?.pt;
         if (!s || !p) return "";
         const lines = [
@@ -609,7 +645,7 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
         return lines.join("<br/>");
       },
     },
-    legend: legendOpts(drawn.map((s) => s.label)),
+    legend: legendOpts(names),
     xAxis: {
       ...axis("value", xTitle, fmtCompact, 28), ...linearSpan,
       axisLabel: { ...AXIS.axisLabel, formatter: (v: string | number) => fmtCompact(Number(v)), showMinLabel: true, showMaxLabel: false },
@@ -619,9 +655,16 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
       axisLabel: { ...AXIS.axisLabel, formatter: (v: string | number) => fmtCompact(Number(v)), showMinLabel: true, showMaxLabel: false },
     },
     series: [
-      ...drawn.map((s) => ({
+      ...drawn.map((s) => {
+        const isPinned = pinned === s.key;
+        const faded = pinned != null && !isPinned;
+        return {
         type: "line" as const,
+        // Stable across a pin, so the update restyles the series in place.
+        id: s.key,
         name: s.label,
+        // A click on the line itself, not only on a point, pins it.
+        triggerLineEvent: true,
         // The best layout is named where it changes along the curve;
         // hovering a curve names every point.
         data: s.points
@@ -630,22 +673,29 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
           .map((p, i, sorted) => ({
             value: [xOf(p), yOf(p)],
             pt: p,
-            label: { show: i === 0 || sorted[i - 1].layout !== p.layout },
+            label: { show: !faded
+              && (i === 0 || sorted[i - 1].layout !== p.layout) },
           })),
         showSymbol: true,
         symbol: s.symbol || "emptyCircle",
-        symbolSize: 5,
-        lineStyle: { width: 1.6, color: s.color, type: s.lineType || "solid" },
-        itemStyle: { color: s.color },
+        symbolSize: isPinned ? 7 : 5,
+        lineStyle: s.envelope
+          ? { width: 8, color: s.color, opacity: faded ? 0.1 : 0.3, type: s.lineType || "solid" }
+          : { width: isPinned ? 3 : 1.6, color: s.color, opacity: faded ? 0.12 : 1,
+              type: s.lineType || "solid" },
+        itemStyle: { color: s.color, opacity: faded ? 0.15 : 1 },
+        z: isPinned ? 10 : s.envelope ? 1 : 2,
         label: {
           formatter: (x: unknown) => (x as { data?: { pt?: FrontierPt } }).data?.pt?.layout ?? "",
           fontSize: 9,
           color: s.color,
           position: "top" as const,
         },
-        labelLayout: { hideOverlap: true },
+        // The pinned line's names are never the ones an overlap hides.
+        labelLayout: { hideOverlap: !isPinned },
         emphasis: { focus: "series" as const, label: { show: true } },
-      })),
+        };
+      }),
       ...drawn.flatMap((s) => {
         const pair = axes.measured;
         const pts = !pair ? [] : (s.measured || []).filter(
@@ -654,6 +704,7 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
         if (!pair || !pts.length) return [];
         return [{
           type: "line" as const,
+          id: `${s.key}|measured`,
           name: s.label,
           data: [...pts]
             .sort((a, b) => (at(a, pair[0]) ?? 0) - (at(b, pair[0]) ?? 0))
@@ -672,6 +723,7 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
         if (!pair || !pts.length) return [];
         return [{
           type: "line" as const,
+          id: `${s.key}|partial`,
           name: s.label,
           data: [...pts]
             .sort((a, b) => (at(a, pair[0]) ?? 0) - (at(b, pair[0]) ?? 0))
@@ -684,12 +736,14 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
         }];
       }),
       // The name rides the most interactive end, as LineChart's end labels.
-      ...drawn.map((s) => {
+      ...drawn.filter((s) => s.endLabel !== false
+        && (pinned == null || pinned === s.key)).map((s) => {
         const last = s.points
           .filter((p) => at(p, xField) != null && at(p, yField) != null)
           .reduce((a, b) => (xOf(b) > xOf(a) ? b : a));
         return {
           type: "scatter" as const,
+          id: `${s.key}|end`,
           name: s.label,
           data: [{ value: [xOf(last), yOf(last)], name: s.label, itemStyle: { color: s.color } }],
           symbolSize: 6,
@@ -717,7 +771,8 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
       {subtitle ? <p className="text-xs text-gray-400 mb-3">{subtitle}</p> : null}
       {staleNote}
       <div ref={box} className={stale ? "opacity-40 transition-opacity" : "transition-opacity"} aria-busy={stale ? true : undefined}>
-        <HaChart option={option} height={chartH} onEvents={events} />
+        {/* Merged, not replaced: a pin restyles the same series in place. */}
+        <HaChart option={option} height={chartH} onEvents={events} merge />
         {footer}
       </div>
     </section>

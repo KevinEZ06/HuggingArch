@@ -21,12 +21,24 @@ from typing import (Any, Dict, List, Literal, Mapping, Optional, Sequence,
 #: it. A producer may add a provenance tag (`row`, for a Compare request), but
 #: it may not omit one of these: a view written for one cloud must be askable of
 #: another. `ep_load_factor` is here even though it is deliberately NOT in
-#: `measure.scope.of_walk` — rho is substituted at the point.
+#: `measure.scope.of_walk` — rho is substituted at the point. `layout` is the
+#: deployment itself (`layout_label`): a line grouped by it is one deployment
+#: through the batches it serves, which `mode` is not — the one-GPU point is on
+#: every mode's ladder, and the Gallery's mixed TP·EP·DP layouts are all
+#: `custom`.
 PointDim = Literal[
-    "mode", "num_gpus", "gpu_sku", "context", "batch_key", "draft_tokens",
-    "acceptance", "ep_load_factor",
+    "mode", "num_gpus", "layout", "gpu_sku", "context", "batch_key",
+    "draft_tokens", "acceptance", "ep_load_factor",
 ]
 POINT_DIMS: Tuple[str, ...] = get_args(PointDim)
+
+#: The coordinates a coordinate's value fixes: a deployment (`layout`) is
+#: one mode at one GPU count, in every cloud (`point_coordinates` derives the
+#: three from the one `ParallelConfig`). Not the other way round — the
+#: Gallery's mixed TP·EP·DP layouts are all mode `custom` at one count. A
+#: view reads it twice: a line along an axis does not hold what fixes the
+#: axis (`view_forms`), and a group by a coordinate states what it fixes.
+POINT_FIXES: Mapping[str, Tuple[str, ...]] = {"layout": ("mode", "num_gpus")}
 
 #: Why a grid point has no values. `beyond_max_context` is not here: the
 #: existing chart extrapolates past a model's published context and flags it,
@@ -117,6 +129,41 @@ def parallel_mode(parallel: Any) -> str:
             and fields["ep_moe"] == 1):
         return "tp_tp"
     return "custom"
+
+
+def layout_label(parallel: Any) -> str:
+    """How a chart names a deployment, and the point-cloud `layout`
+    coordinate — so one name is one deployment. The degrees above one,
+    short enough to sit beside a point (`TP8`, `TP8·EP64·DP8`, `EP32·DP32`;
+    one GPU is `TP1`); the GPU count is said beside it.
+
+    The short form leaves out what the common deployments agree on: the
+    dense FFN split as attention is, and each expert split as attention is
+    when the experts are not spread (`ep_moe` 1) and whole when they are.
+    Anything else is named after it — `FFN-TP`, `MoE-TP`, `DCP`, `PP`, data
+    replicas `REP`, sequence parallelism `SP`, a context-parallel scheme
+    other than PCP, a world's own degree — so two deployments never share a
+    name (`test_point_cloud`)."""
+    tp = parallel.tp_attention
+    cp = f"CP{parallel.cp}" + (
+        f"({parallel.cp_scheme.value})"
+        if parallel.cp_scheme.value != "pcp" else "")
+    parts = [part for part, n in (
+        (f"TP{tp}", tp), (cp, parallel.cp),
+        (f"EP{parallel.ep_moe}", parallel.ep_moe),
+        (f"DP{parallel.dp_attention}", parallel.dp_attention)) if n > 1]
+    expert_tp = tp if parallel.ep_moe == 1 else 1
+    parts += [part for part, named in (
+        (f"FFN-TP{parallel.tp_dense_ffn}", parallel.tp_dense_ffn != tp),
+        (f"MoE-TP{parallel.tp_moe_expert}",
+         parallel.tp_moe_expert != expert_tp),
+        (f"DCP{parallel.dcp}", parallel.dcp > 1),
+        (f"PP{parallel.pp}", parallel.pp > 1),
+        (f"REP{parallel.dp_replicas}", parallel.dp_replicas > 1),
+        ("SP", bool(parallel.sequence_parallel))) if named]
+    parts += [f"{world}{n}" for world, n in
+              sorted((parallel.world_degrees or {}).items()) if n > 1]
+    return "·".join(parts) or "TP1"
 
 
 def mode_ladders(cloud: Sequence[dict]) -> Dict[Any, Tuple[Any, ...]]:
@@ -366,10 +413,11 @@ def view_forms(cloud: Sequence[dict], *, track: str = "sol"
     reason; a view asked for one anyway is still answered — it is
     uninformative, not wrong."""
     # One coordinate tuple per point for every phase and axis to read: the
-    # key a group is held by is this tuple with the axis' own coordinate
-    # dropped. Read through `point_coords`, the same expansion every view
-    # groups by — a point on several modes' ladders is in each of them.
-    cut = {d: i for i, d in enumerate(POINT_DIMS)}
+    # key a group is held by is this tuple without the axis' own coordinate
+    # and without every coordinate that fixes it (`POINT_FIXES`: holding a
+    # deployment holds its GPU count). Read through `point_coords`, the
+    # same expansion every view groups by — a point on several modes'
+    # ladders is in each of them.
     at = point_coords(cloud, POINT_DIMS)
     priced = [(coords, p) for p in cloud if "refused" not in p
               for coords in product(*(at(p, d) for d in POINT_DIMS))]
@@ -390,10 +438,11 @@ def view_forms(cloud: Sequence[dict], *, track: str = "sol"
             # Everything but the axis' own coordinate held still: the rate
             # at each X of that group, the best where a group has several
             # points at one X (the line's own rule).
-            k = cut[coordinate]
+            kept = [i for i, d in enumerate(POINT_DIMS) if d != coordinate
+                    and coordinate not in POINT_FIXES.get(d, ())]
             groups: Dict[Tuple[Any, ...], Dict[Any, float]] = {}
             for coords, p in at:
-                best = groups.setdefault(coords[:k] + coords[k + 1:], {})
+                best = groups.setdefault(tuple(coords[i] for i in kept), {})
                 if p[x] not in best or p[gpu] > best[p[x]]:
                     best[p[x]] = p[gpu]
             moves = any(len(set(rates.values())) > 1
@@ -416,6 +465,9 @@ def _view_payload(cloud: Sequence[dict], *, dims: Sequence[str],
     return {
         "values": dict(values),
         "dims": list(dims),
+        # What each dimension's value fixes, so a page does not run a line
+        # along an axis by a dimension that fixes it (one point a line).
+        "fixes": {d: list(f) for d, f in POINT_FIXES.items() if d in dims},
         "phase": phase,
         # `sol` is the phase's definition and is always said; the tracks
         # beside it only where this cloud carries them, so a page draws
@@ -429,20 +481,50 @@ def _view_payload(cloud: Sequence[dict], *, dims: Sequence[str],
     }
 
 
+def _fixed_by(group_by: Sequence[str], pts: Sequence[dict]) -> Dict[str, Any]:
+    """What a group's coordinates fix (`POINT_FIXES`), stated beside them:
+    a group by deployment names its mode and GPU count, so a page styles
+    the line from its group rather than from one of its points. Every point
+    of the group holds the one value, or the declaration is wrong."""
+    out: Dict[str, Any] = {}
+    for d in group_by:
+        for f in POINT_FIXES.get(d, ()):
+            seen = {p[f] for p in pts}
+            if len(seen) != 1:
+                raise ValueError(f"{d} fixes {f}, yet one group of it holds "
+                                 f"{sorted(seen, key=str)}")
+            out[f] = seen.pop()
+    return out
+
+
 def frontier_view(cloud: Sequence[dict], *, dims: Sequence[str],
                   fix: Mapping[str, Sequence[Any]], group_by: Sequence[str],
-                  phase: str = "decode", track: str = "sol") -> dict:
+                  phase: str = "decode", track: str = "sol",
+                  envelope_by: Optional[Sequence[str]] = None) -> dict:
     """The points of `cloud` held and grouped as `_view_groups` says, one
     line per group, each line its `pareto_front` on the phase's axes on
-    `track`, with the controls' `values`."""
-    groups, values = _view_groups(cloud, dims=dims, fix=fix, group_by=group_by)
-    return {
-        "series": [{"group": dict(zip(group_by, k, strict=True)),
-                    "frontier": pareto_front(pts, phase=phase, track=track)}
-                   for k, pts in groups.items()],
-        **_view_payload(cloud, dims=dims, values=values, phase=phase,
-                        track=track),
-    }
+    `track`, with the controls' `values`.
+
+    With `envelope_by`, the view also publishes `envelopes`: the same held
+    points grouped by those coarser dimensions, each group's front — one
+    per card over every deployment drawn, with `["gpu_sku"]`. An envelope is
+    over whole lines, so its dimensions are among `group_by`."""
+    def fronts(by: Sequence[str]) -> Tuple[List[dict], Dict[str, List[Any]]]:
+        groups, values = _view_groups(cloud, dims=dims, fix=fix, group_by=by)
+        return [{"group": {**_fixed_by(by, pts), **dict(zip(by, k, strict=True))},
+                 "frontier": pareto_front(pts, phase=phase, track=track)}
+                for k, pts in groups.items()], values
+
+    series, values = fronts(group_by)
+    out: Dict[str, Any] = {"series": series}
+    if envelope_by is not None:
+        loose = [d for d in envelope_by if d not in group_by]
+        if loose:
+            raise ValueError(f"an envelope is over whole lines; {loose} are "
+                             f"not among the lines' dimensions {list(group_by)}")
+        out["envelopes"], _values = fronts(envelope_by)
+    return {**out, **_view_payload(cloud, dims=dims, values=values,
+                                   phase=phase, track=track)}
 
 
 def line_view(cloud: Sequence[dict], *, dims: Sequence[str], x: str,

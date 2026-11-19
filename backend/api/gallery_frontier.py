@@ -123,7 +123,7 @@ from backend.inference.parallel_sweep import (
     parallel_configs_for_mode,
     sweep_caps,
 )
-from backend.inference.frontier import (POINT_DIMS, frontier_view, parallel_mode,
+from backend.inference.frontier import (POINT_DIMS, frontier_view,
                                        pareto_front as _pareto_front)
 from backend.inference.sweep_grid import (
     FRONTIER_ACCEPTANCE_DEFAULT,
@@ -170,7 +170,7 @@ pareto_front = _pareto_front
 # version): the entry, and what views read off it (the measured rates and a
 # drawn view). A drawing's fields change without the entry's, and an entry is
 # priced again only when its own do.
-_FRONTIER_SCHEMA = "gallery-frontier-v14"
+_FRONTIER_SCHEMA = "gallery-frontier-v15"
 _DRAWING_SCHEMA = "gallery-frontier-drawing-v6"
 _GALLERY_SELECTION = "envelope"
 #: The precision profile every frontier is priced under: as shipped.
@@ -275,7 +275,7 @@ def _batch_key(batch: Any) -> str:
     return "max"
 
 
-def _theory_item(seq: str, label: str, mode: str, num_gpus: int,
+def _theory_item(seq: str, parallel: ParallelConfig,
                  batch_key: str, per: dict, measure_record: Optional[str],
                  floors: Optional[dict]) -> dict:
     """One cached point: what the read path reads of it and nothing else.
@@ -284,7 +284,7 @@ def _theory_item(seq: str, label: str, mode: str, num_gpus: int,
     — when the canonical record carries concrete measure keys — the name of
     that record. The key table itself belongs to the record and is never
     copied into the entry."""
-    return {"seq": seq, "label": label, "mode": mode, "num_gpus": num_gpus,
+    return {"seq": seq, "parallel": parallel.to_dict(),
             "batch_key": batch_key,
             "sol": {"phases": {"decode": per["phases"]["decode"]}},
             "floors": floors,
@@ -401,7 +401,7 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
         theory: List[dict] = []
         draftErrors: List[dict] = []
         byPoint: Dict[Tuple[str, int], dict] = {}
-        label, num_gpus = layout_label(cfg), cfg.cluster_size
+        label = layout_label(cfg)
         measureRecord = (
             StepLawKey.of_layout(walk_key, cfg).record_name
             if walk_key is not None
@@ -445,7 +445,7 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
                         requests=batchPoint["decode_batch_size"] or 1):
                     continue
                 item = _theory_item(
-                    str(seq), label, parallel_mode(cfg), num_gpus,
+                    str(seq), cfg,
                     _batch_key(served["phases"]["decode"]["batch"]), served,
                     measureRecord, form(served))
                 theory.append(item)
@@ -482,8 +482,8 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
                         # A batch only the draft's capacity admits: a
                         # K-step point, with no plain step (`_at_view`).
                         item = _theory_item(
-                            str(seq), label, parallel_mode(cfg), num_gpus,
-                            _batch_key(batch), served, None, None)
+                            str(seq), cfg, _batch_key(batch), served,
+                            None, None)
                         theory.append(item)
                         byPoint[(str(seq), batch)] = item
                     item.setdefault("draft", {})[textK] = stepForm
@@ -919,7 +919,7 @@ def _draw(core: dict, view: FrontierView, state: str,
     # The entry index each drawn point was read off, for its coverage.
     for i, point in enumerate(core.get("_theory") or []):
         coordinates = point_coordinates(
-            mode=point.get("mode", "custom"), num_gpus=point["num_gpus"],
+            parallel=ParallelConfig.from_dict(point["parallel"]),
             gpu_sku=view.gpu_sku, context=int(point["seq"]),
             batch_key=point.get("batch_key", "max"),
             draft_tokens=int(view.draft_tokens),
@@ -936,7 +936,7 @@ def _draw(core: dict, view: FrontierView, state: str,
         records.append(CloudRecord(
             coordinates=coordinates,
             estimate={"phases": {"decode": dec}},
-            provenance={"layout": item["label"]}, token=i))
+            token=i))
 
     cloud = produce_cloud(records)
 

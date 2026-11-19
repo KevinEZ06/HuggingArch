@@ -26,6 +26,8 @@ const VIRIDIS = [
   "#440154", "#482475", "#414487", "#355f8d",
   "#2a788e", "#22a884", "#7ad151", "#bddf26", "#fde725",
 ];
+/** One colour per GPU count of a power-of-two ladder (1 … 512): Tableau 10. */
+const COUNT_COLORS = [...SWEEP_COLORS, "#9c755f", "#bab0ab"];
 const SYMBOLS = ["circle", "rect", "triangle", "diamond", "roundRect", "pin", "arrow"];
 
 const MODE_LABEL: Record<ParSweepMode, string> = {
@@ -137,7 +139,7 @@ type ParFrontierPt = FrontierPt & {
 type ParGpuSeries = { gpu_sku?: string; points?: ParPoint[] };
 /** What a decode point is held at or grouped by (`frontier.POINT_DIMS`). */
 type CloudDim =
-  | "gpu_sku" | "mode" | "num_gpus" | "context" | "batch_key"
+  | "gpu_sku" | "mode" | "num_gpus" | "layout" | "context" | "batch_key"
   | "draft_tokens" | "acceptance" | "ep_load_factor";
 type CloudValue = string | number;
 // `unavailable` is set when EVERY point of this mode failed to lay out (e.g. CP
@@ -1191,6 +1193,7 @@ const HOLD_LABEL: Record<CloudDim, string> = {
   gpu_sku: "GPU",
   mode: "Mode",
   num_gpus: "GPUs",
+  layout: "Layout",
   context: "Context",
   batch_key: "Batch",
   draft_tokens: "Draft tokens",
@@ -1257,12 +1260,21 @@ type CloudView = {
     frontier?: ParFrontierPt[];
     points?: ParFrontierPt[];
   }[];
+  /** Each card's front over every line drawn, where the view was asked
+   *  for it (`envelope_by`). */
+  envelopes?: {
+    group: Partial<Record<CloudDim, CloudValue>>;
+    frontier: ParFrontierPt[];
+  }[];
   values: Record<CloudDim, CloudValue[]>;
   dims: CloudDim[];
   phase: CloudPhase;
   axes: { sol: [string, string]; measured?: [string, string];
           partial?: [string, string]; coverage: string };
   forms: Record<CloudPhase, Partial<Record<FormKey, string | null>>>;
+  /** What each dimension's value fixes (`frontier.POINT_FIXES`): a
+   *  deployment its mode and GPU count. A group by one states them. */
+  fixes?: Partial<Record<CloudDim, CloudDim[]>>;
 };
 
 /** The GPU count the vs-batch and vs-context forms hold first: the KV
@@ -1379,7 +1391,7 @@ async function postView(body: unknown, signal: AbortSignal): Promise<CloudView> 
  *  pair of axes is the comparison. */
 const SUBTITLE: Record<CloudPhase, Record<"frontier" | "line", string>> = {
   decode: {
-    frontier: "Every layout of the parallel sweep at every per-GPU decode batch, kept to the held values; each line keeps the points no other point of it beats on both axes, up and to the right is better — faster for one request AND more tokens per GPU.",
+    frontier: "Every layout of the parallel sweep at every per-GPU decode batch, kept to the held values; by default each line is one deployment through the batches it serves (on one card: its colour the GPU count, its marker the mode), and keeps the points no other point of it beats on both axes. Up and to the right is better — faster for one request AND more tokens per GPU.",
     line: "Decode tokens/s per GPU, every layout of the parallel sweep kept to the held values; where several points of a line share an X, the line keeps the best (the hover names it). One GPU is the first point of every mode's line.",
   },
   prefill: {
@@ -1457,6 +1469,7 @@ function ThroughputSection({
   // form's default.
   const [picked, setPicked] = useState<Holds>({});
   const [pickedLines, setPickedLines] = useState<CloudDim[] | null>(null);
+  const [showEnvelope, setShowEnvelope] = useState(true);
   const [baseAnswer, setBaseAnswer] = useState<
     { key: string; cloud: string; base: CloudBase } | null>(null);
   const [answer, setAnswer] = useState<{ key: string; view: CloudView } | null>(null);
@@ -1524,20 +1537,38 @@ function ThroughputSection({
   // not a row of empty boxes.
   const lastValues = (answer?.view ?? base?.view)?.values;
   const cardsHeld = fix.gpu_sku?.length ?? base?.served.size ?? gpus.length;
-  const lineDims: CloudDim[] = pickedLines ?? (drawnForm === "batch"
-    ? ["context"] : drawnForm === "frontier" && cardsHeld === 1 ? ["mode"] : []);
+  // The front's lines default to one per deployment (`layout`): each is
+  // that deployment's points at the held context through its batches.
+  // Where the phase does not move with the batch (the cloud's own answer)
+  // a deployment is one point, and the lines are the modes' instead.
+  // A line along an X is not one value of a dimension that fixes the X (a
+  // deployment along its GPU count is one point): such a pick is dropped
+  // on that form, and comes back on the others.
+  const xCoord: CloudDim | null = drawnForm === "frontier" ? null
+    : drawnForm === "batch" ? "batch_key" : drawnForm;
+  const fixes = base?.view.fixes ?? {};
+  const lineDims: CloudDim[] = (pickedLines ?? (drawnForm === "batch"
+    ? ["context"] : drawnForm !== "frontier" ? []
+      : !refusedFor("batch") ? ["layout"] : cardsHeld === 1 ? ["mode"] : []))
+    .filter((d) => !xCoord || !(fixes[d] ?? []).includes(xCoord));
   // What a line may be one value of: the cloud's own dimensions beside the
   // card (a line never mixes cards), each with more than one value here.
   const cloudDims = base?.view.dims || [];
   const lineOptions = cloudDims.filter((d) => d !== "gpu_sku"
     && ((lastValues?.[d]?.length ?? 0) > 1 || lineDims.includes(d)));
   const by: CloudDim[] = ["gpu_sku", ...lineDims.filter((d) => d !== "gpu_sku")];
+  // Each card's envelope over its lines rides the front's answer whenever
+  // the lines split a card; with lines by card alone each line IS one.
+  const envelopeBy: CloudDim[] | null = drawnForm === "frontier" && by.length > 1
+    ? ["gpu_sku"] : null;
+  const envelopeOn = showEnvelope && !!envelopeBy;
   // No view is asked before its defaults are known: the request is one
   // function of the sweep, the context, the phase, the form and the
   // reader's picks.
   const reqBody = fresh
     ? JSON.stringify({ sweep: sweepBody, phase, fix, group_by: by,
-                       ...formView(drawnForm) }) : "";
+                       ...formView(drawnForm),
+                       ...(envelopeBy ? { envelope_by: envelopeBy } : {}) }) : "";
   const view = reqBody && answer?.key === reqBody ? answer.view : null;
   useEffect(() => {
     if (!reqBody) return;
@@ -1563,20 +1594,38 @@ function ThroughputSection({
     .filter((s) => s.points.length);
   // Cards tell lines apart by colour; with one card on the chart, the
   // other dimension takes the colour instead (contexts their own scale).
+  // Lines by deployment on one card: each its own colour and legend entry —
+  // the colour its GPU count, the line and marker its mode, so every
+  // (mode, GPU count) pair reads apart. Across cards the card keeps the
+  // colour and the deployments of a mode share its entry.
   const cards = new Set(groups.map((s) => s.group.gpu_sku));
+  const byLayout = by.includes("layout");
+  const ownColours = byLayout && cards.size === 1;
+  // A group by deployment states its mode and GPU count (`view.fixes`).
+  const counts = [...new Set(groups.map((s) => Number(s.group.num_gpus)))]
+    .sort((a, b) => a - b);
   const rest = by.filter((d) => d !== "gpu_sku");
-  const restKeys = [...new Set(groups.map((s) => rest.map((d) => s.group[d]).join("·")))];
-  const style = (group: Partial<Record<CloudDim, CloudValue>>, i: number) => {
-    const ri = restKeys.indexOf(rest.map((d) => group[d]).join("·"));
+  const keyOf = (group: Partial<Record<CloudDim, CloudValue>>) =>
+    byLayout ? String(group.mode ?? "") : rest.map((d) => group[d]).join("·");
+  const restKeys = [...new Set(groups.map((s) => keyOf(s.group)))];
+  const style = (group: Partial<Record<CloudDim, CloudValue>>) => {
+    const ri = restKeys.indexOf(keyOf(group));
     const mode = group.mode as ParSweepMode | undefined;
     const ci = rest.length === 1 && rest[0] === "context"
       ? SWEEP_SEQ_LENS.indexOf(Number(group.context)) : -1;
     return {
-      key: `${group.gpu_sku}:${rest.map((d) => group[d]).join("·")}:${i}`,
-      label: by.map((d) => cloudLabel(d, group[d] ?? "")).join(" · "),
+      // The line's own group: stable while the lines around it change, so
+      // a pinned line stays pinned.
+      key: `${group.gpu_sku}:${rest.map((d) => group[d]).join("·")}`,
+      label: ownColours ? String(group.layout ?? "")
+        : byLayout
+          ? `${String(group.gpu_sku)} · ${cloudLabel("mode", mode ?? "")}`
+          : by.map((d) => cloudLabel(d, group[d] ?? "")).join(" · "),
       color: cards.size > 1
         ? colorOf.get(String(group.gpu_sku ?? "")) || SWEEP_COLORS[0]
-        : ci >= 0 ? VIRIDIS[ci % VIRIDIS.length] : SWEEP_COLORS[ri % SWEEP_COLORS.length],
+        : ownColours
+          ? COUNT_COLORS[counts.indexOf(Number(group.num_gpus)) % COUNT_COLORS.length]
+          : ci >= 0 ? VIRIDIS[ci % VIRIDIS.length] : SWEEP_COLORS[ri % SWEEP_COLORS.length],
       mode, ri,
     };
   };
@@ -1695,6 +1744,14 @@ function ThroughputSection({
               onChange={(ds) => setPickedLines(ds as CloudDim[])}
             />
           ) : null}
+          {envelopeBy ? (
+            <label title="Each card's front over every line drawn, as a band under them."
+              className="inline-flex items-center gap-1.5 h-7 text-xs whitespace-nowrap text-gray-700 cursor-pointer">
+              <input id="infer-throughput-envelope" type="checkbox" className="accent-gray-700"
+                checked={showEnvelope} onChange={(e) => setShowEnvelope(e.target.checked)} />
+              Envelope
+            </label>
+          ) : null}
         </>
       )}
       <span title={measuredReason
@@ -1707,7 +1764,9 @@ function ThroughputSection({
     </div>
   );
   const subtitle = SUBTITLE[phase][drawnForm === "frontier" ? "frontier" : "line"]
+    + (envelopeOn ? " The broad band is each card's envelope: the front over every line drawn." : "")
     + (phase === "prefill" ? PREFILL_SCHEDULE_NOTE : "") + specNote + ` SOL${measuredOn ? ", measured beside it where every op of the step is measured" : " only"}.`
+    + (drawnForm === "frontier" ? " Click a line to highlight it (again, or Esc, to clear)." : "")
     + (onApply ? " Click a point to apply it." : "");
   const empty = failed ? `view load failed: ${failed}` : view ? "No layout serves these held values on these GPUs." : "Loading…";
   const pastNote = past ? (
@@ -1758,19 +1817,39 @@ function ThroughputSection({
   } else if (!axes) {
     chart = <div className="text-xs text-gray-400 text-center py-6">{empty}</div>;
   } else if (drawnForm === "frontier") {
-    const series: FrontierSeries<ParFrontierPt>[] = groups.map((s, i) => {
-      const st = style(s.group, i);
+    // A legend of deployments reads by mode, then GPU count.
+    const drawn = ownColours
+      ? [...groups].sort((x, y) => String(x.group.mode).localeCompare(String(y.group.mode))
+        || Number(x.group.num_gpus) - Number(y.group.num_gpus))
+      : groups;
+    const lines: FrontierSeries<ParFrontierPt>[] = drawn.map((s) => {
+      const st = style(s.group);
       return {
         key: st.key, label: st.label, color: st.color, points: s.points,
+        ...(byLayout ? { endLabel: false } : {}),
         ...(measuredOn
           ? { measured: s.points.filter((p) => isComplete(covOf(p))) } : {}),
         ...(cards.size > 1 && (roundOf.get(String(s.group.gpu_sku)) ?? 0) > 0
           ? { symbol: SYMBOLS[(roundOf.get(String(s.group.gpu_sku)) ?? 0) % SYMBOLS.length] } : {}),
-        ...(cards.size > 1 && rest.length
-          ? (rest.length === 1 && st.mode && MODE_LINE[st.mode] ? MODE_LINE[st.mode] : { lineType: LINE_TYPES[st.ri % LINE_TYPES.length] })
-          : {}),
+        ...(byLayout && st.mode && MODE_LINE[st.mode] ? MODE_LINE[st.mode]
+          : cards.size > 1 && rest.length
+            ? (rest.length === 1 && st.mode && MODE_LINE[st.mode] ? MODE_LINE[st.mode] : { lineType: LINE_TYPES[st.ri % LINE_TYPES.length] })
+            : {}),
       };
     });
+    // Each card's envelope as the view published it, a band under its lines.
+    const envelopes: FrontierSeries<ParFrontierPt>[] = envelopeOn
+      ? (view?.envelopes || []).filter((e) => e.frontier.length).map((e) => {
+        const card = String(e.group.gpu_sku ?? "");
+        return {
+          key: `envelope:${card}`,
+          label: cards.size > 1 ? `${card} · envelope` : "Envelope",
+          color: cards.size > 1 ? colorOf.get(card) || SWEEP_COLORS[0] : "#374151",
+          points: e.frontier,
+          envelope: true,
+        };
+      }) : [];
+    const series = [...lines, ...envelopes];
     chart = (
       <>
         <FrontierChart<ParFrontierPt>
@@ -1796,8 +1875,8 @@ function ThroughputSection({
     const measField = measuredOn ? axes.measured?.[1] : undefined;
     const tField = phase === "decode" ? "tpot_s" : "prefill_t_s";
     const bField = phase === "decode" ? "batch" : "prefill_batch";
-    const series: LineSeries[] = groups.flatMap((s, i) => {
-      const st = style(s.group, i);
+    const series: LineSeries[] = groups.flatMap((s) => {
+      const st = style(s.group);
       const shape = {
         key: st.key, applyKey: st.key, label: st.label, color: st.color,
         ...(cards.size > 1 && (roundOf.get(String(s.group.gpu_sku)) ?? 0) > 0

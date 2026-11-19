@@ -139,12 +139,13 @@ def test_a_plan_point_maps_to_the_cloud_coordinates():
 
     point = PlanPoint(16384, 8192, 8, 64, 1.5)
     coordinates = point_coordinates(
-        mode="tp_tp", num_gpus=2, gpu_sku="H100-SXM",
+        parallel=ParallelConfig(tp_attention=2, tp_dense_ffn=2,
+                                tp_moe_expert=2), gpu_sku="H100-SXM",
         context=point.seq_len, batch_key="b64",
         draft_tokens=point.s_verify - 1, acceptance=0.8,
         ep_load_factor=point.ep_load_factor)
     assert coordinates == {
-        "mode": "tp_tp", "num_gpus": 2, "gpu_sku": "H100-SXM",
+        "mode": "tp_tp", "num_gpus": 2, "layout": "TP2", "gpu_sku": "H100-SXM",
         "context": 16384, "batch_key": "b64", "draft_tokens": 7,
         "acceptance": 0.8, "ep_load_factor": 1.5,
     }
@@ -180,7 +181,7 @@ def test_an_estimate_cloud_states_coordinates_and_keeps_absences():
     ])
     served = cloud[0]
     assert {k: served[k] for k in POINT_DIMS} == {
-        "mode": "tp_tp", "num_gpus": 2, "gpu_sku": "H100-SXM",
+        "mode": "tp_tp", "num_gpus": 2, "layout": "TP2", "gpu_sku": "H100-SXM",
         "context": 1024, "batch_key": "b1", "draft_tokens": 2,
         "acceptance": 0.7, "ep_load_factor": 1.5,
     }
@@ -413,3 +414,56 @@ def test_a_line_runs_along_the_context_for_either_phase():
                             group_by=["gpu_sku"], phase=phase)["series"]
         assert [p["context"] for p in line["points"]] == [1024, 4096]
         assert [p[field] for p in line["points"]] == want
+
+
+def test_a_deployments_line_is_its_own_batch_curve_and_drawn_once():
+    """Grouped by `layout`, each line is one deployment through its batches
+    — the one-GPU deployment once, not once per mode's ladder — and the
+    card's envelope (`envelope_by`) is the old one-front-per-card answer."""
+    cloud = [
+        _cloud_point("B300", "tp1", 1, 1024, "b1", 1, 10.0),
+        _cloud_point("B300", "tp1", 1, 1024, "b8", 8, 40.0),
+        _cloud_point("B300", "dp_ep", 8, 1024, "b1", 1, 12.0),
+        _cloud_point("B300", "dp_ep", 8, 1024, "b8", 8, 90.0),
+        _cloud_point("B300", "tp_tp", 8, 1024, "b1", 1, 8.0),
+        _cloud_point("B300", "tp_tp", 8, 1024, "b8", 8, 60.0),
+    ]
+    v = frontier_view(cloud, dims=POINT_DIMS, fix={"context": [1024]},
+                      group_by=["gpu_sku", "layout"], envelope_by=["gpu_sku"])
+    lines = {s["group"]["layout"]: [p["batch"] for p in s["frontier"]]
+             for s in v["series"]}
+    assert lines == {"tp11": [1, 8], "dp_ep8": [1, 8], "tp_tp8": [1, 8]}
+    # A group by deployment states what the deployment fixes.
+    assert {(s["group"]["mode"], s["group"]["num_gpus"]) for s in v["series"]} \
+        == {("tp1", 1), ("dp_ep", 8), ("tp_tp", 8)}
+    alone = frontier_view(cloud, dims=POINT_DIMS, fix={"context": [1024]},
+                          group_by=["gpu_sku"])
+    assert v["envelopes"] == alone["series"]
+    with pytest.raises(ValueError, match="whole lines"):
+        frontier_view(cloud, dims=POINT_DIMS, fix={}, group_by=["layout"],
+                      envelope_by=["gpu_sku"])
+
+
+def test_a_layout_name_is_one_deployment():
+    """`layout` is a coordinate, so two deployments may not share a name:
+    every field of `ParallelConfig` a deployment can differ in shows in it."""
+    import itertools
+    from backend.inference.frontier import layout_label
+    names = {}
+    for tp, ffn, moe, ep, cp, dcp, dp, rep, pp, sp, scheme in itertools.product(
+            (1, 2), (1, 2), (1, 2), (1, 2), (1, 2), (1, 2), (1, 2), (1, 2),
+            (1, 2), (False, True), ("pcp", "ulysses")):
+        if cp == 1 and scheme != "pcp":
+            continue   # a scheme with no context parallel is no deployment
+        cfg = ParallelConfig(tp_attention=tp, tp_dense_ffn=ffn,
+                             tp_moe_expert=moe, ep_moe=ep, cp=cp, dcp=dcp,
+                             dp_attention=dp, dp_replicas=rep, pp=pp,
+                             sequence_parallel=sp, cp_scheme=scheme)
+        name = layout_label(cfg)
+        assert name not in names, (name, names.get(name), cfg)
+        names[name] = cfg
+    assert layout_label(ParallelConfig()) == "TP1"
+    assert layout_label(ParallelConfig(tp_attention=8, tp_dense_ffn=8,
+                                       tp_moe_expert=8)) == "TP8"
+    assert layout_label(ParallelConfig(tp_attention=2, tp_dense_ffn=2,
+                                       dp_attention=4, ep_moe=8)) == "TP2·EP8·DP4"

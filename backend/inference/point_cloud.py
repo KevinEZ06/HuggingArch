@@ -62,18 +62,25 @@ class CloudRecord:
 
 
 def point_coordinates(
-    *, mode: str, num_gpus: int, gpu_sku: str, context: int,
+    *, parallel: Any, gpu_sku: str, context: int,
     batch_key: Any, draft_tokens: int, acceptance: float,
-    ep_load_factor: Any,
+    ep_load_factor: Any, num_gpus: Optional[int] = None,
 ) -> dict[str, Any]:
-    """The one coordinate mapping, including a plan point's ρ."""
+    """The one coordinate mapping, including a plan point's ρ. The
+    deployment's three coordinates — its mode, its GPU count and its name
+    (`frontier.POINT_FIXES`) — are read off the one `parallel`; `num_gpus`
+    only for an estimate with no deployment of its own (`parallel` None)."""
+    from .frontier import layout_label, parallel_mode
+    if parallel is not None:
+        num_gpus = parallel.cluster_size
     try:
         rho = float(ep_load_factor)
     except (TypeError, ValueError):
         rho = str(ep_load_factor)
     return {
-        "mode": mode,
-        "num_gpus": int(num_gpus),
+        "mode": parallel_mode(parallel),
+        "num_gpus": int(num_gpus or 1),
+        "layout": layout_label(parallel) if parallel is not None else "TP1",
         "gpu_sku": gpu_sku,
         "context": context,
         "batch_key": batch_key,
@@ -139,15 +146,13 @@ def estimate_records(
     published context keeps its values, flagged — the parallel cloud's rule
     (`parallel_sweep.decode_rungs`).
     """
-    from .frontier import parallel_mode
-
-    mode = parallel_mode(parallel)
     for seq, verify, points in zip(seq_lens, verify_widths, estimates,
                                    strict=True):
         for (key, _prefill, decode), est in zip(batch_points, points,
                                                 strict=True):
             coordinates = point_coordinates(
-                mode=mode, num_gpus=num_gpus, gpu_sku=gpu_sku, context=seq,
+                parallel=parallel, num_gpus=num_gpus, gpu_sku=gpu_sku,
+                context=seq,
                 batch_key=key if key is not None else "max",
                 draft_tokens=int(verify) - 1,
                 acceptance=acceptance_rate, ep_load_factor=ep_load_factor)
@@ -174,8 +179,7 @@ def estimate_cloud(**kwargs: Any) -> PointCloud:
     return produce_cloud(estimate_records(**kwargs))
 
 
-def parallel_records(plan: Any, results: Sequence[Any],
-                     layout_label: Callable[[Any], str]
+def parallel_records(plan: Any, results: Sequence[Any]
                      ) -> Iterable[CloudRecord]:
     """The Parallelism sweep's cloud from every layout/card/context/batch
     answer — each point a decode rung that also carries its deployment's
@@ -189,14 +193,11 @@ def parallel_records(plan: Any, results: Sequence[Any],
     the one-GPU deployment is every ladder's first rung is the views' rule
     (`frontier.mode_ladders`).
     """
-    from .frontier import parallel_mode
-
     for cell, result in zip(plan.cells, results, strict=True):
-        mode, num_gpus = parallel_mode(cell.parallel), cell.parallel.cluster_size
 
         def at(gpu: str, context: int, batch_key: Any = None) -> dict:
             return plan.coordinates(
-                mode, num_gpus, gpu, context=context,
+                cell.parallel, gpu, context=context,
                 batch_key=(plan.requested_batch_key if batch_key is None
                            else batch_key))
 
@@ -240,7 +241,6 @@ def parallel_records(plan: Any, results: Sequence[Any],
                                        point.get("batch_key", "max")),
                         estimate={**point, "phases": phases},
                         provenance={
-                            "layout": layout_label(cell.parallel),
                             "x": cell.x,
                             "parallel": cell.parallel.to_dict()},
                         beyond_max_context=bool(
@@ -249,7 +249,6 @@ def parallel_records(plan: Any, results: Sequence[Any],
                         no_step_reason="this card serves no decode step")
 
 
-def parallel_cloud(plan: Any, results: Sequence[Any],
-                   layout_label: Callable[[Any], str]) -> PointCloud:
+def parallel_cloud(plan: Any, results: Sequence[Any]) -> PointCloud:
     """The Parallelism cloud, filled by the one producer."""
-    return produce_cloud(parallel_records(plan, results, layout_label))
+    return produce_cloud(parallel_records(plan, results))

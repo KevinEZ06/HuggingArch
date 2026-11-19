@@ -276,8 +276,20 @@ class TestDefaultsEndpoint:
             assert client.post("/inference/parallel-sweep/frontier", json={
                 "sweep": sweep, **missing_x}).status_code == 422
         bad = client.post("/inference/parallel-sweep/frontier",
-                          json={"sweep": sweep, "group_by": ["layout"]})
+                          json={"sweep": sweep, "group_by": ["parallel"]})
         assert bad.status_code == 422
+        # One line per deployment, and the card's envelope over them: the
+        # front the card alone draws.
+        per = client.post("/inference/parallel-sweep/frontier", json={
+            "sweep": sweep, "group_by": ["gpu_sku", "layout"],
+            "envelope_by": ["gpu_sku"]}).json()
+        alone = client.post("/inference/parallel-sweep/frontier", json={
+            "sweep": sweep, "group_by": ["gpu_sku"]}).json()
+        assert per["envelopes"] == alone["series"]
+        assert len(per["series"]) > len(alone["series"])
+        assert client.post("/inference/parallel-sweep/frontier", json={
+            "sweep": sweep, "form": "line", "x": "batch",
+            "envelope_by": ["gpu_sku"]}).status_code == 422
 
 
 class TestKvBudgetWhenWeightsDoNotFit:

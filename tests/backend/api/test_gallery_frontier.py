@@ -27,6 +27,11 @@ from backend.inference.sweep_grid import (
 )
 
 
+#: The theory points' deployment where a test does not care which.
+_TP2 = ParallelConfig(tp_attention=2, tp_dense_ffn=2,
+                      tp_moe_expert=2).to_dict()
+
+
 @pytest.fixture(autouse=True)
 def _one_computation():
     """Each test drives the worker side of a Gallery job directly — the
@@ -67,7 +72,7 @@ def _timed_item(seq, *, batch=4, plain_s=0.01, drafts=None,
                        "effective_tokens_formula": {"symbolic": "B × 1",
                                                     "substituted": f"{batch} × 1"}},
            "throughput": {"groups": 1, "num_gpus": 2}}
-    return {"seq": seq, "label": "TP2", "num_gpus": 2,
+    return {"seq": seq, "parallel": _TP2,
             "sol": {"phases": {"decode": dec}},
             "floors": None if speculative else _one_term(plain_s),
             **({} if measure_record is None else
@@ -185,7 +190,8 @@ def test_a_layout_draws_the_batches_that_fit_and_max_once():
         _serving_law_record(max_batch=100), "B200", ParallelConfig(tp_attention=2))
     pts = _theory_at(res, GALLERY_SEQ_LENS[0])
     assert sorted(_batch(p) for p in pts) == [1, 2, 4, 8, 16, 32, 64, 100]
-    assert all(p["label"] == "TP2" and p["num_gpus"] == 2 for p in pts)
+    assert all(p["parallel"] == ParallelConfig(tp_attention=2).to_dict()
+               for p in pts)
     assert _theory_at(res, GALLERY_SEQ_LENS[-1]) == []
     assert len(FRONTIER_BATCH_GRID) == 12
 
@@ -232,8 +238,7 @@ def test_a_refused_layout_is_reported_not_failed(monkeypatch):
     sk = str(GALLERY_SEQ_LENS[0])
     entry = f._fold(
         "test/Model", [ParallelConfig(), ParallelConfig(tp_attention=2)],
-        [projected, {"theory": [{**_timed_item(sk), "label": "TP2",
-                                 "num_gpus": 2}], "draft_errors": []}])
+        [projected, {"theory": [_timed_item(sk)], "draft_errors": []}])
     assert entry["error"] is None
     assert entry["layouts"][0]["refused"] == "heads do not divide"
     assert entry["layouts"][1]["points"] == 1
@@ -705,7 +710,7 @@ def test_a_failed_speculative_projection_is_every_ks_published_error(monkeypatch
     calls: list = []
     record = _projecting_record(
         monkeypatch, calls, fail=ValueError("verify refused"), fail_all=True)
-    cfg = ParallelConfig(tp_attention=2)
+    cfg = ParallelConfig.from_dict(_TP2)
     res = f._restamp_layout(record, "B200", cfg)
     assert res["theory"]
     assert [(e["layout"], e["draft_tokens"], e["error"]) for e in res["draft_errors"]] == [
@@ -959,7 +964,7 @@ def _covered_item(seq, *, batch, tpot, coverage):
     rates = {"concurrent_requests": batch,
              "sol": {"time_per_output_token_s": tpot, "per_request": 1 / tpot,
                      "per_gpu": batch / tpot}}
-    return {"seq": seq, "label": f"b{batch}", "num_gpus": 1,
+    return {"seq": seq, "parallel": ParallelConfig().to_dict(),
             "sol": {"phases": {"decode": {"batch": batch, "throughput": rates}}},
             "floors": _one_term(tpot),
             "measures": {"decode": {"coverage": coverage}}}

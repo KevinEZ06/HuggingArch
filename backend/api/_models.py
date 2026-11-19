@@ -677,7 +677,10 @@ class ParallelFrontierRequest(BaseModel):
     measured one the measured answer), the phase drawn, the dimensions held
     to a set of values, the ones each drawn line is one value of, and the
     form — each line its Pareto frontier (`frontier`), or its points along
-    `x` (`line`: GPU count, per-GPU decode batch or context).
+    `x` (`line`: GPU count, per-GPU decode batch or context). A frontier
+    may also ask for the envelope over coarser groups of its lines
+    (`envelope_by`: each card's front over all its deployments, drawn over
+    the deployments' own lines).
 
     Which (phase, form) pairs the cloud can actually answer is the cloud's
     own answer, published with every view (`frontier.view_forms`); this
@@ -688,6 +691,7 @@ class ParallelFrontierRequest(BaseModel):
     group_by: List[CloudDim] = Field(default_factory=lambda: ["gpu_sku"])
     form: ViewForm = "frontier"
     x: Optional[LineAxis] = None
+    envelope_by: Optional[List[CloudDim]] = None
 
     @model_validator(mode="after")
     def _x_matches_form(self) -> "ParallelFrontierRequest":
@@ -695,6 +699,9 @@ class ParallelFrontierRequest(BaseModel):
             raise ValueError("a line view names its X axis (x)")
         if self.form == "frontier" and self.x is not None:
             raise ValueError("a frontier view has no X axis; drop x")
+        if self.form == "line" and self.envelope_by is not None:
+            raise ValueError("an envelope is a frontier's; a line view has "
+                             "none — drop envelope_by")
         return self
 
 

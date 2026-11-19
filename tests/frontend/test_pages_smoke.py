@@ -148,10 +148,12 @@ def _frontier_view(phase: str = "decode", points=None) -> dict:
         "series": [{"group": {"gpu_sku": "B200", "mode": "dp_ep"},
                     "frontier": line, "points": line}],
         "values": {"gpu_sku": ["B200"], "mode": ["dp_ep", "tp_tp"],
-                   "num_gpus": [8], "context": [4096], "batch_key": ["b8", "b64"],
+                   "num_gpus": [8], "layout": ["EP8·DP8", "TP8"],
+                   "context": [4096], "batch_key": ["b8", "b64"],
                    "draft_tokens": [0], "acceptance": [1.0], "ep_load_factor": [1.0]},
-        "dims": ["mode", "num_gpus", "gpu_sku", "context", "batch_key",
+        "dims": ["mode", "num_gpus", "layout", "gpu_sku", "context", "batch_key",
                  "draft_tokens", "acceptance", "ep_load_factor"],
+        "fixes": {"layout": ["mode", "num_gpus"]},
         "phase": phase,
         "axes": _FRONTIER_AXES[phase],
         "forms": _FRONTIER_FORMS,
@@ -1023,11 +1025,12 @@ def test_throughput_charts_are_views_the_backend_draws_of_one_cloud(browser_base
     ctx = _frontier_view()["values"]["context"][0]
     assert probe == {**probe, "fix": {"batch_key": ["max"]},
                      "group_by": ["gpu_sku", "mode"], "form": "line", "x": "num_gpus"}
-    # It opens on Pareto, holding Plan's card: one card's layouts against
-    # each other, so its lines split by mode.
+    # It opens on Pareto, holding Plan's card: one line per deployment
+    # through its batches, with the card's envelope over them.
     assert first["form"] == "frontier" and "x" not in first
     assert first["fix"] == {"context": [ctx], "gpu_sku": ["B200"]}
-    assert first["group_by"] == ["gpu_sku", "mode"]
+    assert first["group_by"] == ["gpu_sku", "layout"]
+    assert first["envelope_by"] == ["gpu_sku"]
     s.page.wait_for_timeout(1500)
     assert s.count(view) == 2, "a view re-asked because of its own answer"
 
@@ -1065,8 +1068,8 @@ def test_throughput_charts_are_views_the_backend_draws_of_one_cloud(browser_base
     assert last()["form"] == "frontier"
     assert "x" not in last()
     assert last()["fix"] == {"context": [ctx], "gpu_sku": ["B200"]}
-    # One card on the chart: its lines split by mode.
-    assert last()["group_by"] == ["gpu_sku", "mode"]
+    # Back on Pareto: one line per deployment again.
+    assert last()["group_by"] == ["gpu_sku", "layout"]
     assert last()["phase"] == "decode"
 
     # The other phase of the same cloud: one view asked, the same holds, and
@@ -1076,6 +1079,9 @@ def test_throughput_charts_are_views_the_backend_draws_of_one_cloud(browser_base
     assert last()["phase"] == "prefill"
     assert last()["form"] == "frontier"
     assert last()["fix"] == {"context": [ctx], "gpu_sku": ["B200"]}
+    # Prefill does not move with the batch: a deployment is one point, so
+    # the lines are the modes' ladders.
+    assert last()["group_by"] == ["gpu_sku", "mode"]
     assert s.page.is_disabled("#infer-throughput-form-batch")
     assert "does not move with batch" in (
         s.page.get_attribute("#infer-throughput-form-batch", "title") or "")
@@ -1113,13 +1119,14 @@ def test_throughput_charts_are_views_the_backend_draws_of_one_cloud(browser_base
     assert s.wait_for(lambda: last()["fix"] == {"context": [ctx], "gpu_sku": ["B200"],
                                                 "mode": modes[1:2]})
     tick("infer-throughput-lines", "batch_key")
-    assert s.wait_for(lambda: last()["group_by"] == ["gpu_sku", "mode", "batch_key"])
+    assert s.wait_for(lambda: last()["group_by"] == ["gpu_sku", "layout", "batch_key"])
     # The reader's hold and lines survive a switch; the rest are the form's
     # — Pareto's card was a default, so vs GPUs draws every card again.
     switch("num_gpus")
     assert last().get("x") == "num_gpus"
     assert last()["fix"] == {"context": [ctx], "batch_key": ["max"], "mode": modes[1:2]}
-    assert last()["group_by"] == ["gpu_sku", "mode", "batch_key"]
+    # A deployment fixes its GPU count: along the GPU count it is no line.
+    assert last()["group_by"] == ["gpu_sku", "batch_key"]
     s.assert_clean()
 
 
