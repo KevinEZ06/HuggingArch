@@ -974,6 +974,124 @@ register(Provider(
 
 
 # ---------------------------------------------------------------------------
+# DSA sparse attention — one AscendC launch for the whole `flash_dsa` span.
+#
+# `sparse_mla` (vllm_ascend/attention/sfa_v1.py:172-245) has two arms. The
+# A5 one sorts the selection and goes through `sparse_flash_mla`; A3 takes
+# the `else` at :228 and calls `npu_sparse_flash_attention` directly, with
+# `query_rope=None` and `key_rope=None` — this geometry is absorbed, so
+# there is no rope operand to pass.
+#
+# TWO THINGS THIS CELL CANNOT SAY, recorded rather than worked around:
+#
+#   * `s_kv == n_topk_keys`. The cell's `s_kv` is the rows a query ATTENDS,
+#     not the pool it selects out of (`benchmark_identity._dsa_identity`
+#     says so and names the gap: "no cell axis carries that length yet").
+#     So every index is in range and the selection covers the pool: what
+#     runs is a full unordered gather-and-attend, not a sparse draw from a
+#     larger cache. The indices still come from `refs._mla_sparse_indices`
+#     — a golden-ratio stride, unordered, different per query — so the
+#     gather's access pattern is scattered even though its SET is whole.
+#     The A3 arm does not sort (only A5 does, for its DMA), so passing
+#     them unsorted is what the plugin does.
+#
+#   * `sparse_mode=0`, not the `3` the plugin passes. Mode 3 is
+#     right-down causal, which the plugin can use because online `s_kv`
+#     covers `s_query`; folded to `s_kv < s_query` the first
+#     `s_query - s_kv` rows would have an empty causal window — the kernel
+#     would skip work and time a launch that computed nothing, and the
+#     cross-check against the torch floor (no mask at all,
+#     `attention._torch_sparse_mla_build`: gather, two dots, one softmax)
+#     would fail. Mode 0 is every selected row, which is the floor's
+#     function. The masked mode is a different cell, not this one.
+_SPARSE_MLA_MODE_UNMASKED = 0
+
+
+def _sparse_mla_build(inv: Invocation, env: Env,
+                      inputs: Dict[str, Any]) -> BenchCase:
+    """`npu_sparse_flash_attention` over a paged latent cache."""
+    import torch
+
+    ops = _c_ascend()
+    q = inputs["q"]                     # [B, s_query, n_heads, d_head]
+    cache = inputs["c"]                 # [B, s_kv, d_head]
+    idx = inputs["indices"]             # [B, s_query, n_topk_keys], int32
+    d_v = int(inputs["Dv"])
+    b, s_q, heads, d_head = q.shape
+    s_kv = int(cache.shape[1])
+    scale = float(d_head) ** -0.5
+
+    # The cell carries a contiguous latent; the kernel reads it through a
+    # page table, so the pages are a VIEW padded to a whole page — the
+    # bytes timed stay the cell's. `PA_BSND` with no head axis: one latent
+    # row is the key every head shares (absorbed MLA).
+    pages_per_seq = (s_kv + ASCEND_PAGE - 1) // ASCEND_PAGE
+    blocks = b * pages_per_seq
+    rows = pages_per_seq * ASCEND_PAGE
+    if rows > s_kv:
+        pad = torch.zeros(b, rows - s_kv, d_head,
+                          dtype=cache.dtype, device=cache.device)
+        cache = torch.cat([cache, pad], dim=1)
+    # `PA_BSND` is [blocks, page, heads, d]: four dims, and the tiling
+    # refuses three ("kvDimNum must be 4, but now is 3",
+    # `sparse_flash_attention_tiling.cpp:1824`). An absorbed latent has one
+    # row per token shared by every head, so the head axis is 1 — the
+    # layout's shape, not a second copy of the cache.
+    kv_pages = cache.reshape(blocks, ASCEND_PAGE, 1, d_head).contiguous()
+    table = (torch.arange(blocks, dtype=torch.int32, device=q.device)
+             .reshape(b, pages_per_seq))
+
+    # TND for the query: the token axis is flattened and the sequence
+    # boundaries ride on `actual_seq_lengths_query`, as the plugin passes
+    # them (`metadata.query_start_loc[1:]`).
+    q_tnd = q.reshape(b * s_q, heads, d_head).contiguous()
+    # The selection keeps its head axis even where every head shares one
+    # row: the tiling wants rank 3 ("sparse_indices dimension is 2,
+    # expected dimension is 3", `sparse_flash_attention_tiling.cpp:566`),
+    # so the shared selection is broadcast to [T, 1, topk] rather than
+    # flattened with the token axis.
+    idx_tnd = idx.reshape(b * s_q, 1, -1).contiguous()
+    cu_q = torch.tensor([(i + 1) * s_q for i in range(b)],
+                        dtype=torch.int32, device=q.device)
+    seq_kv = torch.tensor([s_kv] * b, dtype=torch.int32, device=q.device)
+
+    def run():
+        return ops.npu_sparse_flash_attention(
+            query=q_tnd, key=kv_pages, value=kv_pages,
+            sparse_indices=idx_tnd, scale_value=scale,
+            sparse_block_size=1, block_table=table,
+            actual_seq_lengths_query=cu_q, actual_seq_lengths_kv=seq_kv,
+            query_rope=None, key_rope=None,
+            layout_query="TND", layout_kv="PA_BSND",
+            sparse_mode=_SPARSE_MLA_MODE_UNMASKED, attention_mode=2,
+            return_softmax_lse=False)
+
+    def canonical(out):
+        o = out[0] if isinstance(out, (list, tuple)) else out
+        # [B·s_query, n_heads, d_v] -> the floor's [B, s_query, n_heads, d_v]
+        return o.reshape(b, s_q, heads, -1)[..., :d_v].float()
+
+    return BenchCase(run=run, to_canonical=canonical)
+
+
+register(Provider(
+    library="vllm_ascend", signature="mla_sparse_attention",
+    kernel_impl="npu_sparse_flash_attention",
+    import_name="torch_npu",
+    build=_sparse_mla_build, fused_op="flash_dsa",
+    serves=KernelSignature(signature="mla_sparse_attention",
+                           activation=_ASCEND_FLOAT,
+                           dtype_slots=(("kv", _ASCEND_FLOAT),),
+                           # The page the plugin allocates the latent in.
+                           # Without it this signature has no page on an
+                           # Ascend box at all (`served_kv_block_sizes`
+                           # narrows by the card's device) and no job is
+                           # ever planned for the cell.
+                           kv_block_sizes=(ASCEND_PAGE,)),
+))
+
+
+# ---------------------------------------------------------------------------
 # HCCL collectives.
 #
 # A group of `n_comm_ranks` processes, each on its own die, with the
