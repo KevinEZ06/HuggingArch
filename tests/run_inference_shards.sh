@@ -17,7 +17,12 @@
 #   shard3  393 passed               19:57
 #   shard4  167 passed               14:56
 #   合计 1181 passed, 3 skipped, 0 failed —— 墙钟 47 分钟
-set -u
+# `-e` is deliberately NOT set: a shard that fails must not stop the script
+# before the others are waited on and summarised — reporting which shards
+# failed is this script's whole job, and the failure is raised at the end.
+# `pipefail` is, so a `cmd | tail` cannot report the exit of `tail`; that is
+# exactly how a `kernel_bench run` exit of 3 once read as 0 here.
+set -uo pipefail
 
 SHARDS="${SHARDS:-4}"
 OUT="${OUT:-/tmp/inference_shards}"
@@ -56,11 +61,28 @@ echo "===== 汇总 ====="
 tp=0; ts=0; tf=0
 for i in $(seq 1 "$SHARDS"); do
   [ -f "$OUT/shard$i.log" ] || continue
-  line=$(grep -E "[0-9]+ (passed|failed|error)" "$OUT/shard$i.log" | tail -1)
-  printf "  shard%-3s %s\n" "$i" "${line:-（无总结行，看 $OUT/shard$i.log）}"
-  tp=$((tp + $(echo "$line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo 0)))
-  ts=$((ts + $(echo "$line" | grep -oE '[0-9]+ skipped' | grep -oE '[0-9]+' || echo 0)))
-  tf=$((tf + $(echo "$line" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo 0)))
+  line=$(grep -E "[0-9]+ (passed|failed|error)" "$OUT/shard$i.log" | tail -1) || line=""
+  if [ -z "$line" ]; then
+    # No summary line: killed by a timeout, or still running. Not zero
+    # tests — unknown, which must not read as a clean shard.
+    printf "  shard%-3s （无总结行，看 %s）\n" "$i" "$OUT/shard$i.log"
+    fail=1
+    continue
+  fi
+  printf "  shard%-3s %s\n" "$i" "$line"
+  # pytest writes "281 passed, 3 skipped, 119 deselected in 2818s", so the
+  # counts are comma-separated fields: split on the comma and anchor each
+  # pattern, or a greedy `.*` eats all but the last digit ("281" read as
+  # "1"). `sed -n` prints nothing and exits 0 for an outcome that did not
+  # occur, which `pipefail` requires — `grep -o` would exit 1 and abort.
+  n_of() {
+    printf '%s\n' "$line" | tr ',' '\n' \
+      | sed -nE "s/^ *([0-9]+) $1.*/\1/p" | head -1
+  }
+  n_passed=$(n_of passed); n_skipped=$(n_of skipped); n_failed=$(n_of failed)
+  tp=$((tp + ${n_passed:-0}))
+  ts=$((ts + ${n_skipped:-0}))
+  tf=$((tf + ${n_failed:-0}))
 done
 echo "  ----"
 echo "  合计 ${tp} passed, ${ts} skipped, ${tf} failed"
