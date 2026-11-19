@@ -254,18 +254,37 @@ kernel_dispatches:
     when: {device: [npu], activation_dtype: [int8]}
     source_anchor: "W8A8_DYNAMIC packed projection: npu_dynamic_quant then npu_quant_matmul with the per-channel weight scale and the per-token activation scale (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:104-131)"
 
-  # NOT declared here, and the reason is the same for all four:
-  # `moe_fused_gate`, `topk`, `permute` and `combine` have no single
-  # kernel on this plugin. The gate's is chosen by
-  # `check_npu_moe_gating_top_k` from the checkpoint's `scoring_func`,
-  # `renormalize` and group widths (`ops/fused_moe/router/
-  # router_factory.py:15-33, :80-88`); `permute` and `combine` ARE the
-  # dispatch, and which kernel runs them follows the MoE communication
-  # method picked at runtime (AllGather / AllToAll / MC2 / FusedMC2,
-  # `ops/fused_moe/moe_comm_method.py:61-75`). A single `impl_id` for any
-  # of them would be a declaration that is false on another deployment,
-  # so they stay `ambiguous` — a visible gap — until the condition
-  # vocabulary can state what selects them.
+  # `moe_fused_gate` and `topk` are still NOT declared: the gate's kernel
+  # is chosen by `check_npu_moe_gating_top_k` from the checkpoint's
+  # `scoring_func`, `renormalize` and group widths (`ops/fused_moe/router/
+  # router_factory.py:15-33, :80-88`), which is not a deployment fact.
+  #
+  # `permute` and `combine` ARE the MoE dispatch, and above one expert
+  # rank the kernel that runs them follows a communication method chosen
+  # per step (AllGather / AllToAll / MC2 / FusedMC2). But at `ep_moe: 1`
+  # there is nothing to choose: `setup_moe_comm_method` registers all four
+  # implementations only when `moe_config.ep_size > 1`, and its `else`
+  # branch registers AllGather ALONE (`ops/fused_moe/moe_comm_method.py:
+  # 68-75`). So the unsharded expert world is a declaration, not a
+  # preference, and the two rows below state it.
+  #
+  # Above `ep_moe: 1` they stay `ambiguous` on purpose. The remaining
+  # branches turn on `num_tokens <= mc2_tokens_capacity`
+  # (`ascend_forward_context.py:330`), a per-step token count whose
+  # threshold is computed at startup (~512 x tp, `:271-274`). `phase`
+  # would be a proxy for it, not a statement of it, so it is not used
+  # here: a prefill chunk is USUALLY over the capacity and a decode batch
+  # USUALLY under, but "usually" is not what a dispatch declares.
+  - op: permute
+    library: vllm_ascend
+    impl_id: npu_moe_init_routing_v2
+    when: {device: [npu], expert_parallel: [1]}
+    source_anchor: "With one expert rank, setup_moe_comm_method registers AllGatherCommImpl alone (vllm_ascend/ops/fused_moe/moe_comm_method.py:68-75); its dispatcher pre-processes with torch_npu.npu_moe_init_routing_v2 (vllm_ascend/ops/fused_moe/moe_comm_method.py:210-233)"
+  - op: combine
+    library: vllm_ascend
+    impl_id: npu_moe_token_unpermute
+    when: {device: [npu], expert_parallel: [1]}
+    source_anchor: "The same AllGather implementation post-processes with torch_npu.npu_moe_token_unpermute, chosen over npu_moe_finalize_routing because that one is documented to lose accuracy (vllm_ascend/ops/fused_moe/moe_comm_method.py:216-226)"
 
   # Tensor-parallel collectives, which on this plugin have exactly one
   # path. `NPUCommunicator` does not override `all_reduce`, so it takes

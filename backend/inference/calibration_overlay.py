@@ -123,6 +123,11 @@ class DeploymentContext:
     #: dispatch audited only on the unsharded embedding path reads it; this
     #: is a request/deployment fact, not a graph-match condition.
     tensor_parallel: int = 1
+    #: The degree of the MoE expert-parallel world (`ParallelConfig.ep_moe`).
+    #: A framework that selects a different dispatch/combine kernel once the
+    #: experts are spread across ranks reads it. Same standing as
+    #: `tensor_parallel` — a deployment fact — and a separate world from it.
+    expert_parallel: int = 1
 
 
 @dataclass(frozen=True)
@@ -672,7 +677,8 @@ def point_row_of(row: Mapping[str, Any], identity: RowIdentity,
         else binding.deployed(replace(
             binding.deployment,
             kv_block_size=deployment.kv_block_size,
-            tensor_parallel=deployment.tensor_parallel)))
+            tensor_parallel=deployment.tensor_parallel,
+            expert_parallel=deployment.expert_parallel)))
     bindings = op_bindings()
     op, shape_json, (shape_in, shape_out) = identity.of_event(row)
     signature = bindings.get(op)
@@ -844,6 +850,7 @@ def build_deployment_context(
     """
     sig = parallel_signature(parallel)
     tp = 1 if parallel is None else parallel.tp_attention
+    ep = 1 if parallel is None else parallel.ep_moe
     return DeploymentContext(
         framework=framework,
         framework_binding=framework_binding,
@@ -851,7 +858,8 @@ def build_deployment_context(
         gpu_sku=gpu_sku,
         phase=phase,
         kv_block_size=deployment_kv_block_size(framework_binding, kv_block_size),
-        tensor_parallel=tp)
+        tensor_parallel=tp,
+        expert_parallel=ep)
 
 
 def parallel_signature(parallel: Any) -> str:

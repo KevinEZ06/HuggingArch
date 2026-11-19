@@ -174,6 +174,12 @@ class ServingDeployment:
     #: The vocabulary-parallel tensor-parallel degree (the attention TP
     #: world), or None when the caller did not state a parallel deployment.
     tensor_parallel: Optional[int] = None
+    #: The expert-parallel degree (`ParallelConfig.ep_moe`, the `moe_copies`
+    #: world), or None when the caller did not state a parallel deployment.
+    #: A framework that picks a different MoE kernel once the experts are
+    #: spread across ranks reads this, not `tensor_parallel`: the two are
+    #: separate worlds and a MoE dispatch asks about the expert one.
+    expert_parallel: Optional[int] = None
     #: The MMA families the described card's SKU row lists peaks for
     #: (`gpu_specs.peak_families`). This is the capability half of a
     #: precision-launch choice: a default candidate needs every declared
@@ -190,6 +196,7 @@ class ServingDeployment:
            compute_capability: Optional[str] = None,
            kv_block_size: Optional[int] = None,
            tensor_parallel: Optional[int] = None,
+           expert_parallel: Optional[int] = None,
            peak_families: Tuple[str, ...] = ()) -> "ServingDeployment":
         flags = []
         for name, value in (server_flags or {}).items():
@@ -203,13 +210,14 @@ class ServingDeployment:
                     f"integer, not {value!r}")
         return cls(tuple(sorted(flags)), activation_dtype, device,
                    compute_capability, kv_block_size, tensor_parallel,
-                   tuple(peak_families))
+                   expert_parallel, tuple(peak_families))
 
     @classmethod
     def at(cls, *, gpu_sku: Optional[str], activation_dtype: Optional[str],
            server_flags: Optional[Mapping[str, ServerOption]] = None,
            kv_block_size: Optional[int] = None,
-           tensor_parallel: Optional[int] = None) -> "ServingDeployment":
+           tensor_parallel: Optional[int] = None,
+           expert_parallel: Optional[int] = None) -> "ServingDeployment":
         """The deployment an estimate request describes: its GPU SKU's
         `device` and `compute_capability` (`gpu_specs.csv`), its activation
         dtype, and the server options it set. A SKU or a dtype the tables do
@@ -226,6 +234,7 @@ class ServingDeployment:
                       if gpu is not None else None,
                       kv_block_size=kv_block_size,
                       tensor_parallel=tensor_parallel,
+                      expert_parallel=expert_parallel,
                       peak_families=(peak_families(gpu)
                                      if gpu is not None else ()))
 
@@ -411,6 +420,13 @@ class DispatchCondition:
     * `tensor_parallel: [<degree>, ...]` — the degree of the vocabulary/
       attention tensor-parallel world. It scopes a declaration audited only
       on an unsharded deployment; PP/EP alone do not change it.
+    * `expert_parallel: [<degree>, ...]` — the degree of the MoE
+      expert-parallel world (`ParallelConfig.ep_moe`). A framework whose MoE
+      dispatch/combine kernel changes once the experts are spread across
+      ranks states that here: vLLM-Ascend registers only the all-gather
+      path while the expert world is one rank, and selects among several
+      others above it (vllm_ascend/ascend_forward_context.py:397-398).
+      `tensor_parallel` is a different world and does not answer it.
     * `device: [...]` — the GPU SKU's `device` (`gpu_specs.csv`).
     * `min_compute_capability: "<major>.<minor>"` — the GPU SKU's CUDA
       compute capability (`gpu_specs.csv`) is at least this, the threshold a
@@ -437,6 +453,7 @@ class DispatchCondition:
     activation_dtype: Tuple[str, ...] = ()
     kv_block_size: Tuple[int, ...] = ()
     tensor_parallel: Tuple[int, ...] = ()
+    expert_parallel: Tuple[int, ...] = ()
     device: Tuple[str, ...] = ()
     min_compute_capability: Optional[Tuple[int, int]] = None
     below_compute_capability: Optional[Tuple[int, int]] = None
@@ -453,7 +470,7 @@ class DispatchCondition:
 
     KEYS = frozenset({"server_flag", "activation_dtype", "output_dtype",
                       "device",
-                      "kv_block_size", "tensor_parallel",
+                      "kv_block_size", "tensor_parallel", "expert_parallel",
                       "min_compute_capability", "below_compute_capability",
                       "unquantized_bf16_launch",
                       "architectures",
@@ -479,7 +496,7 @@ class DispatchCondition:
     #: cards of one walk class answer them alike by construction.
     DEPLOYMENT_KEYS: ClassVar[FrozenSet[str]] = frozenset(
         {"server_flag", "activation_dtype", "kv_block_size",
-         "tensor_parallel"})
+         "tensor_parallel", "expert_parallel"})
     #: The keys the precision-resolved LAUNCH decides, supplied per row by
     #: `point_keys` after `precision_launches` has materialized the walk.
     #: They are neither card nor request facts and are never guessed from a
@@ -519,7 +536,11 @@ class DispatchCondition:
                 and (not self.tensor_parallel
                      or (deployment.tensor_parallel is not None
                          and deployment.tensor_parallel
-                         in self.tensor_parallel)))
+                         in self.tensor_parallel))
+                and (not self.expert_parallel
+                     or (deployment.expert_parallel is not None
+                         and deployment.expert_parallel
+                         in self.expert_parallel)))
 
     def holds_for_card(self, deployment: ServingDeployment) -> bool:
         """Whether the CARD's facts satisfy this condition's card keys
@@ -553,6 +574,7 @@ class DispatchCondition:
                            ("output_dtype", self.output_dtype),
                            ("kv_block_size", self.kv_block_size),
                            ("tensor_parallel", self.tensor_parallel),
+                           ("expert_parallel", self.expert_parallel),
                            ("device", self.device)):
             if value:
                 out[key] = list(value)
@@ -635,7 +657,7 @@ class DispatchCondition:
                 raise ValueError(f"{where}: `when.{key}` is a list of integers")
             return tuple(value)
 
-        for key in ("kv_block_size", "tensor_parallel"):
+        for key in ("kv_block_size", "tensor_parallel", "expert_parallel"):
             if any(value <= 0 for value in integers(key)):
                 raise ValueError(
                     f"{where}: `when.{key}` is a list of positive integers")
@@ -721,6 +743,7 @@ class DispatchCondition:
                                for n in names("output_dtype")),
             kv_block_size=integers("kv_block_size"),
             tensor_parallel=integers("tensor_parallel"),
+            expert_parallel=integers("expert_parallel"),
             device=tuple(n.lower() for n in names("device")),
             min_compute_capability=minimum,
             below_compute_capability=below,
@@ -1638,6 +1661,7 @@ def _conditions_can_overlap(left: DispatchCondition,
             (left.activation_dtype, right.activation_dtype),
             (left.kv_block_size, right.kv_block_size),
             (left.tensor_parallel, right.tensor_parallel),
+            (left.expert_parallel, right.expert_parallel),
             (left.device, right.device),
             (left.graph.phase, right.graph.phase),
             (left.graph.head_dim, right.graph.head_dim)):
