@@ -235,6 +235,12 @@ kernel_dispatches:
     when: {device: [npu], architectures: [Glm5NextForConditionalGeneration]}
     source_anchor: "Glm5NextDecoderLayer.hc_post -> torch.ops._C_ascend.npu_hc_post (vllm_ascend/models/glm5next/model.py:523-525), registered npu_hc_post_npu -> EXEC_NPU_CMD(aclnnHcPost) (csrc/torch_binding.cpp:1434); profiler `HcPost`"
 
+  - op: flash_dsa
+    library: vllm_ascend
+    impl_id: npu_sparse_flash_attention
+    when: {device: [npu], architectures: [Glm5NextForConditionalGeneration]}
+    source_anchor: "sparse_mla -> torch.ops._C_ascend.npu_sparse_flash_attention (vllm_ascend/attention/sfa_v1.py:228), one launch per layer; profiler `SparseFlashAttention`"
+
 op_implementations:
   # Residual add + RMSNorm: AscendRMSNorm.forward_oot with a residual makes
   # one npu_add_rms_norm_bias call (one aclnnAddRmsNormBias), prefill and
@@ -322,6 +328,19 @@ op_implementations:
       architectures: [Glm5NextForConditionalGeneration]
       device: [npu]
     source_anchor: "Glm5NextDecoderLayer.hc_post -> torch.ops._C_ascend.npu_hc_post(x, residual, post, comb) (vllm_ascend/models/glm5next/model.py:523-525), registered npu_hc_post_npu -> EXEC_NPU_CMD(aclnnHcPost) (csrc/torch_binding.cpp:1434); the last layer materialises its own (vllm_ascend/models/glm5next/model.py:484) and every other defers it into the next layer's pre (vllm_ascend/models/glm5next/model.py:536)"
+
+  # DSA's sparse main attention is ONE AscendC launch, not the three ops
+  # the naive plan spells it as. `sparse_mla` gathers the top-K KV entries
+  # inside the kernel — no score or softmax tensor reaches HBM — so the
+  # span is `flash_dsa`'s whole chain, exactly as it is on CUDA.
+  # Unbound, the three members priced separately and stayed `unplaced`
+  # (`missing_signature`) at 215 ms a step, larger than the attention
+  # class they belong to.
+  flash_dsa:
+    when:
+      architectures: [Glm5NextForConditionalGeneration]
+      device: [npu]
+    source_anchor: "sparse_mla -> torch.ops._C_ascend.npu_sparse_flash_attention(query, key=cache, value=cache, sparse_indices, sparse_mode=3, attention_mode=2) (vllm_ascend/attention/sfa_v1.py:172-245, the call at vllm_ascend/attention/sfa_v1.py:228); the profiler names it SparseFlashAttention"
 
   fused_gdn_gating:
     source_anchor: "fused_gdn_gating_patch (vllm_ascend/ops/triton/fused_gdn_gating.py:59-99, kernel vllm_ascend/ops/triton/fused_gdn_gating.py:14-56) via DeviceOperator.fused_gdn_gating (vllm_ascend/device/device_op.py:940-942), from AscendGatedDeltaNetAttention._forward_core (vllm_ascend/ops/gdn.py:680)"
