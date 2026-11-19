@@ -1879,7 +1879,7 @@ def test_gallery_speculative_switch_reasks_the_frontier_under_its_draft(browser_
     assert "DeepSeek-V3.2" in s.page.inner_text("#g-front-no-draft")
     errors = s.page.inner_text("#g-front-draft-errors")
     assert "TP8" in errors and "verify refused" in errors
-    assert "one link latency" in s.page.inner_text("#g-front-footnote")
+    assert "RDMA hop latency" in s.page.inner_text("#g-front-footnote")
     before = s.count("/gallery/frontier")
     s.page.select_option("#g-spec-k", str(FRONTIER_DRAFT_TOKENS[-1]))
     assert s.wait_for(lambda: s.count("/gallery/frontier") > before)

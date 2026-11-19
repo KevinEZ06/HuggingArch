@@ -58,6 +58,21 @@ class GPUSpec:
     nvls: str
     pcie_gbps: Optional[float]
     rdma_gbps: Optional[float]
+    #: What one link traversal across nodes (the RDMA fabric) waits on
+    #: BEYOND one inside a node, µs — an excess, not an absolute: a
+    #: cross-node hop waits the request's link latency plus this
+    #: (`comm_cost.Fabric.hop_latency`). It is the NIC, the switch and the
+    #: proxy a cross-node step goes through. Derived from NCCL's own tuning
+    #: model (NVIDIA/nccl v2.27.7-1, src/graph/tuning.cc:143-155, `hwLat`):
+    #: a network step less an NVLink step on the Tree/LL row — Tree because
+    #: the hops here are a log-depth schedule (`comm_volume.latency_hops`),
+    #: as a tree's are, and the row NCCL itself reads when one rank per node
+    #: exposes the network latency (the Ring/LL row would give less than
+    #: half). A PCIe card's step is NCCL's 1.0 µs, not NVLink's 0.6, and
+    #: a 100 GbE card would run NCCL's socket transport, slower still; the
+    #: sheet charges both the InfiniBand figure, optimistic there. Empty
+    #: with no RDMA column: no cross-node path to wait on.
+    rdma_hop_latency_us: Optional[float]
     #: HBM capacity as the vendor sheet prints it ("80GB"). The sheet says
     #: GB but the figure is binary: HBM stacks come in power-of-two sizes,
     #: so H100's "80GB" is 80 GiB (nvidia-smi: 81559 MiB). Bandwidth columns
@@ -134,6 +149,7 @@ def load_gpu_specs() -> list[GPUSpec]:
     for spec in specs:
         check_compute_capability(spec)
         check_nvls(spec)
+        check_rdma_hop_latency(spec)
         check_memory_bandwidth(spec)
     return specs
 
@@ -233,6 +249,8 @@ PEAK_COLUMNS: Mapping[str, str] = _peak_columns()
 #:     `intra_bw_label`; `nvlink_gbps` also says the card has an NVLink
 #:     domain (`has_nvlink_domain`);
 #:   * `rdma_gbps`   — `peak_inter_bw_bytes_per_sec`, `inter_bw_label`;
+#:   * `rdma_hop_latency_us` — `inter_hop_latency_s`, what a cross-node
+#:     link traversal adds to the request's link latency;
 #:   * `nvls`        — `has_nvls`, which all-reduce the switch admits;
 #:   * `gpus_per_node` — `gpus_per_node`, whether a group stays in a node;
 #:   * `compute_capability` — a collective rung's own window
@@ -244,7 +262,7 @@ PEAK_COLUMNS: Mapping[str, str] = _peak_columns()
 #: (`framework_bindings._check_card_fact_classification`).
 PRICE_COLUMNS: FrozenSet[str] = frozenset({
     "mem_gib", "mem_bw_gbps", "nvlink_gbps", "pcie_gbps", "rdma_gbps",
-    "nvls", "gpus_per_node", "compute_capability", *PEAK_COLUMNS.values()})
+    "rdma_hop_latency_us", "nvls", "gpus_per_node", "compute_capability", *PEAK_COLUMNS.values()})
 
 #: The sheet columns no walk and no number reads — what a row says about
 #: itself, for a reader. Explicit, one entry per column with why: the third
@@ -384,6 +402,29 @@ def peak_inter_bw_bytes_per_sec(gpu: GPUSpec) -> Optional[float]:
     if gpu is None:
         return None
     return gbps_to_bytes_per_sec(inter_node_bw_gbps(gpu.rdma_gbps))
+
+
+def check_rdma_hop_latency(spec: GPUSpec) -> None:
+    """A row with an RDMA fabric states what a hop across it waits beyond
+    one inside a node: refused at load, not when a cross-node collective
+    first asks (`inter_hop_latency_s`)."""
+    if (inter_node_bw_gbps(spec.rdma_gbps) is not None
+            and spec.rdma_hop_latency_us is None):
+        raise ValueError(
+            f"gpu_specs.csv: {spec.sku} has an RDMA fabric and no "
+            "rdma_hop_latency_us; every SKU with one states it")
+
+
+def inter_hop_latency_s(gpu: GPUSpec) -> float:
+    """What one cross-node link traversal waits on beyond one inside a
+    node, seconds (`GPUSpec.rdma_hop_latency_us`). Zero with no RDMA
+    fabric: nothing crosses nodes. A card WITH an RDMA fabric that does not
+    state it is a sheet bug, not zero — zero is the one-latency-for-every-
+    fabric pricing this column exists to replace."""
+    if gpu is None or inter_node_bw_gbps(gpu.rdma_gbps) is None:
+        return 0.0
+    check_rdma_hop_latency(gpu)
+    return float(gpu.rdma_hop_latency_us) * 1e-6
 
 
 def gpus_per_node(gpu: GPUSpec) -> int:

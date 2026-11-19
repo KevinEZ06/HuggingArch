@@ -45,8 +45,10 @@ MOE_DP_EP_DEGREE_DEFAULT = 8
 def moe_dp_ep_degree(gpu_sku: str) -> int:
     return MOE_DP_EP_DEGREE.get(gpu_sku, MOE_DP_EP_DEGREE_DEFAULT)
 
-# One link traversal's latency, in µs, the same on every link — NVLink,
-# PCIe, InfiniBand or RoCE — at this granularity. A collective pays it once
+# One link traversal's latency, in µs, on every link — NVLink, PCIe,
+# InfiniBand or RoCE; a traversal across nodes also waits the card's RDMA
+# hop latency (`gpu_specs.csv` `rdma_hop_latency_us`, a card fact, not this
+# floor; `comm_cost.Fabric.hop_latency`). A collective pays it once
 # per traversal its algorithm waits on in sequence (`comm_volume.ALGORITHMS`:
 # a one-shot all-reduce 1, a two-shot or NVLS one 2 — what a framework runs
 # inside an NVLink domain, `comm_cost.collective_ladder` — and NCCL's

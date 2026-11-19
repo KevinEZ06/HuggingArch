@@ -664,7 +664,7 @@ export function Gallery() {
   ) : null;
   const frontFootnote = (
     <p id="g-front-footnote" className="-mt-3 mb-6 px-1 text-xs text-gray-400">
-      SOL is a speed-of-light roofline: each kernel at max(compute, memory, comm, launch), kernels serial with no compute/comm overlap, and one link latency for every fabric (NVLink, PCIe and RDMA alike).
+      SOL is a speed-of-light roofline: each kernel at max(compute, memory, comm, launch), kernels serial with no compute/comm overlap, and every link hop at the link latency, a hop across nodes also at the card's RDMA hop latency (gpu_specs.csv, after NCCL's own tuning model).
     </p>
   );
 
@@ -848,7 +848,7 @@ export function Gallery() {
               </select>
 )}
           </label>
-          <label className="block text-xs" title="One link traversal's latency, the same on every link. A collective pays it once per hop its schedule waits on: an all-reduce of N ranks 2·log2 N, a reduce-scatter / all-gather / all-to-all log2 N. Applies on Enter or leaving the box.">
+          <label className="block text-xs" title="One link traversal's latency inside a node; a hop across nodes waits this plus the card's RDMA hop latency. A collective pays it once per hop its schedule waits on: an all-reduce of N ranks 2·log2 N, a reduce-scatter / all-gather / all-to-all log2 N. Applies on Enter or leaving the box.">
             <span className="font-medium text-gray-600">Link latency (µs)</span>
             <input id="g-comm-latency" type="number" min={0} step={0.5}
               className="mt-1 block w-28 text-sm border border-gray-300 rounded-lg px-3 py-1.5"

@@ -381,7 +381,8 @@ class _FloorTerms:
     A step's time is `Σ_k w_k x Max(arms_k)` (`StepSum`, `build_row_exprs`):
     each arm is a row's compute, memory, collective or launch time, and
     only the last two read a floor — a collective's fixed time is its link
-    traversals times the link latency (`COMM_LATENCY_S_<collective>`), a
+    traversals times the link latency, plus its cross-node traversals'
+    RDMA latency (`COMM_LATENCY_S_<collective>`, affine in the floor), a
     launch is `LAUNCH_S`. This is that sum read off the law's own CSE graph
     — one graph output per step term (`term_k`, `StepSum.term_laws`) —
     every weight and arm an output of one program over the graph's
@@ -1447,7 +1448,7 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
 class FloorCard:
     """A card's binding of a law with the two floors apart: the card's
     values at both floors 0 (`zero`) and at both 1 s (`unit`) — a
-    collective's fixed time is linear in the link latency
+    collective's fixed time is affine in the link latency
     (`comm_cost.collective_latency`), a launch is `LAUNCH_S` — and the
     floors a point is read at (`floors_s`: link latency, launch floor)."""
     zero: Mapping[str, float]

@@ -147,8 +147,8 @@ class TestGPUSpecsBandwidthLanes(unittest.TestCase):
             fp32_tflops=None, tf32_tflops=None, bf16_tflops=None,
             fp16_tflops=None, int8_tops=None, fp8_tflops=None,
             fp4_tflops=None, nvlink_gbps=None, nvls="no", pcie_gbps=None,
-            rdma_gbps=None, mem_gib=None, mem_type="", mem_bw_gbps=None,
-            tdp_w=None, gpus_per_node=None,
+            rdma_gbps=None, rdma_hop_latency_us=None, mem_gib=None,
+            mem_type="", mem_bw_gbps=None, tdp_w=None, gpus_per_node=None,
         )
         self.assertEqual(intra_bw_label(empty), "")
         self.assertEqual(inter_bw_label(empty), "")
@@ -171,7 +171,7 @@ class TestPeakFlopsByName(unittest.TestCase):
             bf16_tflops=None, fp16_tflops=None,
             int8_tops=None, fp8_tflops=None, fp4_tflops=None,
             nvlink_gbps=None, nvls="no", pcie_gbps=None, rdma_gbps=None,
-            mem_gib=None, mem_type="", mem_bw_gbps=None, tdp_w=None,
+            rdma_hop_latency_us=None, mem_gib=None, mem_type="", mem_bw_gbps=None, tdp_w=None,
         )
         kwargs.update(peaks)
         return GPUSpec(**kwargs)

@@ -57,8 +57,11 @@ t_comm    = a collective, per phase of its schedule (inference/comm_cost.py):
               payload × ring_factor / link_bw            (β: the intra-node link
                                                           inside a node, the
                                                           inter-node link across)
-            + count × hops × link_latency                (α: the algorithm's hops,
-                                                          comm_volume.ALGORITHMS)
+            + count × hops × hop_latency                 (α: the algorithm's hops,
+                                                          comm_volume.ALGORITHMS;
+                                                          a cross-node hop also
+                                                          waits the card's RDMA
+                                                          hop latency)
 t_launch  = count × launch_floor   for a row that is not a collective and does
             any work (FLOPs, activations, weights or metadata); 0 otherwise
 ```
@@ -110,9 +113,25 @@ measures empty and small collectives and launches.
   `2 ceil(log2 N)`; a hierarchical collective adds its phases' counts. For
   large messages NCCL may pick a bandwidth-optimal ring with more steps, but
   there the β term dominates.
-- *One link latency for every fabric.* NVLink, PCIe, InfiniBand and RoCE pay
-  the same α per traversal — a deliberate simplification, so a hierarchical
-  64-GPU all-reduce pays 24 traversals at the same α whatever links they cross.
+- *A hop across nodes waits longer than one inside.* Every traversal waits
+  the link latency α (the floor above); a traversal on the inter-node fabric
+  also waits the card's RDMA hop latency (`gpu_specs.csv`
+  `rdma_hop_latency_us`, `comm_cost.Fabric.hop_latency`) — the NIC, the
+  switch and the proxy a cross-node step goes through. It is an excess over
+  an intra-node hop, not an absolute: NCCL's own tuning model charges a
+  network step 5.0 µs against an NVLink step's 0.6 µs (`hwLat`, Tree/LL;
+  NVIDIA/nccl v2.27.7-1, `src/graph/tuning.cc:143-155`), so the sheet states
+  the difference, 4.4 µs, on every card with an RDMA column. Tree, because the
+  hops here are a log-depth schedule as a tree's are, and it is the row NCCL
+  reads when one rank per node exposes the network latency; the Ring/LL row
+  would give 2.1 µs. On PCIe cards (NCCL's PCI step is 1.0 µs) and on the
+  RTX-4090's 100 GbE (NCCL's socket transport, slower still) the figure is
+  optimistic. So a 16-GPU hierarchical all-reduce on 8-GPU nodes waits 6
+  intra hops at α and 2 inter hops at α + 4.4 µs. It is a
+  card fact, not a floor: setting α to 0 leaves it, as it leaves the
+  bandwidth term. Until it was declared, every fabric paid the one α, and a
+  decode that spreads its experts over 128 or 256 GPUs across racks priced
+  its per-layer all-to-alls as if they never left the NVLink domain.
   The bandwidth term still prices each phase on its own link.
 
 **No overlap.** Rows are serial: the step is the sum of its rows, and no

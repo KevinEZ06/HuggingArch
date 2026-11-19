@@ -406,6 +406,25 @@ class TestTheCardFormIsTheLaw:
         again = CardForm.from_json(json.loads(json.dumps(form.to_json())))
         assert again == form
 
+    def test_across_nodes_the_rdma_hop_is_a_card_fact_not_the_floor(self):
+        """Experts spread over two 8-GPU nodes: the routed exchange's node
+        level waits the card's RDMA hop latency on top of the link latency
+        at every hop (`Fabric.hop_latency`). That part is no floor — it is
+        still there at α = 0 — and the form, which reads the fixed time at
+        α = 0 and 1 s, is the estimate at every floor."""
+        parallel = ParallelConfig(dp_attention=16, ep_moe=16)
+        estimates = _estimates("Qwen/Qwen3-30B-A3B", "H100-SXM", parallel,
+                               decode_batch_size=2)
+        form = _card_form(next(iter(estimates.values())))
+        _assert_form_is_the_estimates(form, "H100-SXM", estimates)
+        free = estimates[(0.0, 0.0)]["per_op_timing_decode"]
+        inter = [ph for row in free for ph in row.get("comm_phases") or ()
+                 if ph["fabric"] == "inter"]
+        assert inter, "a 16-way exchange on 8-GPU nodes crosses them"
+        for ph in inter:
+            assert ph["hop_latency_s"] == pytest.approx(4.4e-6)
+            assert ph["latency_s"] > 0
+
     def test_on_another_card_of_its_class_it_is_that_cards_estimate(self):
         """The rows walked on H100 bound to H200 — another HBM bandwidth,
         the collectives' ranges re-decided on its fabric — are what an

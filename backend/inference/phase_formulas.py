@@ -807,16 +807,16 @@ def _t_comm_formula_for_row(
     comm_bytes_formula: Optional[Dict[str, Any]],
     comm_phases: List[Dict[str, Any]],
     cnt: int,
-    link_latency_s: float = 0.0,
 ) -> Optional[Dict[str, Any]]:
     """The `t_comm` tooltip of a collective row: `bytes / bandwidth
     (fabric) + n × hops × link_latency = time`, and for a hierarchical
     collective (intra RS + inter AR + intra AG) one subterm per phase, each
     at one invocation (`cnt` invocations make the row) with its own hops.
     The hops are each phase's, by the algorithm that runs it (`algorithm`
-    and `hops` on the phase rows `price_collective` returns); the note names
-    a one-phase collective's algorithm. `link_latency_s` is one
-    traversal's.
+    and `hops` on the phase rows `price_collective` returns), and so is one
+    traversal's latency (`hop_latency_s`: a cross-node phase waits longer
+    per hop, `comm_cost.Fabric.hop_latency`); the note names a one-phase
+    collective's algorithm.
     None for a row that moves nothing."""
     if not comm_bw_label or not comm_bw_bytes_per_sec:
         return None
@@ -844,11 +844,13 @@ def _t_comm_formula_for_row(
                           f"({p.get('fabric_label') or p.get('fabric')}, "
                           f"world={p.get('world')})"),
                 "symbolic": (f"({p.get('symbolic') or 'bytes'}) / bandwidth"
-                             + (" + hops × link_latency" if link_latency_s else "")),
+                             + (" + hops × hop_latency"
+                                if p.get("hop_latency_s") else "")),
                 "substituted": (f"({p.get('substituted') or 'bytes'}) / "
                                 f"{bw(p.get('bw_bytes_per_sec') or 0)}"
-                                + (f" + {p.get('hops', 0)} × {_fmt_time(link_latency_s)}"
-                                   if link_latency_s else "")),
+                                + (f" + {p.get('hops', 0)} × "
+                                   f"{_fmt_time(p['hop_latency_s'])}"
+                                   if p.get("hop_latency_s") else "")),
                 "result": (
                     f"{_fmt_si((p.get('bytes_per_rank') or 0) / per, ' B')} / "
                     f"{bw(p.get('bw_bytes_per_sec') or 0)}"
@@ -871,13 +873,19 @@ def _t_comm_formula_for_row(
                             f"{bw(comm_bw_bytes_per_sec)} ({comm_bw_label})"),
             "result": _fmt_time(t_comm_s),
         }
-    hops = sum(int(p.get("hops") or 0) for p in comm_phases)
-    if link_latency_s > 0 and hops:
-        # The fixed part: every instance waits on its schedule's hops, each a
-        # link latency (`comm_cost.collective_latency`).
-        out["symbolic"] += " + n × hops × link_latency"
-        out["substituted"] += (f"  +  {per} × {hops} × "
-                               f"{_fmt_time(link_latency_s)}")
+    # The fixed part: every instance waits on its schedule's hops, each its
+    # fabric's latency (`comm_cost.collective_latency`) — one product per
+    # fabric latency the phases wait at.
+    waits: Dict[float, int] = {}
+    for p in comm_phases:
+        if p.get("hop_latency_s") and p.get("hops"):
+            lat = float(p["hop_latency_s"])
+            waits[lat] = waits.get(lat, 0) + int(p["hops"])
+    if waits:
+        out["symbolic"] += " + n × hops × hop_latency"
+        terms = [f"{hops} × {_fmt_time(lat)}" for lat, hops in waits.items()]
+        out["substituted"] += (f"  +  {per} × " + (
+            terms[0] if len(terms) == 1 else f"({' + '.join(terms)})"))
     if note:
         out["note"] = note
     return out

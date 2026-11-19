@@ -532,7 +532,7 @@ export function PhaseTable({ result, target }: { result: Estimate; target: Graph
         </div>
       ) : (<>
       <div className="text-11 text-amber-700 mb-2">
-        ⚠ <span className="font-medium">No-overlap roofline.</span> t_SOL sums per-leaf t_op = max(t_compute, t_memory, t_comm, t_launch) — kernels assumed serial, no compute/comm overlap; one link latency on every fabric.
+        ⚠ <span className="font-medium">No-overlap roofline.</span> t_SOL sums per-leaf t_op = max(t_compute, t_memory, t_comm, t_launch) — kernels assumed serial, no compute/comm overlap; every hop at the link latency, a cross-node hop also at the card's RDMA hop latency.
       </div>
       <div id="infer-phase-table" className="overflow-x-auto">
         <DataTable

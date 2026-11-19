@@ -1099,8 +1099,7 @@ def point_columns(at: RowAt, row: Mapping[str, Any], card: RowCard, *,
         "t_comm_formula": (_t_comm_formula_for_row(
             t_comm_s=t.t_comm, comm_bytes_per_rank=at.comm_volume,
             comm_bw_bytes_per_sec=bw, comm_bw_label=label, comm_world=world,
-            comm_bytes_formula=comm_formula, comm_phases=phases, cnt=cnt,
-            link_latency_s=card.fabric.step_latency)
+            comm_bytes_formula=comm_formula, comm_phases=phases, cnt=cnt)
             if is_comm else None),
         "t_op_formula": _t_op_formula_for_row(
             t_compute_s=t.t_compute, t_memory_s=t.t_memory,
@@ -1241,8 +1240,10 @@ class FloorForm:
         t(α, L) = K + Σ_k max(a_k, b_k + c_k α, n_k L)
 
     `a` is the row's compute or memory time, whichever binds; `b` its
-    collective's bandwidth time and `c` the link traversals it waits on
-    over the step (`COMM_LATENCY_S` is `c α`); `n` its launches
+    collective's bandwidth time and the RDMA latency its cross-node hops
+    wait beyond α (a card fact, `comm_cost.Fabric.hop_latency`), `c` the
+    link traversals it waits on over the step (`COMM_LATENCY_S` is
+    `c α` plus that RDMA part); `n` its launches
     (`t_launch = n L`). A row whose time moves with neither floor adds
     into `K`. Each coefficient is the row's law read twice
     (`LawBook.row_at`): on the card with both floors 0 and with both 1, so
@@ -1378,8 +1379,12 @@ class CardForm:
 
         t(card, α, L) = Σ_r w_r x max(flops_r / peak(card, dtype_r),
                                       access_r / bw(card),
-                                      payload_r x s_per_byte(card) + hops_r(card) x α,
+                                      payload_r x s_per_byte(card)
+                                        + rdma_r(card) + hops_r(card) x α,
                                       n_r x L)
+
+    (`rdma_r` the cross-node hops' own RDMA latency, `comm_cost.Fabric.
+    hop_latency`: a card fact, not a floor.)
 
     `FloorForm` is this form bound to one card (`bind`): it fixes the card
     and leaves the floors. A CardForm leaves both. Each term keeps one
@@ -1477,7 +1482,8 @@ class CardForm:
         with no `bw` prices every byte at zero seconds, which says the card
         is infinitely fast. `w` forwards of `max(a, b + cα, nL)` is
         `max(wa, wb + wcα, wnL)`."""
-        ladders = [_sig_ladder(sig, fabric) for sig in self.sigs]
+        ladders = [(_sig_ladder(sig, fabric, 0.0), _sig_ladder(sig, fabric, 1.0))
+                   for sig in self.sigs]
         constant = 0.0
         terms: List[Tuple[float, float, float, float]] = []
         for flops, access, di, n, si, payload, w in self.terms:
@@ -1501,8 +1507,13 @@ class CardForm:
                 t_memory = access / peak_bw
             b = c = 0.0
             if si >= 0 and payload > 0:
-                seg = ladder_segment(ladders[si], payload)
-                b, c = payload * seg.s_per_byte, seg.latency_s
+                # The fixed time is affine in the link latency: what a hop
+                # waits at α = 0 (a cross-node hop's own RDMA latency) is
+                # floor-free, the rest is the hops α multiplies.
+                at0, at1 = (ladder_segment(ladder, payload)
+                            for ladder in ladders[si])
+                b = payload * at0.s_per_byte + at0.latency_s
+                c = at1.latency_s - at0.latency_s
             a, b, c, n = w * max(t_compute, t_memory), w * b, w * c, w * n
             if c == 0 and n == 0:
                 constant += max(a, b)
@@ -1524,13 +1535,15 @@ class CardForm:
 
 
 @memoize(maxsize=4096)
-def _sig_ladder(sig: str, fabric: Fabric) -> Tuple[Segment, ...]:
-    """A collective signature's ladder on `fabric` (`CardForm.sigs`) —
-    built at a unit step latency, so a segment's `latency_s` is the hops
-    coefficient one link traversal multiplies. One per (signature, card):
-    every point of a walk shares its collectives' signatures."""
+def _sig_ladder(sig: str, fabric: Fabric, step_latency: float
+                ) -> Tuple[Segment, ...]:
+    """A collective signature's ladder on `fabric` (`CardForm.sigs`) at
+    link latency `step_latency` — read at 0 and at 1 s, a segment's
+    `latency_s` is the floor-free part and the hops coefficient one link
+    traversal multiplies. One per (signature, card, latency): every point
+    of a walk shares its collectives' signatures."""
     return CollectiveSignature.from_key(sig).ladder(
-        fabric._replace(step_latency=1.0))
+        fabric._replace(step_latency=step_latency))
 
 
 @dataclass(frozen=True)

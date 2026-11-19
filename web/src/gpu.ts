@@ -13,6 +13,7 @@ export type GpuItem = {
   nvlink_gbps?: number;
   pcie_gbps?: number;
   rdma_gbps?: number;
+  rdma_hop_latency_us?: number;
   gpus_per_node?: number;
 };
 

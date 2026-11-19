@@ -455,7 +455,7 @@ export function PlanCard(props: {
         </div>
         <div>
           <label htmlFor="infer-comm-latency" className="block text-sm font-medium text-gray-700 mb-1"
-            title="One link traversal's latency, the same on every link. A collective pays it once per hop its schedule waits on: an all-reduce of N ranks 2·log2 N, a reduce-scatter / all-gather / all-to-all log2 N, a send 1.">
+            title="One link traversal's latency inside a node; a hop across nodes waits this plus the card's RDMA hop latency. A collective pays it once per hop its schedule waits on: an all-reduce of N ranks 2·log2 N, a reduce-scatter / all-gather / all-to-all log2 N, a send 1.">
             Link latency (µs)
           </label>
           <input id="infer-comm-latency" type="number" min={0} step={0.5} className="w-full px-4 py-2 border border-gray-300 rounded-lg"

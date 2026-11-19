@@ -13,8 +13,9 @@ coefficient is the number of link traversals
 one collective waits on in sequence (`latency_hops`): the latency-optimal
 small-message schedule's log-depth count. Both are structural and
 seconds-free; N=1 is zero for both. Seconds live in inference: the bytes
-over the link's bandwidth plus the hops times one link latency, the same
-on every fabric (`inference.comm_cost`).
+over the link's bandwidth plus the hops times one link traversal's latency,
+a cross-node traversal waiting longer (`inference.comm_cost.Fabric.
+hop_latency`).
 
 Those two are what NCCL's schedule costs, and what an all-reduce costs
 wherever no faster algorithm runs. Inside one NVLink domain a serving

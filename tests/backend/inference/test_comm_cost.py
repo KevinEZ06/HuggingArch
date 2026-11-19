@@ -505,10 +505,12 @@ class TestCollectiveLatency(unittest.TestCase):
 
     ALPHA = 2e-6
 
-    def _latency(self, op, world, count=1, gpus_per_node=8, stride=1):
+    def _latency(self, op, world, count=1, gpus_per_node=8, stride=1,
+                 rdma=0.0):
+        fabric = Fabric(gpus_per_node, 4.5e11, 5e10, "NVLink", "RDMA",
+                        self.ALPHA, inter_latency=rdma)
         return collective_latency(op=op, world=world, count_per_step=count,
-                                  gpus_per_node=gpus_per_node,
-                                  base_stride=stride, step_latency=self.ALPHA)
+                                  fabric=fabric, base_stride=stride)
 
     def test_each_collective_waits_on_its_schedules_hops(self):
         from backend.arch.layout.comm_volume import latency_hops
@@ -524,6 +526,33 @@ class TestCollectiveLatency(unittest.TestCase):
         self.assertAlmostEqual(self._latency("all_reduce", 16), 8 * self.ALPHA)
         # Within a node: one flat all-reduce of 8.
         self.assertAlmostEqual(self._latency("all_reduce", 8), 6 * self.ALPHA)
+
+    def test_a_hop_across_nodes_waits_on_the_cards_rdma_latency_too(self):
+        # 16 ranks over 2 nodes: the inter AR's 2 hops each wait α + RDMA,
+        # the intra RS and AG's 3 + 3 wait α alone.
+        rdma = 4.4e-6
+        self.assertAlmostEqual(self._latency("all_reduce", 16, rdma=rdma),
+                               8 * self.ALPHA + 2 * rdma)
+        # Inside a node no hop crosses: the RDMA latency is not paid.
+        self.assertAlmostEqual(self._latency("all_reduce", 8, rdma=rdma),
+                               6 * self.ALPHA)
+        # A world that is not whole nodes runs one inter ring: every hop
+        # crosses (Bruck, ceil(log2 12) = 4).
+        self.assertAlmostEqual(self._latency("all_to_all", 12, rdma=rdma),
+                               4 * (self.ALPHA + rdma))
+
+    def test_the_sheet_states_the_rdma_hop_for_every_card_with_rdma(self):
+        from backend.inference.gpu_specs import (
+            inter_hop_latency_s, load_gpu_specs, peak_inter_bw_bytes_per_sec)
+        for gpu in load_gpu_specs():
+            fabric = Fabric.of(gpu, self.ALPHA)
+            if peak_inter_bw_bytes_per_sec(gpu):
+                self.assertGreater(inter_hop_latency_s(gpu), 0, gpu.sku)
+                self.assertGreater(fabric.hop_latency("inter"),
+                                   fabric.hop_latency("intra"), gpu.sku)
+            self.assertEqual(fabric.hop_latency("intra"), self.ALPHA, gpu.sku)
+            self.assertEqual(fabric.without_latency().hop_latency("inter"),
+                             0.0, gpu.sku)
 
     def test_every_instance_pays_it_and_bytes_do_not_move_it(self):
         self.assertAlmostEqual(self._latency("all_to_all", 16, count=58),

@@ -4,8 +4,9 @@ Layout materializes the collectives and owns the flat-ring volume
 (`layout.comm_volume.collective_per_rank_bytes`). This module turns
 that volume into time: hierarchical phases, then bytes over the
 per-direction fabric bandwidth (not HBM), plus each phase's fixed latency
-(the α of the α-β model): the link latency (the request's, the same on
-every link at this granularity) times the link traversals the phase's
+(the α of the α-β model): one link traversal's latency (the request's
+link latency, and on a phase that crosses nodes the card's RDMA hop on top
+of it, `Fabric.hop_latency`) times the link traversals the phase's
 schedule waits on in sequence (`comm_volume.latency_hops`: 2 log2 N for an
 all-reduce, log2 N for a reduce-scatter, all-gather or all-to-all, one for
 a point-to-point send). The latency is what a
@@ -90,11 +91,13 @@ def comm_display_shape(op: str, base_shape: Optional[List[int]],
 class Fabric(NamedTuple):
     """One card's interconnect, as `price_collective` reads it: its node
     size, each fabric's per-direction bandwidth (bytes/s) and label, one
-    link traversal's latency (s, the request's `comm_latency_us`), and
-    what its topology admits of a framework's own all-reduces
-    (`gpu_specs.has_nvlink_domain`, `has_nvls`) beside the compute
-    capability a dispatch tests. A fabric built from bandwidths alone
-    admits none of them: NCCL's schedule prices every collective."""
+    link traversal's latency (s, the request's `comm_latency_us`) and what
+    a traversal across nodes waits on beyond it (`inter_latency`, the
+    card's `rdma_hop_latency_us`; `hop_latency`), and what its topology
+    admits of a framework's own all-reduces (`gpu_specs.has_nvlink_domain`,
+    `has_nvls`) beside the compute capability a dispatch tests. A fabric
+    built from bandwidths alone admits none of them: NCCL's schedule
+    prices every collective, every hop at the one link latency."""
     gpus_per_node: Optional[int]
     intra_bw: Optional[float]
     inter_bw: Optional[float]
@@ -104,6 +107,7 @@ class Fabric(NamedTuple):
     nvlink: bool = False
     nvls: bool = False
     compute_capability: Optional[str] = None
+    inter_latency: float = 0.0
 
     @classmethod
     def of(cls, gpu: "gpu_specs.GPUSpec", step_latency: float = 0.0
@@ -117,17 +121,26 @@ class Fabric(NamedTuple):
 
     def without_latency(self) -> "Fabric":
         """This fabric with free steps: what its bandwidth alone charges."""
-        return self._replace(step_latency=0.0)
+        return self._replace(step_latency=0.0, inter_latency=0.0)
+
+    def hop_latency(self, where: str) -> float:
+        """What one link traversal on fabric `where` (`"intra"` /
+        `"inter"`, a phase's `fabric`) waits on: the link latency, and
+        across nodes the card's RDMA hop on top of it."""
+        return self.step_latency + (self.inter_latency if where == "inter"
+                                    else 0.0)
 
 
 def topology(gpu: Optional["gpu_specs.GPUSpec"]) -> Dict[str, Any]:
-    """What a card's sheet row says its NVLink domain admits, as `Fabric`'s
-    fields: none of it without a card."""
+    """What a card's sheet row says of its fabrics beyond their bandwidths,
+    as `Fabric`'s fields: what its NVLink domain admits and what a
+    cross-node hop waits on. None of it without a card."""
     if gpu is None:
         return {}
     return {"nvlink": gpu_specs.has_nvlink_domain(gpu),
             "nvls": gpu_specs.has_nvls(gpu),
-            "compute_capability": gpu.compute_capability or None}
+            "compute_capability": gpu.compute_capability or None,
+            "inter_latency": gpu_specs.inter_hop_latency_s(gpu)}
 
 
 def _capability(text: str) -> Tuple[int, int]:
@@ -472,8 +485,7 @@ def collective_ladder(*, op: str, world: int, count_per_step: int,
             algorithm=algorithm, fanout=fanout)
         return per_byte, collective_latency(
             op=op, world=world, count_per_step=count_per_step,
-            gpus_per_node=fabric.gpus_per_node, base_stride=base_stride,
-            step_latency=fabric.step_latency, algorithm=algorithm,
+            fabric=fabric, base_stride=base_stride, algorithm=algorithm,
             fanout=fanout)
 
     nccl = priced(NCCL)
@@ -498,18 +510,19 @@ def ladder_segment(ladder: Sequence[Segment], tensor_bytes: float) -> Segment:
 
 
 def collective_latency(*, op: str, world: int, count_per_step: int,
-                       gpus_per_node: Optional[int], base_stride: int,
-                       step_latency: float, algorithm: str = NCCL,
+                       fabric: Fabric, base_stride: int,
+                       algorithm: str = NCCL,
                        fanout: Optional[RouteFanout] = None) -> float:
     """The fixed part of a collective's time over a step: each phase of its
-    schedule (`collective_phases`, run by `algorithm`) pays `step_latency`
-    per link traversal it waits on, for every instance in the step.
-    Independent of the payload once the algorithm is chosen."""
+    schedule (`collective_phases`, run by `algorithm`) pays its fabric's
+    `hop_latency` per link traversal it waits on, for every instance in the
+    step. Independent of the payload once the algorithm is chosen."""
     phases = collective_phases(
         op=op, world=int(world), tensor_bytes=1.0,
-        gpus_per_node=int(gpus_per_node or 1),
+        gpus_per_node=int(fabric.gpus_per_node or 1),
         base_stride=int(base_stride or 1), algorithm=algorithm, fanout=fanout)
-    return sum(step_latency * ph["hops"] for ph in phases) * int(count_per_step)
+    return sum(fabric.hop_latency(ph["fabric"]) * ph["hops"]
+               for ph in phases) * int(count_per_step)
 
 
 def price_collective(
@@ -547,8 +560,8 @@ def price_collective(
         fabric_label = (fabric.intra_label if where == "intra"
                         else fabric.inter_label)
         phase_bytes = float(ph["bytes_per_rank"]) * int(count_per_step)
-        phase_latency = (fabric.step_latency * ph["hops"]
-                         * int(count_per_step))
+        hop_latency = fabric.hop_latency(where)
+        phase_latency = hop_latency * ph["hops"] * int(count_per_step)
         phase_t = (phase_bytes / fabric_bw if fabric_bw and fabric_bw > 0
                    else 0.0) + phase_latency
         t_comm += phase_t
@@ -563,6 +576,7 @@ def price_collective(
             # The link traversals one instance of the phase waits on, and
             # their time over the row's instances.
             "hops": ph["hops"],
+            "hop_latency_s": hop_latency,
             "latency_s": phase_latency,
             "t_phase_s": phase_t,
             "symbolic": ph["symbolic"],
