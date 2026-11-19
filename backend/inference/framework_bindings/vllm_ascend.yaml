@@ -267,6 +267,30 @@ kernel_dispatches:
   # so they stay `ambiguous` — a visible gap — until the condition
   # vocabulary can state what selects them.
 
+  # Tensor-parallel collectives, which on this plugin have exactly one
+  # path. `NPUCommunicator` does not override `all_reduce`, so it takes
+  # `DeviceCommunicatorBase.all_reduce` — `dist.all_reduce` on the device
+  # group, which is HCCL (`vllm/distributed/device_communicators/
+  # base_device_communicator.py:231-233`). There is no custom all-reduce
+  # bypass to pick between: nothing in the v0.30.0-a3 plugin matches
+  # `custom_all_reduce` / `should_custom_ar`, and the only other
+  # communicator it ships (`pyhccl`) is HCCL as well.
+  #
+  # Unlike `permute` / `combine`, these do not follow the MoE
+  # communication method: they are the TP seam's own reductions, declared
+  # on the walk at `hc_attn_post.out` and `out.out`, and they run the same
+  # kernel whatever the expert dispatch does.
+  - op: all_reduce
+    library: vllm_ascend
+    impl_id: hccl_all_reduce
+    when: {device: [npu]}
+    source_anchor: "NPUCommunicator inherits DeviceCommunicatorBase.all_reduce -> torch.distributed.all_reduce on the device group (vllm/distributed/device_communicators/base_device_communicator.py:231-233); the plugin's communicator (vllm_ascend/distributed/device_communicators/npu_communicator.py:40) declares no all_reduce of its own and ships no custom-all-reduce bypass"
+  - op: all_gather
+    library: vllm_ascend
+    impl_id: hccl_all_gather
+    when: {device: [npu]}
+    source_anchor: "The vocabulary gather at the LM head: tensor_model_parallel_all_gather (vllm_ascend/models/glm5next/model.py:261) through the same NPUCommunicator, so torch.distributed.all_gather_into_tensor on HCCL"
+
   - op: flash_dsa
     library: vllm_ascend
     impl_id: npu_sparse_flash_attention
