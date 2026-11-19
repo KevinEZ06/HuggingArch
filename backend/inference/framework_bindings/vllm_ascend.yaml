@@ -235,6 +235,38 @@ kernel_dispatches:
     when: {device: [npu], architectures: [Glm5NextForConditionalGeneration]}
     source_anchor: "Glm5NextDecoderLayer.hc_post -> torch.ops._C_ascend.npu_hc_post (vllm_ascend/models/glm5next/model.py:523-525), registered npu_hc_post_npu -> EXEC_NPU_CMD(aclnnHcPost) (csrc/torch_binding.cpp:1434); profiler `HcPost`"
 
+  # The packed projection takes the same path as a plain linear: the
+  # plugin's class keeps vLLM's concatenated weight and runs ONE GEMM
+  # through `AscendUnquantizedLinearMethod` (the fusion entry above says
+  # so), so its dispatch is `linear`'s, declared here rather than inherited
+  # — `dispatch_for` matches on the op name and knows nothing of variants.
+  # Its ROUTED rows are a different launch (`grouped_gemm`, already
+  # declared) and are not covered by this; a cell that carries a dispatch
+  # reads it by signature, and both ops bind to `gemm`.
+  - op: merged_column_parallel_linear
+    library: torch
+    impl_id: torch_cublas_linear
+    when: {device: [npu], unquantized_bf16_launch: true}
+    source_anchor: "AscendMergedColumnParallelLinear (vllm_ascend/ops/linear.py:251) -> AscendUnquantizedLinearMethod.apply (vllm_ascend/ops/linear.py:100, vllm_ascend/ops/linear.py:133-139) -> unquantized_gemm -> torch.nn.functional.linear (vllm_ascend/ops/linear.py:49-54), which on an NPU dispatches aclnnMatmul_MatMulV3Common_MatMulV3"
+  - op: merged_column_parallel_linear
+    library: vllm_ascend
+    impl_id: npu_quant_matmul_w8a8
+    when: {device: [npu], activation_dtype: [int8]}
+    source_anchor: "W8A8_DYNAMIC packed projection: npu_dynamic_quant then npu_quant_matmul with the per-channel weight scale and the per-token activation scale (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:104-131)"
+
+  # NOT declared here, and the reason is the same for all four:
+  # `moe_fused_gate`, `topk`, `permute` and `combine` have no single
+  # kernel on this plugin. The gate's is chosen by
+  # `check_npu_moe_gating_top_k` from the checkpoint's `scoring_func`,
+  # `renormalize` and group widths (`ops/fused_moe/router/
+  # router_factory.py:15-33, :80-88`); `permute` and `combine` ARE the
+  # dispatch, and which kernel runs them follows the MoE communication
+  # method picked at runtime (AllGather / AllToAll / MC2 / FusedMC2,
+  # `ops/fused_moe/moe_comm_method.py:61-75`). A single `impl_id` for any
+  # of them would be a declaration that is false on another deployment,
+  # so they stay `ambiguous` — a visible gap — until the condition
+  # vocabulary can state what selects them.
+
   - op: flash_dsa
     library: vllm_ascend
     impl_id: npu_sparse_flash_attention
