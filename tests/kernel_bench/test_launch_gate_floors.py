@@ -650,7 +650,11 @@ def _assert_launches_the_cell(impl, job, monkeypatch):
     monkeypatch.setattr(driver, "applicable", lambda inv, env: [
         p for p in original(inv, env) if p.kernel_impl == impl])
 
-    def stop_before_timing(run):
+    # `**_kw` because this stands in for `timing.time_callable`, whose
+    # keyword arguments are the caller's business: the driver passes
+    # `align=` for a group's barrier. The stub's job is to raise before
+    # any timing happens, which no argument changes.
+    def stop_before_timing(run, **_kw):
         raise driver.TooSlowToMeasure("gate passed")
     monkeypatch.setattr(driver, "time_callable", stop_before_timing)
 
@@ -757,7 +761,11 @@ def test_sglangs_fp32_table_rope_launches_the_cell(monkeypatch, table_first):
                     if p.kernel_impl == "sgl_apply_rope_cos_sin_cache")
     monkeypatch.setattr(driver, "applicable", lambda inv, env: [provider])
 
-    def stop_before_timing(run):
+    # `**_kw` because this stands in for `timing.time_callable`, whose
+    # keyword arguments are the caller's business: the driver passes
+    # `align=` for a group's barrier. The stub's job is to raise before
+    # any timing happens, which no argument changes.
+    def stop_before_timing(run, **_kw):
         raise driver.TooSlowToMeasure("gate passed")
     monkeypatch.setattr(driver, "time_callable", stop_before_timing)
 
@@ -813,7 +821,11 @@ def test_sglangs_partial_rope_launches_the_cell(monkeypatch, job):
                     if p.kernel_impl == "sglang_apply_rope_partial")
     monkeypatch.setattr(driver, "applicable", lambda inv, env: [provider])
 
-    def stop_before_timing(run):
+    # `**_kw` because this stands in for `timing.time_callable`, whose
+    # keyword arguments are the caller's business: the driver passes
+    # `align=` for a group's barrier. The stub's job is to raise before
+    # any timing happens, which no argument changes.
+    def stop_before_timing(run, **_kw):
         raise driver.TooSlowToMeasure("gate passed")
     monkeypatch.setattr(driver, "time_callable", stop_before_timing)
 
@@ -907,7 +919,11 @@ def test_vllms_fa3_decode_is_the_paged_varlen_entry(monkeypatch):
                     if p.kernel_impl == "vllm_flash_attention_v3_kvcache")
     monkeypatch.setattr(driver, "applicable", lambda inv, env: [provider])
 
-    def stop_before_timing(run):
+    # `**_kw` because this stands in for `timing.time_callable`, whose
+    # keyword arguments are the caller's business: the driver passes
+    # `align=` for a group's barrier. The stub's job is to raise before
+    # any timing happens, which no argument changes.
+    def stop_before_timing(run, **_kw):
         raise driver.TooSlowToMeasure("gate passed")
     monkeypatch.setattr(driver, "time_callable", stop_before_timing)
     result = driver.run_jobs(

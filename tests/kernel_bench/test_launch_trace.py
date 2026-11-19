@@ -320,7 +320,9 @@ class TestAResultTheTraceCannotHandBack:
         monkeypatch.setattr(driver, "applicable", lambda inv, env: [
             p for p in original(inv, env) if p.kernel_impl == impl])
 
-        def stop_before_timing(call):
+        # `**_kw`: the driver hands `time_callable` an `align=` for a
+        # group's barrier, and this stub raises before any of it matters.
+        def stop_before_timing(call, **_kw):
             raise driver.TooSlowToMeasure("gate passed")
         monkeypatch.setattr(driver, "time_callable", stop_before_timing)
         result = driver.run_jobs(

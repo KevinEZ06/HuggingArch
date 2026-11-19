@@ -265,6 +265,9 @@ class TestOneBatchOfInputsPerCell:
                 "library": "lib", "kernel_impl": tag, "signature": "gemm",
                 # The kernel computes at the cell's own precision.
                 "computes_at": None,
+                # A local kernel, not a collective: the driver reads `world`
+                # to decide whether a cell needs a process per rank.
+                "world": None,
                 "actual_computes_at": lambda self, inv: {},
                 "weight_group": None, "weight_scale": None,
                 "impl_id": lambda self, i: tag,

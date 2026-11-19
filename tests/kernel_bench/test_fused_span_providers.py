@@ -2495,16 +2495,25 @@ class TestHyperConnectionSeam:
             ps = _providers(sig)
             libs = {p.library for p in ps}
             # Both frameworks run every launch of the seam, and a torch floor
-            # runs the naive chain the saving is measured against.
-            assert libs == {"vllm", "sglang", "torch"}, (sig, libs)
+            # runs the naive chain the saving is measured against. A SUBSET,
+            # so another hardware family may serve the seam too — vLLM-Ascend
+            # does for `mhc_post` — while the three that must not quietly
+            # drop out are still named.
+            assert {"vllm", "sglang", "torch"}.issubset(libs), (sig, libs)
             assert all(p.fused_op == sig for p in ps), sig
-            # The framework arms declare the bf16 the audited wrappers
-            # require and assert; the floor every float width, because it
-            # runs the chain at whatever width the cell states.
+            # The CUDA wrappers are audited at bf16 and assert it; the floor
+            # takes every float width, because it runs the chain at whatever
+            # width the cell states. A kernel of neither kind states its own
+            # card's widths (the Ascend cube runs bf16 and fp16 at one rate,
+            # `providers/ascend._ASCEND_FLOAT`), which is that card's fact
+            # and not a width this seam gets to pick.
             for p in ps:
-                assert p.serves.activation == (
-                    TORCH_FLOAT if p.library == "torch" else ("bf16",)), \
-                    p.kernel_impl
+                if p.library == "torch":
+                    assert p.serves.activation == TORCH_FLOAT, p.kernel_impl
+                elif p.library in ("vllm", "sglang"):
+                    assert p.serves.activation == ("bf16",), p.kernel_impl
+                else:
+                    assert "bf16" in p.serves.activation, p.kernel_impl
 
     def test_the_projection_names_which_of_its_two_kernels_ran(self):
         """vLLM's projection wrapper has TWO kernels behind it and picks by
