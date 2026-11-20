@@ -1880,16 +1880,19 @@ class Fusion:
                     tuple(program.by_uid(uid).inputs_obj)[index].external_sid
                     for uid, index in match.crossed}
                 # Each is a tensor of its own the loop carries across the
-                # seam — vLLM's `hidden_states` and `residual` — so each is
-                # named for the formal and the writer it carries: one name
-                # for two tensors would be one block input of two sizes.
+                # seam — vLLM's `hidden_states` and `residual` — and enters
+                # the drawn layer through the formal (`InputRef.crosses`):
+                # that is the edge a graph draws. Its `external_sid` is the
+                # tensor's identity, one per carried tensor (one name for
+                # two would be one block input of two sizes), an opaque key
+                # no reader parses.
                 refs = tuple(
                     type(ref)(src=None, port=ref.port,
                               external_sid=(
                                   f"{formal}:{ref.src.display_path or ref.src.name}"
                                   if ref.src is not None
                                   else ref.external_sid),
-                              grafted=True)
+                              grafted=True, crosses=formal)
                     if member in previous else ref
                     for (member, _i, ref, _p) in external)
             name = anchor.name
@@ -2332,6 +2335,7 @@ def materialize_tree(source: Any, program: Any, rewrite: Rewrite) -> Any:
                     port=ref.port,
                     external_sid=ref.external_sid,
                     grafted=ref.grafted,
+                    crosses=ref.crosses,
                 ))
                 continue
             moved = retarget(ref)

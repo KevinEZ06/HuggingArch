@@ -230,7 +230,10 @@ class NodeBuilder:
             node_inputs = []
             input_ports = []
             for ref in ir.inputs_obj:
-                base = ref.src.aggregation_id if ref.src is not None else ref.external_sid
+                # A read across a layer seam is drawn from the formal it
+                # enters through (`InputRef.crosses`), not its tensor key.
+                base = (ref.src.aggregation_id if ref.src is not None
+                        else ref.crosses or ref.external_sid)
                 if not base:
                     continue
                 node_inputs.append(f"{base}.{ref.port}" if ref.port else base)

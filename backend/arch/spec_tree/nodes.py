@@ -466,6 +466,13 @@ class InputRef:
     #: that was not grafted is a stream the body reads, which may share the
     #: spelling (`Scope.read`, in a frame `Scope.calling` opened).
     grafted: bool = False
+    #: The scope input this read enters the drawn layer through, for a
+    #: launch across a layer seam (`fusion.Seams`): it reads a tensor the
+    #: previous iteration wrote, which the loop carries in on that formal
+    #: (`x`). The edge a graph draws for it is the formal's; `external_sid`
+    #: stays the tensor's own identity (one per carried tensor), which no
+    #: reader parses. "" for every other ref.
+    crosses: str = ""
 
 
 @dataclass

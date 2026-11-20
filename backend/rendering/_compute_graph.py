@@ -606,7 +606,14 @@ def serialize_post_tree(post_tree, resolved_spec, *,
                     continue  # children are the absorbed subgraph, don't recurse
             if d.get("children"):
                 d["children"] = _expand_fused(d["children"], pre_idx)
-        return [d for d in dicts if d.get("id") not in prune]
+        # A launch is never one of another launch's absorbed members, even
+        # where it stands under a member's name: DeepSeek-V3's first dense
+        # layer quantises its input norm in its own launch
+        # (`fused_rmsnorm_quant`, at `input_layernorm`), while the seam
+        # launch took that norm's other runs.
+        launches = {m["fused_uid"] for m in fusion_matches}
+        return [d for d in dicts
+                if d.get("id") not in prune or d.get("uid") in launches]
 
     def _prepend_block_input_nodes(
         children: List[Dict[str, Any]], inputs: List[str],
@@ -842,6 +849,17 @@ def serialize_post_tree(post_tree, resolved_spec, *,
         _endpoint(name, drawn)
     for node in top_level:
         _endpoint(node.display_path, node.display_path)
+    # A model-level op a launch replaced is read by the name its spine entry
+    # declares, and the launch stands at that entry's place in the spine
+    # (`layer_path`): a launch across the last layer's seam takes the final
+    # norm and is named for the seam (`norm__seam@block`).
+    spine_names = {tuple(entry.layer_path): entry.name
+                   for entry in iter_tree(program.resolved).spine
+                   if entry.kind == "op"}
+    for node in top_level:
+        name = spine_names.get(tuple(node.layer_path or ()))
+        if name is not None and name != node.display_path:
+            _endpoint(name, node.display_path)
     for stream in post_tree.streams.values():
         if stream.stack_name in stack_last:
             _endpoint(stream.name, stack_last[stream.stack_name])

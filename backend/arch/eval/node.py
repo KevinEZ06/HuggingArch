@@ -63,6 +63,9 @@ class InputRef(Protocol):
     #: whether `external_sid` is a component formal the tree grafted onto
     #: its caller's name, rather than a name the body reads as written
     grafted: bool
+    #: the scope formal a read across a layer seam enters through ("" for
+    #: any other read): the edge drawn for it is that formal's
+    crosses: str
 
 
 @runtime_checkable
