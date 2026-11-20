@@ -8,7 +8,8 @@ layout math and the list of ops cannot grow into one file again.
 from __future__ import annotations
 
 from .fusion_plans import FUSION_SCHEMES
-from .op_signatures import OpSignature, TensorLayout, register_signature
+from .op_signatures import (COMM_DOMAIN_AXIS, OpSignature, TensorLayout,
+                            register_signature)
 
 
 register_signature(OpSignature(
@@ -1369,6 +1370,7 @@ register_signature(OpSignature(
     shape_projection="collective",
     inputs=(TensorLayout("payload", ("n_comm_elems",)),),
     structural_axes=("n_comm_ranks", "n_comm_stride"),
+    variant_dims=(COMM_DOMAIN_AXIS,),
     doc=("all-reduce: every rank ends up holding the sum over the group "
          "(`ncclAllReduce`, or a custom one-shot/two-shot kernel at small "
          "sizes). Grafted where a row-parallel GEMM's partial sums meet a "
@@ -1383,6 +1385,7 @@ register_signature(OpSignature(
     shape_projection="collective",
     inputs=(TensorLayout("payload", ("n_comm_elems",)),),
     structural_axes=("n_comm_ranks", "n_comm_stride"),
+    variant_dims=(COMM_DOMAIN_AXIS,),
     doc=("all-gather: each rank contributes its shard and ends up holding "
          "the concatenation (`ncclAllGather`). Grafted where a sharded "
          "tensor meets a consumer that needs it whole — the vocabulary "
@@ -1396,6 +1399,7 @@ register_signature(OpSignature(
     shape_projection="collective",
     inputs=(TensorLayout("payload", ("n_comm_elems",)),),
     structural_axes=("n_comm_ranks", "n_comm_stride"),
+    variant_dims=(COMM_DOMAIN_AXIS,),
     doc=("reduce-scatter: the group sums the payload and each rank keeps "
          "one slice of the result (`ncclReduceScatter`). Grafted where "
          "partial sums meet a consumer that wants them sharded — the "
@@ -1410,6 +1414,7 @@ register_signature(OpSignature(
     shape_projection="collective",
     inputs=(TensorLayout("payload", ("n_comm_elems",)),),
     structural_axes=("n_comm_ranks", "n_comm_stride"),
+    variant_dims=(COMM_DOMAIN_AXIS,),
     doc=("all-to-all: every rank sends a distinct slice to every other, "
          "swapping which axis the tensor is sharded on — torch's "
          "`all_to_all_single` with a flat `sendcount`, DeepEP's "
@@ -1426,6 +1431,7 @@ register_signature(OpSignature(
     shape_projection="collective",
     inputs=(TensorLayout("payload", ("n_comm_elems",)),),
     structural_axes=("n_comm_ranks", "n_comm_stride"),
+    variant_dims=(COMM_DOMAIN_AXIS,),
     doc=("The pipeline hop: one point-to-point send/recv pair handing a "
          "tensor across a pipeline cut (`ncclSend` / `ncclRecv`). Not a "
          "collective over a group — the payload crosses once, whatever the "

@@ -538,6 +538,13 @@ class _StoredRowIdentity(RowIdentity):
                  served: Mapping[str, int], dtype_env_json: str,
                  declined: str):
         self._served = dict(served)
+        # A stored row has no card beside it, so there is nothing to place
+        # its group against and `_reach_of` answers None — the key every
+        # collective row had before the reach axis existed. Stated rather
+        # than inherited: this class does not run `RowIdentity.__init__`,
+        # so an attribute it forgets is an attribute that does not exist.
+        self._ranks_per_host = None
+        self._ranks_per_scaleup_domain = None
         self._leaves = {}
         self._result = None
         self._program = None
@@ -781,11 +788,17 @@ def point_keys(cell: Any, rows: Sequence[Mapping[str, Any]],
               .scan_chunk_size(binding.ssm_chunk_size_from),
               None if binding is None else cell.analysis.program
               .sinkhorn_iters(binding.hc_sinkhorn_iters_from))
+    # The card's domain sizes, for the collective cells that key on how far
+    # their group reaches. Part of the memo key beside the served choices:
+    # two deployments of one analysis on cards of different domain sizes
+    # place the same group differently, and must not share an identity.
+    served = served + _comm_domain_sizes(deployment.gpu_sku)
     identity = cell.identities.get(served)
     if identity is None:
         identity = cell.identities[served] = RowIdentity(
             cell, kv_block_size=served[0], ssm_chunk_size=served[1],
-            sinkhorn_iters=served[2])
+            sinkhorn_iters=served[2], ranks_per_host=served[3],
+            ranks_per_scaleup_domain=served[4])
     return [point_row_of(row, identity, deployment, model_id=model_id,
                          spec_hash=spec_hash) for row in rows]
 
@@ -860,6 +873,31 @@ def build_deployment_context(
         kv_block_size=deployment_kv_block_size(framework_binding, kv_block_size),
         tensor_parallel=tp,
         expert_parallel=ep)
+
+
+def _comm_domain_sizes(gpu_sku: Optional[str]
+                       ) -> Tuple[Optional[int], Optional[int]]:
+    """`(ranks_per_host, ranks_per_scaleup_domain)` for a SKU, for keying a
+    collective by how far its group reaches.
+
+    The second is None until a sheet row states a scale-up domain wider
+    than its chassis, and then `comm_reach` answers in two values exactly
+    as this module always has. An unknown SKU answers `(None, None)`: a
+    group whose placement nothing describes is keyed as every row before
+    the axis was, rather than on a guessed node size — the same refusal
+    `gpus_per_node` makes by raising rather than reading 8.
+    """
+    from .gpu_specs import get_gpu, gpus_per_node
+    if not gpu_sku:
+        return (None, None)
+    gpu = get_gpu(gpu_sku)
+    if gpu is None:
+        return (None, None)
+    try:
+        host = gpus_per_node(gpu)
+    except ValueError:
+        return (None, None)
+    return (host, None)
 
 
 def parallel_signature(parallel: Any) -> str:

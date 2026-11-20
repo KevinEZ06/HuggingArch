@@ -5,15 +5,18 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.inference.comm_cost import (
-    COMM_OPS, Fabric, collective_latency, collective_per_rank_bytes,
-    collective_phases, price_collective,
+    COMM_OPS, COMM_REACH_HOST, COMM_REACH_SCALEOUT, COMM_REACH_SCALEUP,
+    Fabric, collective_latency, collective_per_rank_bytes,
+    collective_phases, comm_reach, price_collective,
 )
+from backend.inference.op_signatures import COMM_DOMAIN_AXIS
 
 
 class TestCollectiveFormulas(unittest.TestCase):
@@ -714,6 +717,176 @@ class TestCardFabricHasOneStatement(unittest.TestCase):
                 gs.intra_bw_label(gpu), gs.inter_bw_label(gpu),
                 latency)._replace(**topology(gpu))
             self.assertEqual(Fabric.of(gpu, latency), was, gpu.sku)
+
+
+class TheReachOfAGroup(unittest.TestCase):
+    """A collective's group spans one chassis, a scale-up domain, or more
+    than one — and a measurement of each must answer only for its own.
+
+    Before this, a sheet row meant one chassis and a group either fitted it
+    or did not. A supernode ends that: on an Atlas A3, 32 ranks leave the
+    16-die chassis and are still on the scale-up fabric, a domain away in
+    bandwidth from the RoCE the two-valued reading prices them at.
+    """
+
+    def test_a_group_inside_one_chassis_is_host(self):
+        for world in (2, 8, 16):
+            self.assertEqual(
+                comm_reach(world, base_stride=1, ranks_per_host=16),
+                COMM_REACH_HOST, world)
+
+    def test_without_a_wider_domain_leaving_the_chassis_is_scaleout(self):
+        """What the two-valued reading has always said, unchanged: a card
+        declaring no domain past its chassis has nothing in between."""
+        self.assertEqual(
+            comm_reach(32, base_stride=1, ranks_per_host=16),
+            COMM_REACH_SCALEOUT)
+
+    def test_a_declared_supernode_puts_a_tier_in_between(self):
+        def reach(n):
+            return comm_reach(n, base_stride=1, ranks_per_host=16,
+                              ranks_per_scaleup_domain=384)
+        self.assertEqual(reach(16), COMM_REACH_HOST)
+        self.assertEqual(reach(32), COMM_REACH_SCALEUP)
+        self.assertEqual(reach(384), COMM_REACH_SCALEUP)
+        self.assertEqual(reach(385), COMM_REACH_SCALEOUT)
+
+    def test_stride_spreads_a_small_group_past_its_chassis(self):
+        """An outer axis composed over an inner one is spaced out: four
+        ranks at stride 8 touch four chassis of 16, not one."""
+        self.assertEqual(
+            comm_reach(4, base_stride=8, ranks_per_host=16,
+                       ranks_per_scaleup_domain=384),
+            COMM_REACH_SCALEUP)
+
+    def test_the_price_and_the_key_divide_the_same_way(self):
+        """`collective_phases` and `comm_reach` must not disagree about
+        where a group sits: one says intra, the other says host, and they
+        are the same sentence. Both read `members_within`."""
+        for world, stride, g in ((8, 1, 16), (32, 1, 16), (4, 8, 16),
+                                 (16, 1, 8), (12, 1, 16), (2, 1, 16)):
+            phases = collective_phases("all_reduce", world, 1 << 20,
+                                       gpus_per_node=g, base_stride=stride)
+            priced_all_intra = bool(phases) and all(
+                p["fabric"] == "intra" for p in phases)
+            keyed_host = comm_reach(world, base_stride=stride,
+                                    ranks_per_host=g) == COMM_REACH_HOST
+            self.assertEqual(priced_all_intra, keyed_host,
+                             f"world={world} stride={stride} g={g}")
+
+
+class WhatACollectiveCellIsKeyedOn(unittest.TestCase):
+    """The reach belongs in the key, and belongs there by its ABSENCE for
+    the common case."""
+
+    HOST = '{"n_comm_elems":4194304,"n_comm_ranks":8,"n_comm_stride":1}'
+
+    @staticmethod
+    def _sig(name="all_reduce"):
+        import backend.inference.op_signatures_catalog  # noqa: F401
+        from backend.inference.op_signatures import get_signature
+        return get_signature(name)
+
+    def _keyed(self, reach, name="all_reduce"):
+        import json
+        return self._sig(name).project(json.dumps(
+            {**json.loads(self.HOST), COMM_DOMAIN_AXIS: reach},
+            separators=(",", ":"), sort_keys=True))
+
+    def test_an_intra_host_row_keys_exactly_as_it_did(self):
+        """Every collective row measured so far is intra-host, so this is
+        the whole backward-compatibility claim: the axis costs them
+        nothing and no corpus row is rewritten to gain it."""
+        self.assertEqual(self._sig().project(self.HOST), self.HOST)
+
+    def test_the_same_payload_and_group_at_two_reaches_are_two_keys(self):
+        self.assertNotEqual(self._keyed(COMM_REACH_SCALEUP),
+                            self._sig().project(self.HOST))
+
+    def test_scaleup_and_scaleout_do_not_share_a_key_either(self):
+        """The middle tier is the point: a supernode measurement must not
+        answer for a group that left the supernode."""
+        self.assertNotEqual(self._keyed(COMM_REACH_SCALEUP),
+                            self._keyed(COMM_REACH_SCALEOUT))
+
+    def test_every_collective_signature_declares_the_axis(self):
+        """A signature that forgot it would go on sharing one key across
+        fabrics, which is the defect this axis exists to end."""
+        for name in ("all_reduce", "all_gather", "reduce_scatter",
+                     "all_to_all", "send_recv"):
+            self.assertIn(COMM_DOMAIN_AXIS, self._sig(name).variant_dims, name)
+
+    def test_the_axis_is_not_a_cell_dim(self):
+        """It identifies by presence. In `cell_dims` it would be REQUIRED,
+        and every existing row — none of which carries it — would stop
+        keying at all."""
+        for name in ("all_reduce", "send_recv"):
+            self.assertNotIn(COMM_DOMAIN_AXIS, self._sig(name).cell_dims, name)
+
+    def test_a_crossing_lookup_misses_a_corpus_of_host_rows(self):
+        """The property the axis exists for, asserted on the real lookup
+        and not on two strings being unequal.
+
+        The corpus holds intra-host collective rows and nothing else. A
+        deployment whose group leaves the chassis must come away with NO
+        measurement — falling back to the roofline — rather than being
+        handed the intra-host row because its key happens to omit an axis
+        the asking key carries. An absent axis is the DEFAULT (host), never
+        a wildcard that matches every reach, and the difference between
+        those two readings is a cross-fabric collective priced at HCCS.
+        """
+        import csv
+        from backend.inference.op_calibration import (
+            CalibrationRegistry, BenchmarkKey, merge_validated_rows,
+            physical_time_for)
+        path = PROJECT_ROOT / "tests/golden/ascend_vllm_ascend.csv"
+        with open(path, newline="") as handle:
+            rows = [r for r in csv.DictReader(handle) if r["op"] in COMM_OPS]
+        registry = merge_validated_rows(
+            CalibrationRegistry(), [dict(r) for r in rows],
+            source="<test>", origin="shared")
+
+        host_keys = [BenchmarkKey.from_csv_row(r).to_physical() for r in rows]
+
+        def timing(key):
+            return physical_time_for(
+                registry, key,
+                current_peak_tflops_at=lambda *_a, **_k: 248.4,
+                current_peak_bw_gbps=1600.0)
+
+        # The corpus answers for the reach it was taken at ...
+        hit = [k for k in host_keys if timing(k) is not None]
+        self.assertTrue(hit, "no intra-host collective row answered at all, "
+                             "so a miss below would prove nothing")
+
+        # ... and for no other.
+        import json
+        for reach in (COMM_REACH_SCALEUP, COMM_REACH_SCALEOUT):
+            for key in host_keys:
+                crossing = replace(key, shape_json=json.dumps(
+                    {**json.loads(key.shape_json), COMM_DOMAIN_AXIS: reach},
+                    separators=(",", ":"), sort_keys=True))
+                self.assertEqual(
+                    registry.get_physical(crossing), [],
+                    f"{reach} key found an intra-host row")
+                self.assertIsNone(
+                    timing(crossing),
+                    f"{reach} group was handed an intra-host measurement")
+
+    def test_the_measured_corpus_still_keys_where_it_did(self):
+        """The 12 Ascend collective rows were all taken on one chassis
+        (the sheet row's note says every measurement on it is intra-node),
+        so not one of them may gain the axis."""
+        import csv
+        from backend.inference.op_calibration import BenchmarkKey
+        path = PROJECT_ROOT / "tests/golden/ascend_vllm_ascend.csv"
+        with open(path, newline="") as handle:
+            rows = [r for r in csv.DictReader(handle)
+                    if r["op"] in COMM_OPS]
+        self.assertTrue(rows, "no collective rows to check")
+        for row in rows:
+            shape = BenchmarkKey.from_csv_row(row).to_physical().shape_json
+            self.assertNotIn(COMM_DOMAIN_AXIS, shape, row["op"])
 
 
 if __name__ == "__main__":

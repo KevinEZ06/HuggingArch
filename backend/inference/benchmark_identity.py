@@ -12,10 +12,11 @@ same row identity the route looks up at request time.
 from __future__ import annotations
 
 from .op_signatures import (
-    PAGE_AXIS, OpSignature, get_signature, op_bindings, op_signature,
-    output_width,
+    COMM_DOMAIN_AXIS, PAGE_AXIS, OpSignature, get_signature, op_bindings,
+    op_signature, output_width,
     spec_get, zip_engine_layouts,
 )
+from .comm_cost import COMM_REACH_HOST, comm_reach
 from backend.arch.ops import OpSpec
 from backend.arch.activation_formats import ACTIVATION_FORMATS
 from backend.arch.dtypes import (
@@ -668,25 +669,49 @@ class CommLaunch:
 
 
 def _collective_identity(comm: Optional[CommLaunch],
-                         sig: Optional[OpSignature]) -> Optional[str]:
+                         sig: Optional[OpSignature],
+                         reach: Optional[str] = None) -> Optional[str]:
     """`{n_comm_elems, n_comm_ranks, n_comm_stride}` — the buffer one launch
-    moves, the group it moves it over, and that group's spacing on the mesh.
+    moves, the group it moves it over, and that group's spacing on the mesh
+    — plus `n_comm_domain` when that group leaves its chassis.
 
     One axis per published fact, and only the axes the signature's cell
     declares: a signature asking for an axis no comm fact answers gets no
     cell, so the row is dropped and named instead of keyed on a guess.
+
+    `n_comm_domain` is a VARIANT axis, so it identifies by presence
+    (`OpSignature.project`) and is written only for a group that reaches
+    past one host. A group inside one host is the default and says nothing,
+    which is why every row measured before this axis existed keys exactly
+    as it did — they were all intra-host, as the Ascend sheet row's note
+    says of itself in so many words. The asymmetry is deliberate: it is
+    the absence that is the common case, and a key should spend bytes on
+    what is unusual.
+
+    Without it a cross-host measurement and an intra-host one of the same
+    payload and group size are ONE key, and the envelope takes the fastest
+    of them — so the intra-host row would answer for a deployment whose
+    traffic crosses a fabric an order of magnitude slower, and the
+    cross-host row it measured would never win and look like it was never
+    taken. `send_recv`'s catalog entry used to say `n_comm_ranks` with
+    `n_comm_stride` "is what decides whether the peer is in this node or
+    across the fabric"; that holds only while one sheet row means one
+    chassis, which a supernode ends.
     """
     if comm is None or sig is None:
         return None
     facts = {"n_comm_elems": comm.elements,
              "n_comm_ranks": comm.world,
              "n_comm_stride": comm.stride}
-    dims: Dict[str, int] = {}
+    dims: Dict[str, Any] = {}
     for axis in sig.cell_dims:
         value = facts.get(axis)
         if value is None or value <= 0:
             return None
         dims[axis] = int(value)
+    if (reach and reach != COMM_REACH_HOST
+            and COMM_DOMAIN_AXIS in sig.variant_dims):
+        dims[COMM_DOMAIN_AXIS] = str(reach)
     return json.dumps(dims, separators=(",", ":"), sort_keys=True)
 
 
@@ -900,6 +925,7 @@ def identity_shape_from_shape_in(
     spec_dims: Optional[Dict[str, Any]] = None,
     shape_in_exact: Any = None,
     comm: Optional[CommLaunch] = None,
+    comm_reach_: Optional[str] = None,
     routed_rows: Optional[int] = None,
 ) -> Optional[str]:
     """Derive the calibration identity shape from the engine's per-op
@@ -956,7 +982,7 @@ def identity_shape_from_shape_in(
         # shape only sometimes is: an all-gather's `shape_in` is one rank's
         # shard while the launch's payload is the gathered buffer. The walk
         # already states the payload it priced, so read that.
-        return _collective_identity(comm, sig)
+        return _collective_identity(comm, sig, comm_reach_)
     # One launch's whole geometry, for every projection below: the walk's
     # floored extents are means wherever the law divides, and no kernel runs
     # a fraction of a row.
@@ -1373,7 +1399,18 @@ class RowIdentity:
     def __init__(self, analysis: Any, *,
                  kv_block_size: Optional[int] = None,
                  ssm_chunk_size: Optional[int] = None,
-                 sinkhorn_iters: Optional[int] = None) -> None:
+                 sinkhorn_iters: Optional[int] = None,
+                 ranks_per_host: Optional[int] = None,
+                 ranks_per_scaleup_domain: Optional[int] = None) -> None:
+        # How far a collective's group reaches, for the cells that declare
+        # `COMM_DOMAIN_AXIS`. The card states the domain sizes and the row
+        # states its own world and stride; `comm_reach` is the one place
+        # they are turned into an answer, and `comm_cost` prices the same
+        # groups through the same division (`members_within`). Absent sizes
+        # leave every group keyed as intra-host, which is what a sheet with
+        # no domain wider than its chassis means.
+        self._ranks_per_host = ranks_per_host
+        self._ranks_per_scaleup_domain = ranks_per_scaleup_domain
         # The serving choices a cell may be keyed on, which the deployment
         # makes and the model does not: the paged-KV page (`PAGE_AXIS`; the
         # framework binding states it and a request may override it) and the
@@ -1811,6 +1848,17 @@ class RowIdentity:
         return op, attach_gqa_sinks(shape_json, bool(leaf.get("sinks"))), (
             shape_in, shape_out)
 
+    def _reach_of(self, comm: Optional[CommLaunch]) -> Optional[str]:
+        """How far this launch's group reaches, or None when the row is no
+        collective or the card named no host size. None keys exactly as
+        every row did before the axis existed."""
+        if comm is None or self._ranks_per_host is None:
+            return None
+        return comm_reach(
+            comm.world, base_stride=comm.stride,
+            ranks_per_host=self._ranks_per_host,
+            ranks_per_scaleup_domain=self._ranks_per_scaleup_domain)
+
     def _identity(self, op: str, row: Dict[str, Any], leaf: Dict[str, Any],
                   shape_in: Any, shape_out: Any, *, exact: bool) -> Optional[str]:
         """The identity shape of `row` read off `shape_in` — the walk's
@@ -1842,7 +1890,10 @@ class RowIdentity:
             # A BARE collective's whole cell: it has no local math, so its
             # payload, group and mesh spacing are the launch, and the row
             # states all three. None for every row that is not one.
-            comm=CommLaunch.from_row(row),
+            comm=(launch := CommLaunch.from_row(row)),
+            # The reach of that same group. Only a collective has one, and
+            # only one that leaves its host writes an axis.
+            comm_reach_=self._reach_of(launch),
             # The routed buffer's rows, read off the row's own wire
             # identity — the same count the overlay's padding reads
             # (`launch_rows`), so a key and its geometry name one launch.

@@ -86,6 +86,63 @@ def comm_display_shape(op: str, base_shape: Optional[List[int]],
     return out
 
 
+#: The physical reaches a collective group can have, outermost last. The
+#: names are the domain's, not a vendor's: one chassis, the scale-up domain
+#: that chassis belongs to, and everything past it. On an Atlas A3 that
+#: reads 16 dies / a supernode over Lingqu (UB) / RoCE; on an NVL72 rack it
+#: reads one tray / the NVLink rack / InfiniBand. `docs/parallelism.md`
+#: registers the words.
+COMM_REACH_HOST = "host"
+COMM_REACH_SCALEUP = "scaleup"
+COMM_REACH_SCALEOUT = "scaleout"
+COMM_REACHES = (COMM_REACH_HOST, COMM_REACH_SCALEUP, COMM_REACH_SCALEOUT)
+
+
+def members_within(ranks_in_domain: Optional[int], base_stride: int,
+                   world: int) -> int:
+    """How many of a group's members land inside ONE domain of
+    `ranks_in_domain` ranks, given the parallelism nested inside it.
+
+    `min(world, max(1, ranks_in_domain // base_stride))` — the one place
+    that division is written. `collective_phases` reads it to split a
+    collective into intra and inter phases, and `comm_reach` reads it to
+    say how far the whole group stretches; neither restates it.
+    """
+    n = max(int(world or 1), 1)
+    d = max(int(ranks_in_domain or 1), 1)
+    s = max(int(base_stride or 1), 1)
+    return min(n, max(1, d // s))
+
+
+def comm_reach(world: int, *, base_stride: int = 1,
+               ranks_per_host: Optional[int],
+               ranks_per_scaleup_domain: Optional[int] = None) -> str:
+    """How far a collective group of `world` ranks physically stretches.
+
+    `host` when every member sits in one chassis, `scaleup` when it leaves
+    the chassis but stays inside the scale-up domain that chassis belongs
+    to, `scaleout` when it leaves that domain too. The three differ by an
+    order of magnitude of bandwidth each, which is why a measurement of one
+    must never answer for another.
+
+    `ranks_per_scaleup_domain` absent means the card declares no domain
+    wider than its chassis, and the answer is the two-valued one this
+    module has always given: a group either fits the node or does not.
+    That is every row on the sheet today, so nothing changes until a card
+    states a wider domain.
+    """
+    n = max(int(world or 1), 1)
+    if n <= 1:
+        return COMM_REACH_HOST
+    host = max(int(ranks_per_host or 1), 1)
+    if n <= members_within(host, base_stride, n):
+        return COMM_REACH_HOST
+    domain = max(int(ranks_per_scaleup_domain or host), host)
+    if domain > host and n <= members_within(domain, base_stride, n):
+        return COMM_REACH_SCALEUP
+    return COMM_REACH_SCALEOUT
+
+
 class Fabric(NamedTuple):
     """One card's interconnect, as `price_collective` reads it: its node
     size, each fabric's per-direction bandwidth (bytes/s) and label, one
@@ -388,7 +445,10 @@ def collective_phases(
     s = max(int(base_stride or 1), 1)
     # Group members that land inside one node, given the inner-inner_group
     # stride. base_stride=1 → min(n, g) (the legacy size-only rule).
-    m = min(n, max(1, g // s))
+    # `members_within` is that division's one owner; `comm_reach` reads the
+    # same one to key a measurement, so the price and the lookup cannot
+    # disagree about where a group sits.
+    m = members_within(g, s, n)
     T = float(tensor_bytes)
     # `T` token in the formula. When the caller passes the tensor's
     # axis·dtype expansion (`t_sym` = "(B·s_ctx·d_model·dt_a)", `t_sub` =
