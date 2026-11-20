@@ -374,15 +374,30 @@ class NaivePattern(BaseModel):
 
     def required_ports(self) -> FrozenSet[str]:
         """The input ports every launch of this plan fills: those a node
-        that is always there reads among its `inputs` (not an optional
-        node's, nor an `optional_inputs` slot)."""
+        that is always there reads among its `inputs` (not an
+        `optional_inputs` slot) — directly, or through an optional node it
+        reads, which an absent match reads through to
+        (`PatternNode.read_through`: a router's gate temperature stands on
+        the `gating` the launch reads either way). An optional node's own
+        other inputs are not."""
         if self.parallel is not None:
             return frozenset(ref.partition(".")[2]
                              for ref in self.parallel.shared_inputs)
-        return frozenset(ref.partition(".")[2]
-                         for pn in (self.nodes or {}).values()
-                         if not pn.optional
-                         for ref in pn.inputs if ref.startswith("external."))
+        nodes = self.nodes or {}
+        out = set()
+        for pn in nodes.values():
+            if pn.optional:
+                continue
+            for ref in pn.inputs:
+                head = ref.partition(".")[0]
+                while head != "external" and nodes[head].optional:
+                    through = nodes[head].read_through()
+                    if through is None:
+                        break
+                    ref, head = through, through.partition(".")[0]
+                if head == "external":
+                    out.add(ref.partition(".")[2])
+        return frozenset(out)
 
     def collective(self) -> bool:
         """Whether the launch is a collective: a node of the subgraph runs a

@@ -654,6 +654,15 @@ def _input_ports(pattern: Any, bound: Mapping[str, Any]
         spec = pattern.nodes[pattern_name]
         for index, ref in enumerate((*spec.inputs, *spec.optional_inputs)):
             head, _, tail = ref.partition(".")
+            # An edge to an optional node the match does not have reads
+            # what that node would have read (`PatternNode.read_through`),
+            # as the matcher bound it: a router with no gate temperature
+            # reads its logits, the launch's `gating` port.
+            while head != "external" and head not in bound:
+                through = pattern.nodes[head].read_through()
+                if through is None:
+                    break
+                head, _, tail = through.partition(".")
             if head == "external":
                 out[(node.uid, index)] = tail
     return out

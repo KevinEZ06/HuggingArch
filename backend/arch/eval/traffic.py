@@ -2312,9 +2312,7 @@ def _activation_reads(node: Identified, uid: int, shape, *, in_override,
                                cache_laws, edges)
             src = found[0] if found else None
             if src is not None and refs[index].src is None:
-                read_port = next((port for producer, port
-                                  in edges.reads(node, index)
-                                  if producer.uid == src.uid), read_port)
+                read_port = edges.port_read(node, index, src)
         # A weight arriving on an edge is a WEIGHT read, priced at the
         # width it is stored in, and `_weight_traffic` has already billed
         # it to this node. Pricing it here as well counted the same tensor
@@ -2580,7 +2578,7 @@ def _activation_reads(node: Identified, uid: int, shape, *, in_override,
         port = read_port
         if carried is None and src is not None:
             carried = declared_output(src, program, launch_of,
-                                      "" if port == "out" else port,
+                                      cache.main_port(port),
                                       cached=writers, shapes=shapes)
         if carried is None:
             carried = Written(produced_width(src, port, precision, program),

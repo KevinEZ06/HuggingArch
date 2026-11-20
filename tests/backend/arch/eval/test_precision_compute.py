@@ -76,7 +76,8 @@ def test_the_panels_compute_column_asks_the_matmuls_not_the_stored_tensor():
     (the split is the framework's, whatever the profile)."""
     program = Phase(DECODE).substitute(
         shared_program("deepseek-ai__DeepSeek-V3"))
-    analysis = Deployment(program).at(batch=1, input_tokens=16).analyze()
+    # The module's shared walk: this test only reads it.
+    analysis = shared_walk(Deployment(program).at(batch=1, input_tokens=16))
     precision = analysis.resolved_precision
     operands = traffic_mod.matmul_operands(
         analysis.program, analysis.formats.values, precision)

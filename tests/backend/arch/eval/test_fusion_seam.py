@@ -15,7 +15,6 @@ block), not the walk's dims.
 from __future__ import annotations
 
 import functools
-import json
 from itertools import pairwise
 import sys
 from pathlib import Path
@@ -32,16 +31,14 @@ from backend.inference.framework_bindings import (ServingDeployment,
 from backend.inference.gpu_specs import get_gpu
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.pipeline import analyze
-from tests.snapshots import SNAPSHOT_DIR, resolve_snapshot
+from tests.snapshots import resolve_snapshot, snapshot_config
 
 BATCH = 8
 
 
 def _config(model: str) -> Dict[str, Any]:
     """The checkpoint's `config.json`, as the snapshot recorded it."""
-    data = json.loads(
-        (SNAPSHOT_DIR / f"{model.replace('/', '__')}.json").read_text())
-    return data.get("config", data)
+    return snapshot_config(model)
 
 
 def _rows(model: str, framework: str, *, parallel: Optional[dict] = None,

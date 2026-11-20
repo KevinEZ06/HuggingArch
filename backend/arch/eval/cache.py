@@ -925,6 +925,21 @@ class Edges:
             found.setdefault((run.node.uid, run.port), run.node)
         return tuple((node, port) for (_uid, port), node in found.items())
 
+    def port_read(self, reader: Identified, index: int,
+                  producer: Identified) -> str:
+        """The port input `index` of `reader` reads `producer` on (`reads`;
+        "" for the main output). For a ref that names a tensor rather than
+        a node it is the port the walk's writer publishes it on, which a
+        launch that absorbed the writer may rename (a fused add+norm's
+        `residual_out`) — asked of the edges, where the runs are, and not
+        re-derived by the reader."""
+        for node, port in self.reads(reader, index):
+            if node.uid == producer.uid:
+                return port
+        raise ValueError(
+            f"{reader.display_path}: input {index} does not read uid "
+            f"{producer.uid} ({producer.display_path})")
+
     def handed_exits(self) -> Any:
         """The encoder outputs the walk reads as handed over
         (`Program.handed_exits`): no node of this step writes them."""
