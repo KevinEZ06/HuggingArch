@@ -709,9 +709,9 @@ def _collective_identity(comm: Optional[CommLaunch],
         if value is None or value <= 0:
             return None
         dims[axis] = int(value)
-    if (reach and reach != COMM_REACH_HOST
+    if (reach and int(reach) != COMM_REACH_HOST
             and COMM_DOMAIN_AXIS in sig.variant_dims):
-        dims[COMM_DOMAIN_AXIS] = str(reach)
+        dims[COMM_DOMAIN_AXIS] = int(reach)
     return json.dumps(dims, separators=(",", ":"), sort_keys=True)
 
 

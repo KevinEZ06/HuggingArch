@@ -282,3 +282,101 @@ class TheRankWorkerAgreesOnSampleCounts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheReachSurvivesTheRoundTrip(unittest.TestCase):
+    """A crossing measurement must still read as crossing after it lands.
+
+    The write side has TWO places a cell can be stated: the row's
+    `shape_json` column, which `emit.build_row` serialises from
+    `inv.dims`, and the `PhysicalKey` coverage asks about. Stamping only
+    the second left a cross-machine row on disk whose shape said
+    intra-host, so reading the corpus back keyed it as a chassis
+    measurement -- the pollution `n_comm_domain` exists to prevent,
+    arriving from the side it was not watched on.
+
+    This walks the whole chain on the real functions: job -> dims ->
+    the row's shape text -> corpus schema -> `BenchmarkKey` ->
+    `to_physical`.
+    """
+
+    JOB = {
+        "op": "all_reduce", "signature": "all_reduce",
+        "dims": {"n_comm_elems": 4194304, "n_comm_ranks": 16,
+                 "n_comm_stride": 1},
+        "dtype_env": {"activation": "bf16", "output": "bf16"},
+        "phase": "prefill", "tp": 1,
+        "physical_key": [
+            "all_reduce",
+            '{"n_comm_elems":4194304,"n_comm_ranks":16,"n_comm_stride":1}',
+            '{"activation":"bf16","output":"bf16"}', "prefill"],
+    }
+
+    @staticmethod
+    def _shape_text(job, domain):
+        """The text `emit.build_row` would write, for this domain."""
+        """The text a WRITTEN row carries, off `build_row` itself.
+
+        Not `_cell_text`: that is the helper under test, and asking it
+        directly would pass whether or not `build_row` calls it. The row
+        is what lands in the corpus, so the row is what is read.
+        """
+        from kernel_bench.driver import _job_with_comm_domain
+        from kernel_bench.emit import build_row
+        from kernel_bench.invocation import Invocation
+        from kernel_bench.providers import Provider
+        from kernel_bench.timing import LatencyStats
+
+        inv = Invocation.from_job(_job_with_comm_domain(job, domain))
+        class _P(Provider):
+            def version(self, env):      # the env fixture knows no wheels
+                return "2.10.0.post7"
+
+        provider = _P(library="vllm_ascend", signature="all_reduce",
+                      kernel_impl="hccl_all_reduce",
+                      import_name="torch_npu", build=lambda *a: None)
+        stats = LatencyStats(p50_us=1.0, p95_us=1.0, mean_us=1.0, samples=3,
+                             timing_method="wall")
+        row = build_row(inv, provider, stats, _env(),
+                        date="2026-11-20", contributor="@t")
+        return row["shape_json"]
+
+    def _physical(self, domain):
+        from backend.inference.op_calibration import (
+            BenchmarkKey, CalibrationRegistry, merge_validated_rows)
+        from tests.corpus_row import row as corpus_row
+        shape = self._shape_text(self.JOB, domain)
+        r = corpus_row(
+            op="all_reduce", kernel_impl="hccl_all_reduce",
+            framework="vllm_ascend", gpu="Ascend-910C-A3", phase="prefill",
+            shape_json=shape,
+            dtype_env_json='{"activation":"bf16","output":"bf16"}')
+        # The schema is the gate every corpus row passes; a shape it
+        # refuses never reaches a key at all.
+        merge_validated_rows(CalibrationRegistry(), [dict(r)],
+                             source="<test>", origin="shared")
+        return shape, BenchmarkKey.from_csv_row(r).to_physical()
+
+    def test_a_crossing_row_carries_its_reach_all_the_way_through(self):
+        from backend.inference.comm_cost import COMM_REACH_SCALEUP
+        shape, key = self._physical("scaleup")
+        stamped = f'"n_comm_domain":{COMM_REACH_SCALEUP}'
+        self.assertIn(stamped, shape,
+                      "the row's own shape text lost the reach")
+        self.assertIn(stamped, key.shape_json,
+                      "the physical key lost the reach the row carried")
+
+    def test_it_does_not_collide_with_the_same_cell_on_one_host(self):
+        _, crossed = self._physical("scaleup")
+        _, local = self._physical("host")
+        self.assertNotEqual(
+            crossed, local,
+            "a cross-machine row and a chassis row of the same payload "
+            "and world share a key, so the envelope would hand one for "
+            "the other")
+
+    def test_a_host_row_is_byte_identical_to_before_the_axis(self):
+        shape, _ = self._physical("host")
+        self.assertEqual(
+            shape,
+            '{"n_comm_elems":4194304,"n_comm_ranks":16,"n_comm_stride":1}')

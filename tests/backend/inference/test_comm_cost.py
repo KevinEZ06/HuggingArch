@@ -715,7 +715,9 @@ class TestCardFabricHasOneStatement(unittest.TestCase):
                 gs.peak_intra_bw_bytes_per_sec(gpu),
                 gs.peak_inter_bw_bytes_per_sec(gpu),
                 gs.intra_bw_label(gpu), gs.inter_bw_label(gpu),
-                latency)._replace(**topology(gpu))
+                latency,
+                scaleup_domain=gs.ranks_per_scaleup_domain(gpu),
+                )._replace(**topology(gpu))
             self.assertEqual(Fabric.of(gpu, latency), was, gpu.sku)
 
 
@@ -790,7 +792,7 @@ class WhatACollectiveCellIsKeyedOn(unittest.TestCase):
     def _keyed(self, reach, name="all_reduce"):
         import json
         return self._sig(name).project(json.dumps(
-            {**json.loads(self.HOST), COMM_DOMAIN_AXIS: reach},
+            {**json.loads(self.HOST), COMM_DOMAIN_AXIS: int(reach)},
             separators=(",", ":"), sort_keys=True))
 
     def test_an_intra_host_row_keys_exactly_as_it_did(self):
@@ -864,7 +866,7 @@ class WhatACollectiveCellIsKeyedOn(unittest.TestCase):
         for reach in (COMM_REACH_SCALEUP, COMM_REACH_SCALEOUT):
             for key in host_keys:
                 crossing = replace(key, shape_json=json.dumps(
-                    {**json.loads(key.shape_json), COMM_DOMAIN_AXIS: reach},
+                    {**json.loads(key.shape_json), COMM_DOMAIN_AXIS: int(reach)},
                     separators=(",", ":"), sort_keys=True))
                 self.assertEqual(
                     registry.get_physical(crossing), [],
@@ -891,3 +893,83 @@ class WhatACollectiveCellIsKeyedOn(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ASupernodeIsScaleUpAcrossMachines(unittest.TestCase):
+    """Both halves of the question, on the sheet row that answers it.
+
+    `gpus_per_node` is the CHASSIS and `ranks_per_scaleup_domain` is the
+    fast fabric's reach. They coincide on every card that has no
+    supernode, and on an Atlas A3 they do not: 16 against 768. Getting
+    that wrong is not a crash, it is 32 ranks priced on a 25 GB/s NIC
+    that carried none of their traffic.
+    """
+
+    def _ascend(self):
+        from backend.inference.gpu_specs import get_gpu
+        gpu = get_gpu("Ascend-910C-A3")
+        self.assertIsNotNone(gpu, "the Ascend row is what this tests")
+        return gpu
+
+    def test_the_sheet_separates_the_chassis_from_the_domain(self):
+        from backend.inference.gpu_specs import (gpus_per_node,
+                                                 ranks_per_scaleup_domain)
+        gpu = self._ascend()
+        self.assertEqual(gpus_per_node(gpu), 16)
+        self.assertEqual(ranks_per_scaleup_domain(gpu), 768)
+
+    def test_the_lookup_tiers_a_crossing_group_as_scaleup(self):
+        """A measured row keyed `scaleup` is only found if the estimate
+        asks for `scaleup`."""
+        from backend.inference.gpu_specs import (gpus_per_node,
+                                                 ranks_per_scaleup_domain)
+        gpu = self._ascend()
+        host, domain = gpus_per_node(gpu), ranks_per_scaleup_domain(gpu)
+        for world, want in ((8, COMM_REACH_HOST), (16, COMM_REACH_HOST),
+                            (32, COMM_REACH_SCALEUP),
+                            (64, COMM_REACH_SCALEUP),
+                            (768, COMM_REACH_SCALEUP),
+                            (769, COMM_REACH_SCALEOUT),
+                            (1024, COMM_REACH_SCALEOUT)):
+            self.assertEqual(
+                comm_reach(world, base_stride=1, ranks_per_host=host,
+                           ranks_per_scaleup_domain=domain),
+                want, f"world={world}")
+
+    def test_a_world_with_no_measurement_is_priced_on_the_fast_fabric(self):
+        """The half a reach code cannot cover.
+
+        64 and 96 ranks are not in the corpus and will be priced from the
+        roofline. Inside the supernode that traffic never touches a NIC,
+        so pricing it on `rdma_gbps` would be wrong by the better part of
+        an order of magnitude -- and silently, since a number comes back
+        either way.
+        """
+        gpu = self._ascend()
+        fabric = Fabric.of(gpu, 2e-6)
+        for world in (16, 32, 64, 96, 768):
+            _t, phases = price_collective(
+                op="all_reduce", world=world, tensor_bytes=1 << 23,
+                count_per_step=1, fabric=fabric, base_stride=1)
+            labels = {p["fabric_label"] for p in phases}
+            self.assertEqual(labels, {"HCCS"}, f"world={world} left the "
+                                               f"scale-up fabric: {labels}")
+
+    def test_past_the_domain_it_is_the_nic(self):
+        gpu = self._ascend()
+        _t, phases = price_collective(
+            op="all_reduce", world=1024, tensor_bytes=1 << 23,
+            count_per_step=1, fabric=Fabric.of(gpu, 2e-6), base_stride=1)
+        self.assertIn("RDMA", {p["fabric_label"] for p in phases})
+
+    def test_a_card_with_no_supernode_is_unchanged(self):
+        """Every other row on the sheet leaves the column empty, and must
+        read exactly as it did: this is what keeps the GPU baseline
+        byte-identical."""
+        from backend.inference import gpu_specs as gs
+        for gpu in gs.load_gpu_specs():
+            if gpu.sku == "Ascend-910C-A3":
+                continue
+            self.assertEqual(
+                gs.ranks_per_scaleup_domain(gpu), gs.gpus_per_node(gpu),
+                f"{gpu.sku} gained a domain it never declared")

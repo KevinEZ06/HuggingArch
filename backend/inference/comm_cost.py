@@ -92,10 +92,27 @@ def comm_display_shape(op: str, base_shape: Optional[List[int]],
 #: reads 16 dies / a supernode over Lingqu (UB) / RoCE; on an NVL72 rack it
 #: reads one tray / the NVLink rack / InfiniBand. `docs/parallelism.md`
 #: registers the words.
-COMM_REACH_HOST = "host"
-COMM_REACH_SCALEUP = "scaleup"
-COMM_REACH_SCALEOUT = "scaleout"
+#: A TIER, not a size. The obvious encoding — how many ranks the domain
+#: holds — cannot be written down for `scaleout`, which has no fixed
+#: extent at all, and would split one fabric's measurements across
+#: several keys the day a 384-die and a 768-die supernode both exist.
+#: What a lookup needs to know is which fabric a group's traffic crossed,
+#: and that is an ordered three, so it is numbered: a corpus cell's
+#: values are positive integers (`benchmarks` refuses anything else), and
+#: a name would have to be spelled identically by every writer forever.
+COMM_REACH_HOST = 1
+COMM_REACH_SCALEUP = 2
+COMM_REACH_SCALEOUT = 3
 COMM_REACHES = (COMM_REACH_HOST, COMM_REACH_SCALEUP, COMM_REACH_SCALEOUT)
+
+#: What a person writes (`--comm-domain`) against what a cell carries.
+#: One mapping, read by the CLI that parses the flag and by anything
+#: rendering a row back: two spellings of this would drift the day a
+#: fourth tier appears.
+COMM_REACH_NAMES = {"host": COMM_REACH_HOST,
+                    "scaleup": COMM_REACH_SCALEUP,
+                    "scaleout": COMM_REACH_SCALEOUT}
+COMM_REACH_LABELS = {code: name for name, code in COMM_REACH_NAMES.items()}
 
 
 def members_within(ranks_in_domain: Optional[int], base_stride: int,
@@ -160,6 +177,10 @@ class Fabric(NamedTuple):
     nvlink: bool = False
     nvls: bool = False
     compute_capability: Optional[str] = None
+    #: Ranks the SCALE-UP domain holds, when wider than the chassis
+    #: (`gpu_specs.ranks_per_scaleup_domain`). None reads as the chassis,
+    #: which is every card that declares no supernode.
+    scaleup_domain: Optional[int] = None
 
     @classmethod
     def of(cls, gpu: "gpu_specs.GPUSpec", step_latency: float = 0.0
@@ -169,7 +190,9 @@ class Fabric(NamedTuple):
                    gpu_specs.peak_intra_bw_bytes_per_sec(gpu),
                    gpu_specs.peak_inter_bw_bytes_per_sec(gpu),
                    gpu_specs.intra_bw_label(gpu), gpu_specs.inter_bw_label(gpu),
-                   step_latency)._replace(**topology(gpu))
+                   step_latency,
+                   scaleup_domain=gpu_specs.ranks_per_scaleup_domain(gpu),
+                   )._replace(**topology(gpu))
 
     def without_latency(self) -> "Fabric":
         """This fabric with free steps: what its bandwidth alone charges."""
@@ -283,7 +306,8 @@ def collective_ladder(*, op: str, world: int, count_per_step: int,
             algorithm=algorithm)
         return per_byte, collective_latency(
             op=op, world=world, count_per_step=count_per_step,
-            gpus_per_node=fabric.gpus_per_node, base_stride=base_stride,
+            gpus_per_node=(fabric.scaleup_domain or fabric.gpus_per_node),
+            base_stride=base_stride,
             step_latency=fabric.step_latency, algorithm=algorithm)
 
     nccl = priced(NCCL)
@@ -341,9 +365,15 @@ def price_collective(
     the same loop as the first rather than by a scalar ratio of link
     bandwidths applied to the first card's total.
     """
+    # The size that decides intra vs inter is the SCALE-UP DOMAIN, not the
+    # chassis: what the split asks is whether this group's traffic stays on
+    # the fast fabric, and on a supernode 768 dies do that across machines.
+    # Cards declaring no supernode have the two equal, so their phases --
+    # and every number on the GPU baseline -- are unchanged.
     phases_list = collective_phases(
         op=op, world=int(world), tensor_bytes=float(tensor_bytes),
-        gpus_per_node=int(fabric.gpus_per_node or 1),
+        gpus_per_node=int(fabric.scaleup_domain
+                          or fabric.gpus_per_node or 1),
         base_stride=int(base_stride or 1), algorithm=algorithm,
         t_sym=t_sym, t_sub=t_sub,
     )

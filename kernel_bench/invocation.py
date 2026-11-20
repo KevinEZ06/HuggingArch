@@ -57,6 +57,15 @@ class Invocation:
     # (`driver.physical_key_for`). A job without it cannot be keyed here —
     # assembling one from `dims` and `dtype_env` is the second derivation this
     # field exists to remove — so the driver refuses it and asks for a re-plan.
+    #: How far this launch's collective group physically reached, when it
+    #: reached past one chassis (`comm_cost.comm_reach`). Not a dim: a dim
+    #: is an extent and this is a placement, which is why it rides beside
+    #: them rather than in them. `emit.build_row` joins it to the cell the
+    #: row states, so a crossing measurement reads as one when the corpus
+    #: is read back. A TIER code (`comm_cost.COMM_REACHES`), not a rank
+    #: count: `scaleout` has no fixed extent to count. 0 is intra-host,
+    #: the default every row carried before the axis existed.
+    comm_domain: int = 0
     physical_key: Optional[Tuple[str, str, str, str]] = None
 
     # --- roofline numerators (for achieved_* on emit) ---
@@ -368,6 +377,7 @@ class Invocation:
             parallel=job.get("parallel", f"tp={job.get('tp', 1)}"),
             count_per_step=int(job.get("count_per_step", 1)),
             moe_block_member=bool(job.get("moe_block_member", False)),
+            comm_domain=int(job.get("comm_domain") or 0),
             physical_key=(tuple(job["physical_key"])
                           if job.get("physical_key") else None),
             kernel_params=dict(job.get("kernel_params") or {}),

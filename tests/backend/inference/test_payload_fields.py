@@ -56,6 +56,14 @@ ADDED = {
         "identity-source edges, so their order is not the inputs'",
     "per_op_timing_decode[*].point_law.in_terms[*].index":
         "as for prefill",
+    "gpu.ranks_per_scaleup_domain":
+        "the GPU sheet states how many ranks a SKU's SCALE-UP domain holds "
+        "when that is wider than one chassis (an Atlas A3 supernode "
+        "reaches 768 dies over Lingqu while `gpus_per_node` stays 16), "
+        "which is what decides whether a collective's traffic leaves the "
+        "fast fabric (`comm_cost.price_collective`, `comm_reach`); the SKU "
+        "block publishes every sheet column, and a reader comparing two "
+        "cards' interconnects needs both sizes to tell them apart",
     "gpu.nvls":
         "the GPU sheet states whether a SKU's NVLink domain reduces in the "
         "switch (NVLink SHARP), which decides whether a framework's NVLS "

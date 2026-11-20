@@ -74,6 +74,15 @@ class GPUSpec:
     mem_bw_gbps: Optional[float]
     tdp_w: Optional[float]
     gpus_per_node: Optional[float] = None
+    #: How many ranks the SCALE-UP DOMAIN holds, when it is wider than one
+    #: chassis. An Atlas A3 supernode reaches 768 dies over Lingqu (UB) at
+    #: the chassis's own rate, so a 32-rank group there crosses machines
+    #: without leaving the fast fabric -- the case `gpus_per_node` alone
+    #: cannot express, because that is the CHASSIS and stays 16.
+    #: Empty means the card declares no domain past its chassis, and every
+    #: reader falls back to `gpus_per_node`: that is every other row on
+    #: the sheet, whose behaviour is unchanged.
+    ranks_per_scaleup_domain: Optional[float] = None
     notes: str = ""
     #: The CUDA compute capability (`major.minor`, "9.0" for Hopper, "10.0" /
     #: "10.3" for the data-centre Blackwells): what a framework's kernel
@@ -264,7 +273,8 @@ PEAK_COLUMNS: Mapping[str, str] = _peak_columns()
 PRICE_COLUMNS: FrozenSet[str] = frozenset({
     "mem_gib", "mem_bw_gbps", "scaleup_gbps", "scaleup_fabric",
     "pcie_gbps", "rdma_gbps",
-    "nvls", "gpus_per_node", "compute_capability", *PEAK_COLUMNS.values()})
+    "nvls", "gpus_per_node", "ranks_per_scaleup_domain",
+    "compute_capability", *PEAK_COLUMNS.values()})
 
 #: The sheet columns no walk and no number reads — what a row says about
 #: itself, for a reader. Explicit, one entry per column with why: the third
@@ -428,6 +438,27 @@ def gpus_per_node(gpu: GPUSpec) -> int:
     if value < 1:
         raise ValueError(f"gpu_specs.csv: {gpu.sku!r} gpus_per_node={value}")
     return value
+
+
+def ranks_per_scaleup_domain(gpu: GPUSpec) -> int:
+    """Ranks in the card's SCALE-UP domain — the chassis unless the sheet
+    says wider.
+
+    `gpus_per_node` is the chassis and answers "does this group leave the
+    machine". It is not the same question as "does this group leave the
+    fast fabric": on an Atlas A3 supernode 768 dies reach each other over
+    Lingqu at the chassis's own rate, so 32 ranks cross machines and stay
+    on scale-up. A row that states nothing here has the two questions
+    coincide, which is every other card on the sheet.
+    """
+    raw = getattr(gpu, "ranks_per_scaleup_domain", None)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return gpus_per_node(gpu)
+    # A domain narrower than the chassis it contains is a sheet error, not
+    # a topology: the chassis answer is the safe one and the louder bug.
+    return max(value, gpus_per_node(gpu))
 
 
 def intra_bw_label(gpu: GPUSpec) -> str:

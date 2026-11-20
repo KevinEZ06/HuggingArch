@@ -42,7 +42,7 @@ ComparedRecord = Union[str, "_quant.ActivationCast"]
 
 
 def physical_key_for(inv: Invocation, env: Env,
-                     comm_domain: str = "host"):
+                     comm_domain: Any = None):
     """The calibration `PhysicalKey` this invocation measures — the same
     library-agnostic key an estimate looks a measurement up under — read off
     the invocation rather than assembled again.
@@ -71,6 +71,60 @@ def physical_key_for(inv: Invocation, env: Env,
     )
 
 
+
+def _reach_code(comm_domain) -> Optional[int]:
+    """The tier code a `--comm-domain` names, or None when it adds nothing.
+
+    None for intra-host and for anything unstated: an absent axis IS the
+    chassis, which is what leaves every row measured before this tier
+    existed byte-identical.
+    """
+    if comm_domain in (None, "", 0):
+        return None
+    from backend.inference.comm_cost import (COMM_REACH_HOST,
+                                             COMM_REACH_NAMES)
+    code = (COMM_REACH_NAMES.get(comm_domain)
+            if isinstance(comm_domain, str) else int(comm_domain))
+    if code is None or int(code) == COMM_REACH_HOST:
+        return None
+    return int(code)
+
+
+def _job_with_comm_domain(job: Dict[str, Any], comm_domain: str
+                          ) -> Dict[str, Any]:
+    """`job` with its collective cell stamped with where the ranks sat.
+
+    One place, before the Invocation exists, so every reader downstream
+    — the row's `shape_json`, the physical key, the coverage question —
+    sees one cell. `host` adds nothing: an absent axis IS intra-host, and
+    that is what keeps every row measured before this byte-identical.
+    """
+    code = _reach_code(comm_domain)
+    if code is None:
+        return job
+    dims = job.get("dims")
+    if isinstance(dims, str):
+        try:
+            dims = json.loads(dims)
+        except (TypeError, ValueError):
+            return job
+    # Only a collective has a group to place.
+    if not isinstance(dims, dict) or "n_comm_ranks" not in dims:
+        return job
+    # NOT into `dims`: `Invocation.from_job` coerces every value with
+    # `int()`, which is the contract — a dim is an extent. The reach is
+    # not an extent, so it rides on the job and `emit.build_row` joins it
+    # to the shape text the row is written with.
+    out = dict(job)
+    out["comm_domain"] = code
+    key = job.get("physical_key")
+    if isinstance(key, (list, tuple)) and len(key) >= 2:
+        key = list(key)
+        key[1] = _with_comm_domain(str(key[1]), comm_domain)
+        out["physical_key"] = key
+    return out
+
+
 def _with_comm_domain(shape_json: str, comm_domain: str) -> str:
     """Stamp a collective cell with how far its group physically reached.
 
@@ -82,7 +136,8 @@ def _with_comm_domain(shape_json: str, comm_domain: str) -> str:
     nothing: an absent axis IS intra-host (`_collective_identity`), which
     is what keeps every row measured before this byte-identical.
     """
-    if not comm_domain or comm_domain == "host" or not shape_json:
+    code = _reach_code(comm_domain)
+    if code is None or not shape_json:
         return shape_json
     from backend.inference.op_signatures import COMM_DOMAIN_AXIS
     try:
@@ -95,7 +150,7 @@ def _with_comm_domain(shape_json: str, comm_domain: str) -> str:
     # carry a fact nothing produced.
     if not isinstance(dims, dict) or "n_comm_ranks" not in dims:
         return shape_json
-    return json.dumps({**dims, COMM_DOMAIN_AXIS: comm_domain},
+    return json.dumps({**dims, COMM_DOMAIN_AXIS: code},
                       separators=(",", ":"), sort_keys=True)
 
 
@@ -361,7 +416,9 @@ def run_jobs(
     agree: Optional[Callable[[int, int], Any]] = None,
     comm_stride: int = 1,
     comm_origin: int = 0,
-    comm_domain: str = "host",
+    # A tier NAME as the CLI spells it, or its code; `_reach_code`
+    # is the one place the two meet. None/"host" adds no axis.
+    comm_domain: Any = None,
     nnodes: int = 1,
     node_rank: int = 0,
     master_addr: str = "127.0.0.1",
@@ -992,6 +1049,13 @@ def run_jobs(
     # resumes at the job that died, not at one it never reached.
     staged: List[Tuple[Optional[Invocation], Any, Optional[BaseException]]] = []
     for job in jobs:
+        # The reach joins the CELL, not just the lookup key. `build_row`
+        # writes `shape_json` from `inv.dims`, so stamping only the
+        # PhysicalKey would leave the row on disk keyed as intra-host
+        # while coverage asked about the crossing one — the two sides
+        # disagreeing about the same measurement, which is the whole
+        # defect `n_comm_domain` exists to end.
+        job = _job_with_comm_domain(job, comm_domain)
         try:
             inv = Invocation.from_job(job)
         except ValueError as e:
