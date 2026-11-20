@@ -25,6 +25,13 @@ _KV = {**_ACT, "kv": "bf16"}
 _W = {**_ACT, "weight": "bf16"}
 
 
+def _ports(*names):
+    """The plan port each operand fills, as a planned job names them
+    (`operand_ports`, from the row): one per operand, in the operands'
+    order."""
+    return [[name] for name in names]
+
+
 def _job(signature, op, phase, dims, shape_in, shape_out, shape_weight=None,
          dtype_env=_ACT, **extra):
     import json
@@ -46,14 +53,15 @@ CASES = [
         "rope", "fused_qk_rope", "decode",
         {"B": 1, "d_rope": 64, "n_heads": 1, "n_kv_heads": 1, "s_query": 1},
         [[1, 1, 1, 64], [1, 1, 64]], [[1, 1, 1, 64], [1, 1, 64]],
-        dtype_env=_KV)),
+        dtype_env=_KV, operand_ports=_ports("q_pe", "k_pe"))),
     # the passed-through half of each head is read only by the `cat`.
     ("torch_rope_partial", _job(
         "rope_partial", "fused_qk_rope_partial", "prefill",
         {"B": 16, "d_head": 192, "d_rope": 64, "n_heads": 2,
          "n_kv_heads": 1, "s_query": 1024},
         [[16, 2, 1024, 192], [16, 1, 1024, 192]],
-        [[16, 2, 1024, 192], [16, 1, 1024, 192]], dtype_env=_KV)),
+        [[16, 2, 1024, 192], [16, 1, 1024, 192]], dtype_env=_KV,
+        operand_ports=_ports("q", "k"))),
     # a projection whose output is the widest tensor of the cell.
     ("torch_cublas_linear", _job(
         "gemm", "linear", "prefill",
@@ -81,7 +89,7 @@ _WINDOWED_GQA = _job(
     {"B": 1, "d_head": 64, "kv_block_size": 16, "n_heads": 2,
      "n_kv_heads": 1, "s_kv": 256, "s_query": 256, "s_window": 64},
     [[1, 2, 256, 64], [1, 1, 256, 64], [1, 1, 256, 64]],
-    [1, 2, 256, 64], dtype_env=_KV)
+    [1, 2, 256, 64], dtype_env=_KV, operand_ports=_ports("q", "k", "v"))
 
 
 @pytest.mark.parametrize("impl, job", CASES, ids=[c[0] for c in CASES])
@@ -110,7 +118,8 @@ _QSA_K_COMPRESS = _job(
     {"B": 1, "compress_ratio": 4, "d_indexer_head": 128, "d_rope": 64,
      "kv_block_size": 16, "s_query": 1024, "s_slots": 256},
     [[1, 1024, 128], [128]], [1, 256, 128],
-    dtype_env={**_KV, "weight": "bf16"})
+    dtype_env={**_KV, "weight": "bf16"},
+    operand_ports=_ports("raw_key", "weight"))
 
 
 def test_the_qsa_key_pool_floor_launches_the_cell(monkeypatch):
@@ -127,7 +136,8 @@ _INDEXER_DECODE = _job(
     {"B": 4, "d_indexer_head": 128, "kv_block_size": 64,
      "n_indexer_heads": 32, "s_kv": 16512, "s_query": 1},
     [[4, 1, 32], [4, 16512, 128], [4, 1, 4096]], [4, 1, 16512],
-    dtype_env={"activation": "bf16", "kv": "bf16", "output": "fp32"})
+    dtype_env={"activation": "bf16", "kv": "bf16", "output": "fp32"},
+    operand_ports=_ports("w", "k", "q"))
 
 
 def test_the_indexer_floor_launches_the_decode_cell(monkeypatch):
@@ -149,7 +159,8 @@ def test_the_indexer_oracle_scores_each_request_against_its_own_keys():
                 "n_indexer_heads": 4, "s_kv": 40, "s_query": 2},
                [[3, 2, 4], [3, 40, 16], [3, 2, 64]], [3, 2, 40],
                dtype_env={"activation": "bf16", "kv": "bf16",
-                          "output": "fp32"})
+                          "output": "fp32"},
+               operand_ports=_ports("w", "k", "q"))
     inv = Invocation.from_job(job)
     spec = get_ref(inv.signature)
     inputs = spec.make_inputs(inv, "cpu", input_generator(inv, "cpu"))
@@ -185,7 +196,8 @@ _SPARSE_SINK_DECODE = _job(
      "n_heads": 64, "n_topk_keys": 1153, "s_kv": 1153, "s_query": 2},
     [[1, 64, 2, 576], [1, 1153, 576], [1, 2, 1153], [64], [1, 1153, 512]],
     [1, 64, 2, 512],
-    dtype_env={**_KV, "weight": "bf16"})
+    dtype_env={**_KV, "weight": "bf16"},
+    operand_ports=_ports("q", "k", "mask", "sinks", "v"))
 
 
 def test_the_sparse_sink_floor_launches_the_cell(monkeypatch):
@@ -207,20 +219,23 @@ _GATED_QUANT_CASES = [
         [[1, 1, 256], [1, 1, 256]], [1, 1, 256],
         dtype_env={**_QUANT_ACT, "activation_granularity": "per-group:128",
                    "metadata": "ue8m0"},
-        kernel_params={"clamp_limit": 10.0})),
+        kernel_params={"clamp_limit": 10.0},
+        operand_ports=_ports("gate", "up"))),
     ("torch_silu_and_mul_with_clamp_quant", _job(
         "silu_and_mul_with_clamp", "silu_and_mul_with_clamp", "decode",
         {"B": 1, "d_ffn": 288, "s_query": 1},
         [[1, 1, 288], [1, 1, 288]], [1, 1, 288],
         dtype_env={**_QUANT_ACT, "activation_granularity": "per-group:32",
                    "metadata": "ue8m0"},
-        kernel_params={"clamp_limit": 10.0})),
+        kernel_params={"clamp_limit": 10.0},
+        operand_ports=_ports("gate", "up"))),
     ("torch_silu_and_mul_quant", _job(
         "silu_and_mul", "silu_and_mul", "decode",
         {"B": 2, "d_ffn": 256, "s_query": 1},
         [[2, 1, 256], [2, 1, 256]], [2, 1, 256],
         dtype_env={**_QUANT_ACT, "activation_granularity": "per-token",
-                   "metadata": "fp32"})),
+                   "metadata": "fp32"},
+        operand_ports=_ports("gate", "up"))),
 ]
 
 
@@ -247,7 +262,8 @@ def test_the_quantised_gated_floor_walks_big_cells_in_row_blocks(monkeypatch):
         {"B": 1, "d_ffn": 256, "s_query": 300}, [[1, 300, 256], [1, 300, 256]],
         [1, 300, 256], dtype_env={**_QUANT_ACT, "metadata": "ue8m0",
                                   "activation_granularity": "per-group:128"},
-        kernel_params={"clamp_limit": 10.0}))
+        kernel_params={"clamp_limit": 10.0},
+        operand_ports=_ports("gate", "up")))
     spec = get_ref(inv.signature)
     inputs = spec.make_inputs(inv, "cpu", input_generator(inv, "cpu"))
     floor = next(p for p in all_providers()
@@ -273,7 +289,8 @@ def test_the_quantised_gated_floor_declines_a_row_its_groups_do_not_tile():
         "silu_and_mul", "silu_and_mul", "decode",
         {"B": 96, "d_ffn": 4, "s_query": 1}, [[96, 1, 4], [96, 1, 4]],
         [96, 1, 4], dtype_env={**_QUANT_ACT, "metadata": "fp32",
-                               "activation_granularity": "per-group:128"}))
+                               "activation_granularity": "per-group:128"},
+        operand_ports=_ports("gate", "up")))
     with pytest.raises(NotImplementedError):
         floor.impl_params(inv)
 
@@ -452,7 +469,7 @@ _MLA_ROPE = _job(
     "rope_partial_q", "fused_qk_rope_partial_q", "prefill",
     {"B": 1, "d_head": 192, "d_rope": 64, "n_heads": 8, "s_query": 64},
     [[1, 8, 64, 192], [1, 64, 64]], [[1, 8, 64, 192], [1, 64, 64]],
-    dtype_env=_KV)
+    dtype_env=_KV, operand_ports=_ports("q", "k_pe"))
 
 
 def _timed_trace(impl, job, monkeypatch=None, *, with_inputs=False):
@@ -678,7 +695,7 @@ _SGL_ROPE_DECODE = _job(
     "rope", "fused_qk_rope", "decode",
     {"B": 13, "d_rope": 128, "n_heads": 1, "n_kv_heads": 1, "s_query": 1},
     [[13, 1, 1, 128], [13, 1, 128]], [[13, 1, 1, 128], [13, 1, 128]],
-    dtype_env=_KV)
+    dtype_env=_KV, operand_ports=_ports("q_pe", "k_pe"))
 
 _STUB_ROPE_OPS = {}
 
@@ -780,7 +797,7 @@ _SGL_ROPE_PARTIAL_DECODE = _job(
     {"B": 1, "d_head": 128, "d_rope": 64, "n_heads": 3, "n_kv_heads": 1,
      "s_query": 1},
     [[1, 3, 1, 128], [1, 1, 1, 128]], [[1, 3, 1, 128], [1, 1, 1, 128]],
-    dtype_env=_KV)
+    dtype_env=_KV, operand_ports=_ports("q", "k"))
 
 
 # The canary the H100 disabled it on after that fix (2026-10-27): ONE head of
@@ -794,7 +811,7 @@ _SGL_ROPE_PARTIAL_ONE_HEAD = _job(
     {"B": 1, "d_head": 256, "d_rope": 64, "n_heads": 1, "n_kv_heads": 1,
      "s_query": 1},
     [[1, 1, 1, 256], [1, 1, 1, 256]], [[1, 1, 1, 256], [1, 1, 1, 256]],
-    dtype_env=_KV)
+    dtype_env=_KV, operand_ports=_ports("q", "k"))
 
 
 @pytest.mark.parametrize("job", [_SGL_ROPE_PARTIAL_ONE_HEAD,
@@ -846,7 +863,7 @@ _VLLM_FA3_DECODE = _job(
      "n_heads": 1, "n_kv_heads": 1, "s_kv": 128, "s_query": 1,
      "s_window": 128},
     [[1, 1, 1, 64], [1, 128, 1, 64], [1, 128, 1, 64]], [1, 1, 1, 64],
-    dtype_env={**_KV, "weight": "bf16"})
+    dtype_env={**_KV, "weight": "bf16"}, operand_ports=_ports("q", "k", "v"))
 
 
 def _stub_vllm_flash_attn(monkeypatch):
