@@ -42,7 +42,8 @@ from .phases import Speculation, phase_binding, phase_throughput, step_tokens
 from .parallel_config import ParallelConfig
 from .prefill_geometry import PrefillChunkSchedule, PrefillEndpointGeometry
 from backend.measure.measure_matrix import MeasureMatrix
-from .row_roofline import FloorForm, StepSum, floor_of, law_symbol, rung_symbols
+from .row_roofline import (FloorForm, FloorTerm, StepSum, candidate_symbols,
+                           floor_of, law_symbol)
 from .sol_data import walkRecordSchema as servingLawSchema
 from .calibration_overlay import point_keys
 from .serving_view import servingCapacityView
@@ -389,7 +390,8 @@ class _FloorTerms:
     definitions; `FloorForm` is it at one point with the floors left free,
     each step term under its own index. Nothing here is a second statement
     of the law: a term whose floors sit anywhere but an affine arm of one
-    max is refused."""
+    max — or, for a collective's envelope, a minimum of such arms — is
+    refused."""
     program: Any
     #: The same graph compiled for numpy arrays (whole-grid projection).
     program_v: Any
@@ -398,9 +400,10 @@ class _FloorTerms:
     width: int
     #: Floor-free parts: (step term, weight output, value output).
     constants: tuple[tuple[int, int, int], ...]
-    #: Per max: its step term, weight output and per arm (output, floor
-    #: or None).
-    terms: tuple[tuple[int, int, tuple[tuple[int, Optional[str]], ...]], ...]
+    #: Per max: its step term, weight output and per arm (outputs, floor
+    #: or None) — one output, or one per algorithm of a collective's
+    #: envelope, the arm their minimum.
+    terms: tuple[tuple[int, int, tuple[tuple[tuple[int, ...], Optional[str]], ...]], ...]
 
     def form(self, point: Mapping[str, Any], zero: Mapping[str, float],
              unit: Mapping[str, float], inputs: Sequence[str]) -> FloorForm:
@@ -447,35 +450,43 @@ class _FloorTerms:
         fixed: dict[int, float] = {}
         for k, weight, value in self.constants:
             fixed[k] = fixed.get(k, 0.0) + at0(weight) * at0(value)
-        maxed: dict[int, tuple[float, float, float, float]] = {}
+        maxed: dict[int, FloorTerm] = {}
         for k, weightIndex, arms in self.terms:
             w = at0(weightIndex)
             if w < 0:
                 raise ValueError(
                     f"a step term is weighted {w}: a max of its arms is not "
                     "the arms' max weighted")
-            a = b = c = n = 0.0
-            for index, floor in arms:
-                v0, v1 = at0(index), at1(index)
+            a = n = 0.0
+            pairs: tuple[tuple[float, float], ...] = ()
+            for indices, floor in arms:
                 if floor is None:
-                    a = max(a, w * v0)
+                    a = max(a, *(w * at0(index) for index in indices))
                 elif floor == "latency":
-                    b, c = w * v0, w * (v1 - v0)
+                    # One pair per algorithm of the envelope; one the card
+                    # cannot run never finishes and is left out
+                    # (`FloorTerm.of`).
+                    pairs = tuple(
+                        (w * at0(index), w * (at1(index) - at0(index)))
+                        if math.isfinite(at0(index)) else (math.inf, math.inf)
+                        for index in indices)
                 else:
+                    (index,) = indices
+                    v0, v1 = at0(index), at1(index)
                     if v0 != 0:
                         raise ValueError(
                             f"a launch arm is {v0} s with no launch floor")
                     n = w * v1
             if k in maxed:
                 raise ValueError(f"step term {k} adds two maxima")
-            maxed[k] = (a, b, c, n)
+            maxed[k] = FloorTerm.of(a, pairs, n)
         for k, value in fixed.items():
             if value and k in maxed:
                 raise ValueError(
                     f"step term {k} adds a floor-free part to a max of "
                     "floored arms: not one term of a floor form")
         return FloorForm.termwise(
-            ((k, maxed.get(k) or (fixed.get(k, 0.0), 0.0, 0.0, 0.0))
+            ((k, maxed.get(k) or FloorTerm(fixed.get(k, 0.0), (), 0.0))
              for k in sorted({*fixed, *maxed})), self.width)
 
 
@@ -529,15 +540,29 @@ def _floorTerms(inputs: tuple[str, ...],
         return len(emitted) - 1
 
     constants: list[tuple[int, int, int]] = []
-    terms: list[tuple[int, int, tuple[tuple[int, Optional[str]], ...]]] = []
+    terms: list[tuple[int, int, tuple[tuple[tuple[int, ...], Optional[str]], ...]]] = []
     step = [0]
 
-    def arm(expr: sp.Expr) -> tuple[int, Optional[str]]:
+    def body(expr: sp.Expr) -> sp.Expr:
+        while isinstance(expr, sp.Symbol) and expr.name in exprs:
+            expr = exprs[expr.name]
+        return expr
+
+    def arm(expr: sp.Expr) -> tuple[tuple[int, ...], Optional[str]]:
         kinds = floors(expr)
+        inner = body(expr)
+        if isinstance(inner, sp.Min) and kinds == {"latency"}:
+            # A collective's envelope: the minimum over its algorithms,
+            # each affine in the link latency (`comm_cost.Envelope`).
+            parts = [arm(part) for part in inner.args]
+            if any(kind not in (None, "latency") for _i, kind in parts):
+                raise ValueError(
+                    f"a collective's envelope waits on a launch: {expr}")
+            return tuple(i for indices, _k in parts for i in indices), "latency"
         if len(kinds) > 1 or not affine(expr):
             raise ValueError(
                 f"a step term's arm is not affine in one floor: {expr}")
-        return emit(expr), next(iter(kinds), None)
+        return (emit(expr),), next(iter(kinds), None)
 
     def split(expr: sp.Expr, weight: tuple[sp.Expr, ...]) -> None:
         w = sp.Mul(*weight) if weight else sp.Integer(1)
@@ -1500,21 +1525,19 @@ def cardBinding(record: Mapping[str, Any], card: Card, *,
                     peak_flops_for_dtype(gpu, dtype) or math.inf)
 
     def collectiveValues(signature: str) -> None:
+        # Each algorithm of the collective's envelope on this card, under
+        # the name the step's law reads it by (`row_roofline.collective_symbol`:
+        # the family, the signature, then the algorithm's own suffix).
         sig = CollectiveSignature.from_key(signature)
-        ladder = sig.ladder(fabric)
+        envelope = sig.envelope(fabric)
         base = sig.symbol_suffix
-        names = (f"COMM_S_PER_BYTE{base}", f"COMM_LATENCY_S{base}")
-        values = (ladder[-1].s_per_byte, ladder[-1].latency_s)
-        for symbol, value in zip(names, values, strict=True):
-            out[symbol] = float(value)
-        for index, segment in enumerate(ladder[:-1]):
-            names = tuple(
-                f"{symbol.name[:-len(f'_r{index}')] if symbol.name.endswith(f'_r{index}') else symbol.name}{base}_r{index}"
-                for symbol in rung_symbols(index))
-            values = (segment.max_bytes, segment.s_per_byte,
-                      segment.latency_s)
-            for symbol, value in zip(names, values, strict=True):
-                out[symbol] = float(value)
+        for candidate, values in zip(envelope.candidates,
+                                     envelope.law_values(), strict=True):
+            for family, symbol, value in zip(
+                    ("COMM_S_PER_BYTE", "COMM_LATENCY_S"),
+                    candidate_symbols(candidate.algorithm), values,
+                    strict=True):
+                out[f"{family}{base}{symbol.name[len(family):]}"] = float(value)
 
     seen: set[str] = set()
     for phase in record["phases"].values():

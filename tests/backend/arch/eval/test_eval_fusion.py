@@ -1555,8 +1555,10 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         """KDA decode: GLM-5.3-Flash runs gate + beta + l2norm + recurrence
         as one launch in both frameworks. Kimi-K3 is not claimed by either:
         vLLM runs its whole mixer as one kernel, and sglang does at
-        attention TP 8. Prefill fuses none of it. The recurrent state read
-        stays on the launch."""
+        attention TP 8. In PREFILL vLLM runs the same span again — FlashKDA
+        takes the gate, beta and both l2 norms as kernel arguments — while
+        sglang's chunk path launches the gate apart, so only vLLM claims
+        GLM's prefill. The recurrent state read stays on the launch."""
         deployment = ServingDeployment.at(gpu_sku="H100-SXM",
                                           activation_dtype="BF16")
 
@@ -1577,7 +1579,11 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
             prefill = shared_walk(base)
             decode = shared_walk(base.during(DECODE, cache_len=4096))
             for framework in ("vllm", "sglang"):
-                self.assertFalse(fired(framework, prefill), model)
+                # vLLM's FlashKDA prefill is this same span, for the class
+                # that has it; sglang's prefill is the chunk path.
+                self.assertEqual(fired(framework, prefill),
+                                 claimed and framework == "vllm",
+                                 (model, framework, "prefill"))
                 self.assertEqual(fired(framework, decode), claimed,
                                  (model, framework))
 
@@ -1621,8 +1627,10 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         """KDA prefill: sglang forms the bounded gate and beta as one launch
         (`fused_kda_gate`) for both KDA classes — GLM-5.3-Flash's head-last
         spelling and Kimi-K3's head-first one, the plan's two `optional`
-        transposes. vLLM's prefill is FlashKDA, a launch no plan states, so
-        it binds nothing; decode is the decode plans' in both frameworks."""
+        transposes. vLLM's prefill is FlashKDA, which takes the gate inside
+        the recurrence launch, so this gate-only plan binds nothing there
+        (Kimi-K3's prefill is the per-channel span instead); decode is the
+        decode plans' in both frameworks."""
         deployment = ServingDeployment.at(gpu_sku="H100-SXM",
                                           activation_dtype="BF16")
 
@@ -1963,7 +1971,9 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         (`fused_kda_decode`) at 12 / 24 / 48 / 96 local heads on SM90+
         without speculation, else the per-channel gate + recurrence launch;
         sglang runs the whole mixer only at 12 local heads (attention TP 8),
-        else the per-channel launch. Prefill fuses neither. The conv and
+        else the per-channel launch. In PREFILL vLLM runs FlashKDA, which
+        takes the gate, beta and both l2 norms as kernel arguments — the
+        per-channel span again, on SM90 and newer only. The conv and
         recurrent state reads stay on the launch."""
         from backend.arch.layout.parallel_config import ParallelConfig
 
@@ -2001,7 +2011,11 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         self.assertEqual(fired("sglang", walk(tp=8, s_verify=3))[0], set())
         self.assertEqual(fired("vllm", tp1, sku="A100-80G-SXM")[0],
                          per_channel)
-        self.assertEqual(fired("vllm", walk(phase="prefill"))[0], set())
+        # Prefill: FlashKDA's one launch on SM90+, and below it the Triton
+        # chunk path, whose gate is its own launch — no plan for that pair.
+        self.assertEqual(fired("vllm", walk(phase="prefill"))[0], per_channel)
+        self.assertEqual(
+            fired("vllm", walk(phase="prefill"), sku="A100-80G-SXM")[0], set())
 
         def cache_reads(analysis):
             return sum(int(t.kv_reads) for t in
@@ -2024,8 +2038,9 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         decode only (prefill convolves three times), the six-way merged input
         projection, the pre-FFN AttnRes add + readout + norm, the MLA q
         concat + latent cache insert, and the compiled output gate in both
-        phases. At attention TP 8 a small decode step splits the merged
-        projection into two GEMMs, so it is not one launch there. GLM-5.3
+        phases. Attention TP 8 is the same one launch: vLLM splits the
+        projection into two stream GEMMs only on a decode step of at most 14
+        tokens, a token threshold billed on the default path. GLM-5.3
         runs the packed conv and the six-way projection in both phases.
         sglang packs the conv for both models and none of vLLM's K3-only
         launches; the MLA q concat + latent cache insert is no K3-only
@@ -2089,7 +2104,7 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
             for m in vllm["add_attn_res_combine_norm"]))
 
         tp8 = fused("vllm", walk(k3, tp=8))
-        self.assertNotIn("merged_column_parallel_linear_wide", tp8)
+        self.assertIn("merged_column_parallel_linear_wide", tp8)
 
         sglang = fused("sglang", decode)
         self.assertIn("causal_conv1d_packed", sglang)
@@ -2117,11 +2132,14 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         ops = {n.op for n in decode.program.walked_nodes()}
         self.assertFalse(ops & {"rope", "rope_emb"}, ops & {"rope", "rope_emb"})
 
-    def test_kimi_k3_merged_projection_is_unfused_at_tp8_decode_only(self):
-        """vLLM splits Kimi-K3's six-way KDA input projection into two GEMMs
-        only at attention TP 8 (`_KDA_TP_SIZE`, low_latency_gemm.py:65) on a
-        small decode step: at every other TP dividing the 96 KDA heads the
-        decode step runs it as one merged GEMM."""
+    def test_kimi_k3_merged_projection_is_one_launch_at_every_tp(self):
+        """Kimi-K3's six-way KDA input projection is one merged GEMM at every
+        attention TP that divides its 96 KDA heads. vLLM splits it into two
+        stream GEMMs only at TP 8 (`_KDA_TP_SIZE`, low_latency_gemm.py:65) on
+        a CUDA-graph decode step of at most 14 tokens
+        (`KDA_PROJECTION_OVERLAP_MAX_TOKENS`, :59) — a token threshold, which
+        is billed on the phase's default path rather than conditioned, so no
+        TP is excluded here."""
         from backend.arch.layout.parallel_config import ParallelConfig
 
         deployment = ServingDeployment.at(gpu_sku="H100-SXM",
@@ -2139,7 +2157,7 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
             if not any(n.op == "merged_column_parallel_linear_wide"
                        for n in fused.nodes()):
                 unfused.append(tp)
-        self.assertEqual(unfused, [8])
+        self.assertEqual(unfused, [])
 
     def test_a_launch_that_exposes_a_cache_join_keeps_its_readers_on_the_cache(
             self):

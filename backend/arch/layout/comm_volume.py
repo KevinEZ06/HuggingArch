@@ -18,18 +18,18 @@ a cross-node traversal waiting longer (`inference.comm_cost.Fabric.
 hop_latency`).
 
 Those two are what NCCL's schedule costs, and what an all-reduce costs
-wherever no faster algorithm runs. Inside one NVLink domain a serving
-framework all-reduces a small or medium payload with its own kernels
-instead (`ALGORITHMS`: one-shot, two-shot, NVLS); which of them a payload
-takes is the framework's dispatch (`framework_bindings`, `collectives:`),
-and what each costs is stated here, beside the ring's.
+wherever no faster algorithm runs. Inside one NVLink domain an all-reduce
+also runs as a one-shot, a two-shot or an NVLS kernel (`ALGORITHMS`); what
+each costs and what topology it needs is stated here, beside the ring's.
+Which of them prices a payload is not a framework's choice: it is the
+fastest the card's fabric can run (`inference.comm_cost.Envelope`).
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from backend.arch.ops import OP_REGISTRY, collective_schedule
 
@@ -263,17 +263,57 @@ def latency_hops(op: str, world: int) -> int:
     return 2 * rounds if op == "all_reduce" else rounds
 
 
+#: What one stage of a collective algorithm is, as a reader draws it: a
+#: ring pass, a direct write to every peer, a reduce-scatter, an all-gather,
+#: the switch reducing or multicasting, or a hop between nodes. The one
+#: statement of the vocabulary; an algorithm naming any other is refused at
+#: import (`CollectiveAlgorithm`).
+STAGE_KINDS = frozenset({"ring", "all_to_all", "reduce_scatter", "all_gather",
+                         "switch_reduce", "switch_multicast", "inter_node"})
+
+#: What a card's fabric may offer an algorithm beyond a link between every
+#: pair of ranks: an NVLink domain, and a switch in it that reduces and
+#: multicasts. The one statement of the vocabulary; `CollectiveAlgorithm.needs`
+#: is checked against it at import, and `inference.comm_cost.Fabric` answers
+#: each name.
+FABRIC_CAPABILITIES = frozenset({"nvlink", "nvls"})
+
+
 @dataclass(frozen=True)
 class CollectiveAlgorithm:
-    """One way to run an all-reduce of N ranks: the link traversals one
+    """One way to run a collective of N ranks: the link traversals one
     instance waits on in sequence (`hops`), the bytes a rank moves per
-    payload byte (`factor`), and the topology it needs: `"nvlink"`, every
-    rank reaching every other over NVLink (a peer-to-peer kernel);
-    `"nvls"`, a switch that reduces in the network; `""`, any fabric."""
+    payload byte (`factor`), the fabric capabilities it needs (`needs`,
+    names from `FABRIC_CAPABILITIES`: `"nvlink"`, every rank reaching every
+    other over NVLink, a peer-to-peer kernel; `"nvls"`, a switch that
+    reduces in the network; none, any fabric), the collectives it runs
+    (`ops`; empty: every one), what it does in one plain sentence
+    (`description`), its stages in order (`stages`, `(kind, label)` with
+    the kind from `STAGE_KINDS`) and what its price leaves out (`note`).
+    NCCL's schedule declares no stages of its own: they are its phases on
+    the card, which the placement decides
+    (`inference.comm_cost.collective_phases`)."""
     name: str
-    needs: str
+    needs: frozenset
     hops: Callable[[str, int], int]
     factor: Callable[[str, int], float]
+    ops: frozenset = frozenset()
+    description: str = ""
+    stages: Tuple[Tuple[str, str], ...] = ()
+    note: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        stray = sorted({kind for kind, _label in self.stages} - STAGE_KINDS)
+        unknown = sorted(set(self.needs) - FABRIC_CAPABILITIES)
+        if stray or unknown or not self.description:
+            raise ValueError(
+                f"collective algorithm {self.name!r}: stage kinds {stray} are "
+                f"not in {sorted(STAGE_KINDS)}, needs {unknown} are not in "
+                f"{sorted(FABRIC_CAPABILITIES)}, or it states no description")
+
+    def runs(self, op: str) -> bool:
+        """Whether this algorithm is a way to run the collective `op`."""
+        return not self.ops or op in self.ops
 
     def factor_symbolic(self, op: str, world: Optional[int] = None, *,
                         symbol: str = "N") -> str:
@@ -287,11 +327,14 @@ class CollectiveAlgorithm:
                 "nvls": f"{less}/{over}"}[self.name]
 
 
-#: The algorithm every collective takes where no dispatch says otherwise.
+#: NCCL's own schedule: the algorithm every collective can run, on any
+#: fabric and across nodes.
 NCCL = "nccl"
 
-#: The all-reduce algorithms, by the names frameworks and NCCL give them;
-#: the vocabulary a binding's `collectives:` is checked against at load.
+#: The algorithms a collective may run, by the names frameworks and NCCL
+#: give them, in the order a tie between two equally fast ones is broken
+#: (`inference.comm_cost.Envelope`). The first three are all-reduces inside
+#: one NVLink domain; NCCL's runs everything.
 #:
 #: * `one_shot` — every rank writes its whole payload to every peer (or
 #:   reads every peer's), then reduces locally: one traversal, and a rank
@@ -302,25 +345,77 @@ NCCL = "nccl"
 #: * `nvls` — NVLink SHARP: each rank reduces its `T/N` slice in the switch
 #:   (`multimem.ld_reduce`) and multicasts it back (`multimem.st`): two
 #:   traversals, and a rank moves `(N-1)/N T` each way, half the ring's.
+#:   The coefficient counts only the PEERS' share of each slice, the way the
+#:   ring's does. The switch's fetch of a rank's own slice and its multicast
+#:   back both cross that rank's link as well, so the bytes on the link are
+#:   `T` each way rather than `(N-1)/N T`: at N=8 the link carries 8/7, about
+#:   14% more bytes than priced, and the time is 1/8, 12.5%, optimistic.
+#:   Kept as stated until a measurement says which reading NVLS's achieved
+#:   bus bandwidth follows; the algorithm's `note` says so on every row.
 #: * `nccl` — NCCL's own schedule, priced as the ring's bytes
 #:   (`ring_factor`) and the latency-optimal log-depth hops (`latency_hops`):
 #:   what runs wherever none of the above does, and on every other
 #:   collective.
 ALGORITHMS: Dict[str, CollectiveAlgorithm] = {
     a.name: a for a in (
-        CollectiveAlgorithm("one_shot", "nvlink",
-                            lambda op, n: 1 if n > 1 else 0,
-                            lambda op, n: float(n - 1) if n > 1 else 0.0),
-        CollectiveAlgorithm("two_shot", "nvlink",
-                            lambda op, n: 2 if n > 1 else 0,
-                            lambda op, n: 2.0 * (n - 1) / n if n > 1 else 0.0),
-        CollectiveAlgorithm("nvls", "nvls",
-                            lambda op, n: 2 if n > 1 else 0,
-                            lambda op, n: (n - 1) / n if n > 1 else 0.0),
-        CollectiveAlgorithm(NCCL, "",
-                            latency_hops,
-                            lambda op, n: ring_factor(op, n) if n > 1 else 0.0),
+        CollectiveAlgorithm(
+            "one_shot", frozenset({"nvlink"}),
+            lambda op, n: 1 if n > 1 else 0,
+            lambda op, n: float(n - 1) if n > 1 else 0.0,
+            frozenset({"all_reduce"}),
+            "each rank writes its whole payload to every peer, then sums the "
+            "copies it received itself",
+            (("all_to_all", "every rank writes its payload to every peer and "
+                            "reduces the copies locally"),)),
+        CollectiveAlgorithm(
+            "two_shot", frozenset({"nvlink"}),
+            lambda op, n: 2 if n > 1 else 0,
+            lambda op, n: 2.0 * (n - 1) / n if n > 1 else 0.0,
+            frozenset({"all_reduce"}),
+            "each rank sums one 1/N slice gathered straight from every peer, "
+            "then writes its summed slice back to every peer",
+            (("reduce_scatter", "each rank reduces its 1/N slice from every "
+                                "peer"),
+             ("all_gather", "each rank writes its reduced slice to every "
+                            "peer"))),
+        CollectiveAlgorithm(
+            "nvls", frozenset({"nvlink", "nvls"}),
+            lambda op, n: 2 if n > 1 else 0,
+            lambda op, n: (n - 1) / n if n > 1 else 0.0,
+            frozenset({"all_reduce"}),
+            "each rank sends its slice into the NVSwitch, which reduces it "
+            "and multicasts the sum back to every rank",
+            (("switch_reduce", "the switch reduces each 1/N slice across the "
+                               "ranks"),
+             ("switch_multicast", "the switch multicasts each reduced slice "
+                                  "to every rank")),
+            note="priced at (N-1)/N of the payload each way, the peers' share "
+                 "of each slice; the switch's fetch of a rank's own slice and "
+                 "its multicast back cross that rank's link too, so the link "
+                 "carries N/(N-1) of that — at N=8 about 14% more bytes, and "
+                 "the time about 12.5% optimistic"),
+        CollectiveAlgorithm(
+            NCCL, frozenset(),
+            latency_hops,
+            lambda op, n: ring_factor(op, n) if n > 1 else 0.0,
+            description="NCCL's own schedule: a ring inside one node; across "
+                        "nodes a reduce-scatter inside each node, the shards "
+                        "exchanged between nodes, then an all-gather inside "
+                        "each node"),
     )}
+
+
+def algorithms_for(op: str) -> Tuple[str, ...]:
+    """The algorithms that run the collective `op` (`ALGORITHMS`, in their
+    order): what a collective's envelope ranges over before the card says
+    which of them its fabric admits. NCCL's is always among them."""
+    return tuple(name for name, a in ALGORITHMS.items() if a.runs(op))
+
+
+# NCCL's schedule is the envelope's floor of feasibility: it runs every
+# collective on every fabric, so no envelope is ever empty.
+if ALGORITHMS[NCCL].ops or ALGORITHMS[NCCL].needs:
+    raise ValueError("NCCL's schedule must run every collective on any fabric")
 
 
 def ring_factor_symbolic(op: str, world: Optional[int] = None, *,

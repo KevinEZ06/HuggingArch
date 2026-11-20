@@ -3,6 +3,7 @@ traffic formulas and their end-to-end wiring into the per-op roofline.
 """
 from __future__ import annotations
 
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -194,13 +195,10 @@ class TestCommCostInPipeline(unittest.TestCase):
         # not multiplied through the 32 layers, so they're scoped out of the
         # "scales by layers" assertion below.
         #
-        # Every TP all_reduce of a llama layer is absorbed by a fused norm
-        # (`allreduce_fused_rmsnorm`): the attention exit's by the layer's own
-        # post-attention norm, the FFN exit's across the seam by the next
-        # layer's input norm (31 launches) and, after the last layer, by the
-        # final norm (1). So the rows are read by the collective they carry
-        # (`comm_op`), not by op name, and the counts are checked to add up to
-        # two all_reduces per layer, each launch costing the same.
+        # The walk is a 4096-token prefill, and vLLM's AR+RMSNorm fusion runs
+        # only where its workspace holds the step's rows, which the binding
+        # bills as decode (`allreduce_fused_rmsnorm`'s `phase`): every TP
+        # all_reduce of a llama layer runs bare here, two per layer.
         rows = [r for r in self._rows(tp_attention=8, tp_dense_ffn=8)
                 if r.get("comm_bytes_per_rank", 0) > 0
                 and "vocab_" not in str(r.get("aggregation_id", ""))]
@@ -208,13 +206,8 @@ class TestCommCostInPipeline(unittest.TestCase):
         self.assertTrue(all(r["comm_op"] == "all_reduce" for r in rows))
         # llama has 32 layers and two TP all_reduces in each.
         self.assertEqual(sum(r["count_per_step"] for r in rows), 2 * 32)
-        # Each of them rides a fused norm, none runs bare.
-        self.assertEqual({r["op"] for r in rows}, {"allreduce_fused_rmsnorm"})
-        # The attention exit's, one per layer in its own layer; the FFN
-        # exit's, split at the seams: 31 into the next layer's input norm
-        # and 1, after the last layer, into the final norm.
-        self.assertEqual(sorted(r["count_per_step"] for r in rows),
-                         [1, 31, 32])
+        self.assertEqual({r["op"] for r in rows}, {"all_reduce"})
+        self.assertEqual(sorted(r["count_per_step"] for r in rows), [32, 32])
         per_launch = [r["t_comm_s"] / r["count_per_step"] for r in rows]
         for r in rows:
             self.assertGreater(r["t_comm_s"], 0)
@@ -222,6 +215,79 @@ class TestCommCostInPipeline(unittest.TestCase):
         # the layers, whichever row (in-layer or seam) carries the launch.
         for t in per_launch:
             self.assertAlmostEqual(t / per_launch[0], 1.0, places=9)
+
+    def test_every_framework_prices_one_collective_alike(self):
+        """The envelope asks the card, not the framework: on an H100 node
+        the same all-reduce (world, instances and payload) costs the same
+        under vLLM and sglang, in time, wire bytes and chosen algorithm."""
+        from backend.inference.framework_bindings import get_binding
+        from backend.inference.gpu_specs import get_gpu
+        from backend.inference.parallel_config import ParallelConfig
+        from backend.inference.pipeline import analyze
+        gpu = get_gpu("H100-SXM")
+        priced = {}
+        for framework in ("vllm", "sglang"):
+            res = analyze(
+                self.resolved, parallel=ParallelConfig(tp_attention=8,
+                                                       tp_dense_ffn=8),
+                framework_binding=get_binding(framework), batch_size=1,
+                avg_input_tokens=4096, avg_output_tokens=0,
+                peak_flops_per_sec=1e15, peak_hbm_bw_bytes_per_sec=3.35e12,
+                gpu=gpu, intra_bw_bytes_per_sec=450e9,
+                inter_bw_bytes_per_sec=50e9, comm_latency_s=2e-6,
+                breakdown=True)
+            priced[framework] = {
+                (c["op"], c["world"], c["count"], c["payload_bytes"]):
+                    (r["t_comm_s"], r["comm_bytes_per_rank"], c["algorithm"])
+                for r in res.per_op_timing
+                for c in [r.get("comm_choice")] if c}
+        shared = set(priced["vllm"]) & set(priced["sglang"])
+        self.assertTrue(shared)
+        for key in shared:
+            self.assertEqual(priced["vllm"][key], priced["sglang"][key], key)
+        # A 4096-token prefill all-reduce of Llama-2's 4096-wide residual is
+        # 32 MiB: NVLS on this switch.
+        self.assertIn("nvls", {v[2] for v in priced["vllm"].values()})
+
+    def test_the_published_choice_is_the_rows_price(self):
+        """Second route on a real walk: the candidate `comm_choice` names is
+        the row's own price — its `t_s` the row's `t_comm_s` and its wire
+        bytes the row's `comm_bytes_per_rank` — inside an NVLS node, across
+        two HGX nodes (the hierarchical schedule) and on a PCIe card."""
+        from backend.inference import gpu_specs as gs
+        from backend.inference.framework_bindings import get_binding
+        from backend.inference.parallel_config import ParallelConfig
+        from backend.inference.pipeline import analyze
+        seen = set()
+        for card, world, want in (("H100-SXM", 16, {"nccl"}),
+                                  ("H100-PCIe", 4, {"nccl"}),
+                                  ("B300", 8, {"nvls"})):
+            gpu = gs.get_gpu(card)
+            res = analyze(
+                self.resolved, parallel=ParallelConfig(
+                    tp_attention=world, tp_dense_ffn=world),
+                framework_binding=get_binding("vllm"), batch_size=1,
+                avg_input_tokens=4096, avg_output_tokens=0,
+                peak_flops_per_sec=1e15, peak_hbm_bw_bytes_per_sec=3.35e12,
+                gpu=gpu,
+                intra_bw_bytes_per_sec=gs.peak_intra_bw_bytes_per_sec(gpu),
+                inter_bw_bytes_per_sec=gs.peak_inter_bw_bytes_per_sec(gpu),
+                comm_latency_s=2e-6, breakdown=True)
+            rows = [r for r in res.per_op_timing if r.get("comm_choice")]
+            self.assertTrue(rows, card)
+            for r in rows:
+                choice = r["comm_choice"]
+                chosen = next(c for c in choice["candidates"]
+                              if c["algorithm"] == choice["algorithm"])
+                self.assertAlmostEqual(chosen["t_s"], r["t_comm_s"],
+                                       delta=1e-12 * max(1.0, r["t_comm_s"]))
+                self.assertAlmostEqual(chosen["wire_bytes_per_rank"],
+                                       r["comm_bytes_per_rank"], delta=1e-6)
+                if choice["op"] == "all_reduce":
+                    seen.add((card, choice["algorithm"],
+                              choice["fabric"]["nodes_spanned"]))
+            self.assertEqual({a for c, a, _n in seen if c == card}, want, card)
+        self.assertIn(("H100-SXM", "nccl", 2), seen)
 
     def test_no_comm_no_cost_at_tp1(self):
         rows = self._rows(tp_attention=1, tp_dense_ffn=1)
@@ -564,62 +630,71 @@ class TestCollectiveLatency(unittest.TestCase):
         self.assertAlmostEqual(t_small, 6 * self.ALPHA, delta=1e-10)
 
 
-class TestTheFrameworkPicksTheAllReduce(unittest.TestCase):
-    """Inside one NVLink domain the framework's dispatch (`collectives:` in
-    its binding) picks the all-reduce algorithm by payload: one-shot (one
-    traversal, a rank receives (N-1)T) below the threshold, two-shot (two,
-    2(N-1)/N T) above it, NVLS where the switch reduces; NCCL's schedule
-    past them, on a card without an NVLink domain, and across domains
-    (`comm_cost.collective_ladder`)."""
+class TestTheEnvelopePicksTheAllReduce(unittest.TestCase):
+    """A collective is priced as its envelope (`comm_cost.Envelope`): the
+    fastest, at its payload, of the algorithms the card's fabric can run —
+    one-shot (one traversal, a rank receives (N-1)T) and two-shot (two,
+    2(N-1)/N T) inside an NVLink domain, NVLS (two, (N-1)/N T) where the
+    switch reduces, NCCL's schedule everywhere. Which ones the fabric runs
+    is a hardware fact and nothing else; no framework is asked."""
 
     ALPHA = 2e-6
 
-    def _rows(self, card, world, payload, framework="vllm", stride=1,
-              architectures=()):
-        from backend.inference.comm_cost import collective_ladder, ladder_segment
-        from backend.inference.framework_bindings import get_binding
+    def _envelope(self, card, world, stride=1, op="all_reduce", count=1):
+        from backend.inference.comm_cost import CollectiveSignature
         from backend.inference.gpu_specs import get_gpu
         fabric = Fabric.of(get_gpu(card), self.ALPHA)
-        from types import SimpleNamespace
-        rungs = get_binding(framework).collectives_for(
-            SimpleNamespace(architectures=architectures), None)["all_reduce"]
-        seg = ladder_segment(collective_ladder(
-            op="all_reduce", world=world, count_per_step=1, base_stride=stride,
-            fabric=fabric, rungs=rungs), payload)
-        return fabric, price_collective(
+        return fabric, CollectiveSignature(op, world, count, stride).envelope(
+            fabric)
+
+    def _one(self, card, world, payload, stride=1):
+        fabric, envelope = self._envelope(card, world, stride)
+        chosen = envelope.choose(payload)
+        t, rows = price_collective(
             op="all_reduce", world=world, tensor_bytes=payload,
             count_per_step=1, fabric=fabric, base_stride=stride,
-            algorithm=seg.algorithm)
+            algorithm=chosen.algorithm)
+        self.assertAlmostEqual(t, chosen.t(payload), delta=1e-15)
+        return t, [(r["algorithm"], r["name"], r["world"], r["hops"])
+                   for r in rows]
 
-    def _one(self, *args, **kw):
-        _fabric, (t, rows) = self._rows(*args, **kw)
-        return t, [(r["algorithm"], r["name"], r["world"], r["hops"]) for r in rows]
-
-    def test_a_tp8_decode_all_reduce_on_hgx_is_one_shot(self):
-        # Kimi-K3 / DeepSeek-V3 at B=1: 7168 x 2 B. N T = 112 KiB <= 1 MiB.
-        for card, bw in (("H100-SXM", 450e9), ("B300", 900e9)):
+    def test_a_small_payload_is_one_shot_on_an_nvlink_card(self):
+        # Kimi-K3 / DeepSeek-V3 at B=1: 7168 x 2 B.
+        for card, bw in (("H100-SXM", 450e9), ("B300", 900e9),
+                         ("A100-80G-SXM", 300e9)):
             t, rows = self._one(card, 8, 14336.0)
             self.assertEqual(rows, [("one_shot", "all_reduce", 8, 1)], card)
             # By hand: one traversal, and every rank receives 7 payloads.
             self.assertAlmostEqual(t, self.ALPHA + 7 * 14336 / bw, delta=1e-15)
 
-    def test_above_the_one_shot_threshold_it_is_two_shot(self):
-        # B=16: 229,376 B; N T = 1.75 MiB > 1 MiB.
-        t, rows = self._one("H100-SXM", 8, 229376.0)
-        self.assertEqual(rows, [("two_shot", "all_reduce", 8, 2)])
-        self.assertAlmostEqual(t, 2 * self.ALPHA + 2 * 7 / 8 * 229376 / 450e9,
-                               delta=1e-15)
-        # The threshold is inclusive: exactly 1 MiB over the group is one-shot.
-        self.assertEqual(self._one("H100-SXM", 8, 131072.0)[1][0][0], "one_shot")
-        self.assertEqual(self._one("H100-SXM", 8, 131088.0)[1][0][0], "two_shot")
-
-    def test_a_prefill_payload_is_nvls_on_hopper_and_two_shot_on_b300(self):
+    def test_a_large_payload_is_nvls_where_the_switch_reduces(self):
         T = 14680064.0   # 1024 tokens x 7168 x 2 B
-        t, rows = self._one("H100-SXM", 8, T)
-        self.assertEqual(rows, [("nvls", "all_reduce", 8, 2)])
-        self.assertAlmostEqual(t, 2 * self.ALPHA + 7 / 8 * T / 450e9, delta=1e-12)
-        self.assertEqual(self._one("B300", 8, T)[1],
-                         [("two_shot", "all_reduce", 8, 2)])
+        for card, bw in (("H100-SXM", 450e9), ("B300", 900e9)):
+            t, rows = self._one(card, 8, T)
+            self.assertEqual(rows, [("nvls", "all_reduce", 8, 2)], card)
+            self.assertAlmostEqual(t, 2 * self.ALPHA + 7 / 8 * T / bw,
+                                   delta=1e-12)
+
+    def test_the_switch_is_where_one_shot_and_nvls_cross(self):
+        # one-shot α + 7T/bw against NVLS 2α + 7T/(8 bw): equal at
+        # T = α bw / 6.125, the fastest on either side of it.
+        cross = self.ALPHA * 450e9 / 6.125
+        self.assertEqual(self._one("H100-SXM", 8, cross * 0.99)[1][0][0],
+                         "one_shot")
+        self.assertEqual(self._one("H100-SXM", 8, cross * 1.01)[1][0][0],
+                         "nvls")
+
+    def test_nvlink_without_a_reducing_switch_is_two_shot(self):
+        # A100's NVSwitch does not reduce in the network: past one-shot it
+        # is two-shot — NCCL's ring moves the same bytes in more hops.
+        T = 14680064.0
+        t, rows = self._one("A100-80G-SXM", 8, T)
+        self.assertEqual(rows, [("two_shot", "all_reduce", 8, 2)])
+        self.assertAlmostEqual(t, 2 * self.ALPHA + 1.75 * T / 300e9,
+                               delta=1e-12)
+        _fabric, envelope = self._envelope("A100-80G-SXM", 8)
+        nvls = next(c for c in envelope.candidates if c.algorithm == "nvls")
+        self.assertEqual(nvls.refusal, "card has no NVLink multicast (NVLS)")
 
     def test_without_an_nvlink_domain_it_is_nccls_schedule(self):
         # PCIe cards: no peer-to-peer NVLink, no switch — every payload runs
@@ -631,21 +706,13 @@ class TestTheFrameworkPicksTheAllReduce(unittest.TestCase):
                 self.assertEqual(rows, [("nccl", "all_reduce", world,
                                          2 * (world - 1).bit_length())],
                                  (card, world, payload))
-
-    def test_nvlink_without_a_reducing_switch_skips_nvls(self):
-        # A100's NVSwitch does not reduce in the network: one-shot and
-        # two-shot run, a payload past them is NCCL's.
-        self.assertEqual(self._one("A100-80G-SXM", 8, 14336.0)[1][0][0], "one_shot")
-        self.assertEqual(self._one("A100-80G-SXM", 8, 14680064.0)[1][0][0], "nccl")
-
-    def test_two_shot_and_nvls_need_their_group_sizes(self):
-        # NVLS at 4, 6 and 8 ranks; a 2-rank group past two-shot is NCCL's,
-        # and so is a 3-rank one, which no vLLM kernel takes at all.
-        self.assertEqual(self._one("H100-SXM", 2, 14680064.0)[1][0][0], "nccl")
-        self.assertEqual(self._one("H100-SXM", 4, 14680064.0)[1][0][0], "nvls")
-        self.assertEqual(self._one("H100-SXM", 3, 7168.0)[1][0][0], "nccl")
-        self.assertEqual(self._one("H100-SXM", 3, 7168.0, framework="sglang")[1][0][0],
-                         "one_shot")
+        _fabric, envelope = self._envelope("H100-PCIe", 4)
+        self.assertEqual(
+            [(c.algorithm, c.refusal) for c in envelope.candidates],
+            [("one_shot", "card has no NVLink domain (PCIe)"),
+             ("two_shot", "card has no NVLink domain (PCIe)"),
+             ("nvls", "card has no NVLink domain (PCIe)"),
+             ("nccl", None)])
 
     def test_across_hgx_nodes_the_hierarchy_stays(self):
         # TP16 on 8-GPU HGX nodes: NCCL's three phases, each its own hops.
@@ -653,91 +720,94 @@ class TestTheFrameworkPicksTheAllReduce(unittest.TestCase):
         self.assertEqual(rows, [("nccl", "reduce_scatter", 8, 3),
                                 ("nccl", "all_reduce", 2, 2),
                                 ("nccl", "all_gather", 8, 3)])
+        _fabric, envelope = self._envelope("H100-SXM", 16)
+        self.assertEqual(
+            [c.refusal for c in envelope.candidates[:-1]],
+            [f"the group spans 2 nodes; {a} runs inside one NVLink domain"
+             for a in ("one-shot", "two-shot", "nvls")])
         # An outer group strided across nodes is one member per node.
         _t, rows = self._one("H100-SXM", 4, 14336.0, stride=8)
         self.assertEqual(rows, [("nccl", "all_reduce", 4, 4)])
 
-    def test_an_nvl72_rack_runs_the_group_sizes_the_kernels_take(self):
-        # GB200 NVL72: TP16 stays inside the rack's NVLink domain, and
-        # FlashInfer has a 16-rank table on SM100: one-shot, then two-shot.
-        self.assertEqual(self._one("GB200", 16, 7168.0)[1],
-                         [("one_shot", "all_reduce", 16, 1)])
-        self.assertEqual(self._one("GB200", 16, 524288.0)[1],
-                         [("two_shot", "all_reduce", 16, 2)])
-        # Symmetric memory's multimem has no 16-rank entry: NCCL.
-        self.assertEqual(self._one("GB200", 16, 14680064.0)[1][0][0], "nccl")
-        # 32 and 72 ranks are one domain too, but no framework kernel takes
-        # them: NCCL's schedule, flat inside the rack.
-        for world in (32, 72):
-            for payload in (7168.0, 14680064.0):
-                self.assertEqual(self._one("GB200", world, payload)[1],
-                                 [("nccl", "all_reduce", world,
-                                   2 * (world - 1).bit_length())],
-                                 (world, payload))
-        self.assertEqual(self._one("GB200", 32, 7168.0, framework="sglang")[1][0][0],
-                         "nccl")
+    def test_an_nvl72_rack_is_one_domain_at_any_group_size(self):
+        # GB200 NVL72: a 16-, 32- or 72-rank group stays inside the rack's
+        # NVLink domain, so the switch's algorithms run there — no
+        # framework's table of group sizes is asked.
+        for world in (16, 32, 72):
+            self.assertEqual(self._one("GB200", world, 7168.0)[1],
+                             [("one_shot", "all_reduce", world, 1)], world)
+            self.assertEqual(self._one("GB200", world, 14680064.0)[1],
+                             [("nvls", "all_reduce", world, 2)], world)
 
-    def test_sglang_reads_its_own_dispatch(self):
-        _t, rows = self._one("H100-SXM", 8, 14336.0, framework="sglang")
-        self.assertEqual(rows, [("one_shot", "all_reduce", 8, 1)])
-        # SM100 keeps two-shot to 8 MiB, SM90 to 512 KiB.
-        self.assertEqual(self._one("B200", 8, 4194304.0, framework="sglang")[1][0][0],
-                         "two_shot")
-        self.assertEqual(self._one("H100-SXM", 8, 4194304.0, framework="sglang")[1][0][0],
-                         "nvls")
+    def test_other_collectives_run_nccls_schedule(self):
+        for op in ("all_gather", "reduce_scatter", "all_to_all"):
+            _fabric, envelope = self._envelope("B300", 8, op=op)
+            self.assertEqual([c.algorithm for c in envelope.candidates],
+                             ["nccl"], op)
 
     def test_a_fabric_with_no_card_runs_nccl(self):
-        # Bandwidths alone admit no framework kernel: the textbook schedule.
-        from backend.inference.comm_cost import CollectiveRung, collective_ladder
-        ladder = collective_ladder(
-            op="all_reduce", world=8, count_per_step=1, base_stride=1,
-            fabric=Fabric(8, 4.5e11, 5e10, "NVLink", "RDMA", self.ALPHA),
-            rungs=(CollectiveRung("one_shot", max_bytes_times_world=1 << 20,
-                                  worlds=(8,)),))
-        self.assertEqual([s.algorithm for s in ladder], ["nccl", "nccl"])
-        self.assertEqual(ladder[0].max_bytes, 0.0)
+        # Bandwidths alone admit no NVLink algorithm: the textbook schedule.
+        from backend.inference.comm_cost import CollectiveSignature
+        fabric = Fabric(8, 4.5e11, 5e10, "NVLink", "RDMA", self.ALPHA)
+        envelope = CollectiveSignature("all_reduce", 8, 1, 1).envelope(fabric)
+        self.assertEqual([c.algorithm for c in envelope.candidates
+                          if c.feasible], ["nccl"])
+        self.assertEqual(envelope.choose(14336.0).algorithm, "nccl")
+        # A refused algorithm has no price: it never finishes, so the law's
+        # minimum over every candidate is the minimum over the feasible
+        # ones, whatever order the algorithms are declared in.
+        self.assertEqual([latency == math.inf for _rate, latency
+                          in envelope.law_values()],
+                         [True, True, True, False])
 
-
-class TestBlackwellAndFusionArchitectures(TestTheFrameworkPicksTheAllReduce):
-    """NVLS by the capability's group sizes, and sglang's FlashInfer path for
-    the model classes it turns AR fusion on for."""
-
-    T = 14680064.0   # a 1024-token prefill all-reduce, 7168 x 2 B
-
-    def test_a_blackwell_tp4_prefill_all_reduce_is_two_shot(self):
-        # vLLM: no multimem at 4 ranks on SM100; FlashInfer's two-shot to
-        # 32 MiB (64 MiB on SM103). sglang: no multicast at 4 ranks on SM100.
-        for card in ("B200", "B300"):
-            for fw in ("vllm", "sglang"):
-                t, rows = self._one(card, 4, self.T, framework=fw)
-                self.assertEqual(rows, [("two_shot", "all_reduce", 4, 2)],
-                                 (card, fw))
-                # By hand: two traversals, 2 x 3/4 of the payload.
-                self.assertAlmostEqual(
-                    t, 2 * self.ALPHA + 1.5 * self.T / 900e9, delta=1e-12)
-        # Past FlashInfer's SM100 32 MiB cap, vLLM runs NCCL.
-        self.assertEqual(self._one("B200", 4, 64e6)[1][0][0], "nccl")
-        # Hopper keeps NVLS at 4 ranks.
-        self.assertEqual(self._one("H100-SXM", 4, self.T)[1][0][0], "nvls")
-
-    def test_sglang_runs_flashinfer_two_shot_for_its_fusion_architectures(self):
-        dsv3 = ("DeepseekV3ForCausalLM",)
-        self.assertEqual(
-            self._one("B200", 8, self.T, framework="sglang",
-                      architectures=dsv3)[1],
-            [("two_shot", "all_reduce", 8, 2)])
-        # Below the switch it is still one-shot.
-        self.assertEqual(
-            self._one("B200", 8, 14336.0, framework="sglang",
-                      architectures=dsv3)[1][0][0], "one_shot")
-        # Another model class runs the v2 kernel: multicast at 8 ranks.
-        self.assertEqual(
-            self._one("B200", 8, self.T, framework="sglang",
-                      architectures=("LlamaForCausalLM",))[1][0][0], "nvls")
-        # Hopper: the fusion rung is SM100's only.
-        self.assertEqual(
-            self._one("H100-SXM", 8, self.T, framework="sglang",
-                      architectures=dsv3)[1][0][0], "nvls")
+    def test_the_choice_is_published_from_the_same_envelope(self):
+        """`comm_choice`: the chosen algorithm is the fastest feasible
+        candidate, its time and wire bytes are the ones the row prices, and
+        every feasible candidate's curve is its own law on the log grid."""
+        from backend.inference.comm_cost import CURVE_PAYLOADS
+        fabric, envelope = self._envelope("H100-SXM", 8, count=3)
+        payload = 229376.0
+        choice = envelope.choice(payload)
+        self.assertEqual(choice["algorithm"], "nvls")
+        self.assertEqual(choice["fabric"], {"link": "NVLink", "nvls": True,
+                                            "gpus_per_node": 8,
+                                            "nodes_spanned": 1})
+        feasible = [c for c in choice["candidates"] if c["feasible"]]
+        self.assertEqual(min(feasible, key=lambda c: c["t_s"])["algorithm"],
+                         "nvls")
+        chosen = next(c for c in feasible if c["algorithm"] == "nvls")
+        t, rows = price_collective(
+            op="all_reduce", world=8, tensor_bytes=payload, count_per_step=3,
+            fabric=fabric, base_stride=1, algorithm="nvls")
+        self.assertAlmostEqual(chosen["t_s"], t, delta=1e-15)
+        self.assertEqual(chosen["wire_bytes_per_rank"],
+                         sum(r["bytes_per_rank"] for r in rows))
+        self.assertEqual(chosen["wire_bytes_per_rank"], 3 * 7 / 8 * payload)
+        self.assertEqual([p for p, _t in chosen["curve"]],
+                         list(CURVE_PAYLOADS))
+        self.assertEqual(len(CURVE_PAYLOADS), 25)
+        # The envelope on the same grid is the pointwise minimum of the
+        # feasible curves, with the algorithm that sets it.
+        for k, (p, t, algorithm) in enumerate(choice["envelope_curve"]):
+            best = min(feasible, key=lambda c: c["curve"][k][1])
+            self.assertEqual((p, t, algorithm),
+                             (best["curve"][k][0], best["curve"][k][1],
+                              best["algorithm"]))
+        self.assertEqual({row[2] for row in choice["envelope_curve"]},
+                         {"one_shot", "nvls"})
+        self.assertIn("12.5%", chosen["note"])
+        # What each algorithm is, from its declaration: a declared
+        # algorithm's stages, and NCCL's from its phases on this placement.
+        self.assertEqual([st["kind"] for st in chosen["stages"]],
+                         ["switch_reduce", "switch_multicast"])
+        self.assertTrue(all(c["description"] for c in choice["candidates"]))
+        self.assertEqual(choice["ranks"], list(range(8)))
+        fabric, envelope = self._envelope("H100-SXM", 16)
+        nccl = envelope.choice(payload)["candidates"][-1]
+        self.assertEqual([st["kind"] for st in nccl["stages"]],
+                         ["reduce_scatter", "inter_node", "all_gather"])
+        self.assertEqual((CURVE_PAYLOADS[0], CURVE_PAYLOADS[-1]),
+                         (1 << 10, 1 << 30))
 
 
 class TestRoutedExchangeLevels(unittest.TestCase):
@@ -950,18 +1020,24 @@ class TestRoutedExchangeLevels(unittest.TestCase):
         self.assertEqual(len(self._phases(8, 8)), 1)
 
     def test_a_routed_exchange_runs_nccls_schedule(self):
-        """A framework's own all-reduce kernels do not run a dispatch, at
-        any placement — the non-divisible one included, which used to
-        decline to say so."""
+        """A routed exchange is an all-to-all, which only NCCL's schedule
+        runs (`comm_volume.algorithms_for`): its envelope is that one
+        candidate at every placement, and asking the fabric about an
+        all-reduce algorithm for it is an error, not a refusal."""
+        from backend.inference.comm_cost import CollectiveSignature
         for world, node, stride in ((8, 8, 1), (32, 8, 1), (64, 72, 2)):
+            fabric = Fabric(node, 4.5e11, 5e10, nvlink=True, nvls=True)
+            envelope = CollectiveSignature(
+                "all_to_all", world, 1, stride, self.F).envelope(fabric)
+            self.assertEqual([c.algorithm for c in envelope.candidates],
+                             ["nccl"])
             with self.assertRaises(ValueError):
-                collective_phases("all_to_all", world, self.T,
-                                  gpus_per_node=node, base_stride=stride,
-                                  fanout=self.F, algorithm="one_shot")
+                fabric.refusal("one_shot", op="all_to_all", world=world,
+                               base_stride=stride)
 
     def test_members_per_node_has_one_statement(self):
-        """The rung dispatch, the fabric split and the levels read one
-        number (`members_per_node`), not three spellings of it."""
+        """The envelope's feasibility, the fabric split and the levels read
+        one number (`members_per_node`), not three spellings of it."""
         for world, node, stride, want in ((8, 8, 1, 8), (8, 8, 2, 4),
                                           (32, 8, 1, 8), (4, 8, 8, 1),
                                           (8, 72, 1, 8), (2, 8, 4, 2)):

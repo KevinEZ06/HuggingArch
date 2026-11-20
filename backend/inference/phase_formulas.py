@@ -807,6 +807,7 @@ def _t_comm_formula_for_row(
     comm_bytes_formula: Optional[Dict[str, Any]],
     comm_phases: List[Dict[str, Any]],
     cnt: int,
+    choice: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """The `t_comm` tooltip of a collective row: `bytes / bandwidth
     (fabric) + n × hops × link_latency = time`, and for a hierarchical
@@ -815,8 +816,9 @@ def _t_comm_formula_for_row(
     The hops are each phase's, by the algorithm that runs it (`algorithm`
     and `hops` on the phase rows `price_collective` returns), and so is one
     traversal's latency (`hop_latency_s`: a cross-node phase waits longer
-    per hop, `comm_cost.Fabric.hop_latency`); the note names a one-phase
-    collective's algorithm.
+    per hop, `comm_cost.Fabric.hop_latency`). The note names the algorithm
+    the collective's envelope chose and the feasible ones it was the
+    fastest of (`choice`, `comm_cost.Envelope.choice`).
     None for a row that moves nothing."""
     if not comm_bw_label or not comm_bw_bytes_per_sec:
         return None
@@ -827,8 +829,14 @@ def _t_comm_formula_for_row(
         return f"{_fmt_si(v, 'B')}/s" if v and v > 0 else "bandwidth"
 
     note = f"world={comm_world}" if comm_world else None
-    if note and len(comm_phases) == 1 and comm_phases[0].get("algorithm"):
-        note += f", {comm_phases[0]['algorithm'].replace('_', '-')}"
+    if note and choice:
+        def name(a: str) -> str:
+            return a.replace("_", "-")
+        feasible = [name(c["algorithm"]) for c in choice["candidates"]
+                    if c["feasible"]]
+        note += f", {name(choice['algorithm'])}"
+        if len(feasible) > 1:
+            note += f" (fastest of {', '.join(feasible)})"
     per = max(int(cnt or 1), 1)
     out: Dict[str, Any]
     if len(comm_phases) > 1:

@@ -204,6 +204,20 @@ def _torch_floor_build(inv: Invocation, env: Env, inputs: Dict[str, Any]
         return BenchCase(run=fused, to_canonical=lambda o: torch.cat(
             [o[0].float(), o[1].float().flatten(1)], dim=-1))
 
+    if sig == "mhc_post_combine_norm":
+        def post_combine_norm():
+            """The Blackwell seam span's naive chain at the cell's width:
+            the post-mix, then the carried-pre collapse and the next
+            sublayer's RMSNorm."""
+            y = post_mix()
+            reduced = (inputs["pre"].to(dt).unsqueeze(-1) * y).sum(dim=1)
+            normed = reduced * torch.rsqrt(
+                reduced.square().mean(-1, keepdim=True, dtype=torch.float32)
+                + float(inputs["norm_eps"])).to(dt)
+            return normed * inputs["norm_weight"].to(dt), y
+        return BenchCase(run=post_combine_norm, to_canonical=lambda o: torch.cat(
+            [o[0].float(), o[1].float().flatten(1)], dim=-1))
+
     if sig == "mhc_mega_post_pre":
         def mega_mhc():
             """The Mega-MHC span's naive chain at the cell's width."""
@@ -535,6 +549,35 @@ def _sgl_combine_norm_build(inv: Invocation, env: Env, inputs: Dict[str, Any]
         to_canonical=lambda y: _big_fuse_canonical(y, post, comb))
 
 
+def _sgl_post_combine_norm_build(inv: Invocation, env: Env,
+                                 inputs: Dict[str, Any]) -> BenchCase:
+    """sglang's Blackwell seam launch: the post, the next sublayer's
+    collapse by the carried `pre`, and that sublayer's norm, in one call
+    (`mhc_post_combine_norm_prefill`). It writes both ports the span
+    declares — the normed input and the new residual — so the canonical
+    form is the launch's own two writes.
+
+    The kernel is a JIT build compiled for V4.1's geometry (4 copies x 5120),
+    which the arm declares (`enum`) rather than asserting inside the build.
+    """
+    _require_cuda()
+    from sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill import (
+        mhc_post_combine_norm_prefill,
+    )
+    x, residual = inputs["sublayer"], inputs["residual"]
+    post, comb, pre = inputs["post"], inputs["comb"], inputs["pre"]
+    weight = inputs["norm_weight"].bfloat16().contiguous()
+    eps = float(inputs["norm_eps"])
+
+    def run():
+        return mhc_post_combine_norm_prefill(
+            x, residual, post, comb, pre.contiguous(), weight, eps)
+    return BenchCase(
+        run=run,
+        to_canonical=lambda o: __import__("torch").cat(
+            [o[1].float(), o[0].float().flatten(1)], dim=-1))
+
+
 # --- mhc_fused_post_pre ----------------------------------------------------
 
 def _vllm_fused_build(inv: Invocation, env: Env, inputs: Dict[str, Any]
@@ -661,8 +704,24 @@ register(Provider(
     build=_sgl_combine_norm_build, fused_op="mhc_pre_big_fuse",
 ))
 
+# The Blackwell one-launch seam: sglang's kernel, and the torch floor below.
+# No vLLM arm — vLLM has no launch at this boundary (its delayed epilogue is
+# the `mhc_pre_big_fuse` arm above, after a separate post).
+register(Provider(
+    library="sglang", signature="mhc_post_combine_norm",
+    kernel_impl="sglang_mhc_post_combine_norm_prefill",
+    import_name="sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill",
+    serves=KernelSignature(signature="mhc_post_combine_norm",
+                           activation=("bf16",),
+                           enum=(("d_model", (5120,)),
+                                 ("n_hidden_copies", (4,)))),
+    build=_sgl_post_combine_norm_build, fused_op="mhc_post_combine_norm",
+    min_sm=100,
+))
+
 for _sig in ("mhc_post", "mhc_pre_gemm", "mhc_pre_big_fuse",
-             "mhc_fused_post_pre", "mhc_mega_post_pre"):
+             "mhc_fused_post_pre", "mhc_mega_post_pre",
+             "mhc_post_combine_norm"):
     register(Provider(
         library="torch", signature=_sig, kernel_impl=f"torch_{_sig}",
         import_name="torch",

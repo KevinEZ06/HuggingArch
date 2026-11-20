@@ -25,12 +25,24 @@
 #     (`apply_routed_scaling_factor_on_output`, srt/models/deepseek_v2.py:781).
 #
 # Same boundary in prefill and decode.
+#
+# The gate temperature a checkpoint may divide the logits by before scoring
+# (DeepSeek-V4.1's `gate_temp`, `components/library/dsv41_moe_vl.yaml`) is an
+# OPTIONAL member: neither launch has a temperature operand — vLLM's kernel
+# reads the logits and scores them (`_dsv4_topk_kernel` :77-81), and no vLLM
+# or sglang router applies one anywhere — so where the graph spells it, it is
+# work the router launch absorbs. That is exact when the temperature is 1 (the
+# reference default, and no released V4.1 config sets another) or is folded
+# into the gate weight the server loads; which of the two holds is not read
+# here. The same statement as `moe_mega_gate_sqrtsoftplus`, which absorbs the
+# same scale into the wider launch that starts at the gate GEMM.
 
 fused_op: moe_topk_sqrtsoftplus
 
 naive_pattern:
   nodes:
-    softplus: { op: softplus,          inputs: [external.gating] }
+    temperature: { op: scale_const,    inputs: [external.gating], optional: true }
+    softplus: { op: softplus,          inputs: [temperature.out] }
     score:    { op: sqrt,              inputs: [softplus.out] }
     biased:   { op: add,               inputs: [score.out, external.bias] }
     topk:     { op: topk,              inputs: [biased.out] }

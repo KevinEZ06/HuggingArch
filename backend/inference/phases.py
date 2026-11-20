@@ -46,7 +46,7 @@ from .gpu_specs import NoPeakForDtype
 from .intensity import arithmetic_intensity
 from .module_rows import instance_count
 from .row_roofline import (LawBook, RowCard, RowRoofline, RowTimes, StepSum,
-                           WeightDemand, build_row_exprs, comm_factor,
+                           WeightDemand, build_row_exprs, row_algorithms,
                            bare_row, law_columns, point_columns, weight_demand)
 from .phase_formulas import (
     FormulaDefs,
@@ -1350,7 +1350,7 @@ def compute_per_op_timing(
     #: lists no column for a width the deployment chose.
     gpu_sku: str = "",
     #: The card itself, when there is one: its topology decides which of the
-    #: framework's all-reduce algorithms run on it (`comm_cost.topology`).
+    #: all-reduce algorithms its fabric runs (`comm_cost.topology`).
     gpu: Any = None,
 ) -> List[Dict[str, Any]]:
     """Build per-leaf rooftop timing rows scaled to full per-step model
@@ -1406,7 +1406,7 @@ def compute_per_op_timing(
     from backend.arch.eval.dim import (as_extent, as_number, as_wire, expr_of,
                                        value_of)
     # The card's topology rides with its bandwidths: what it admits of the
-    # framework's own all-reduces (`comm_cost.collective_ladder`).
+    # all-reduce algorithms (`comm_cost.Envelope`).
     fabric = Fabric(gpus_per_node, intra_bw_bytes_per_sec,
                     inter_bw_bytes_per_sec, intra_bw_label, inter_bw_label,
                     comm_latency_s)._replace(**topology(gpu))
@@ -1652,10 +1652,6 @@ def compute_per_op_timing(
             # that is not a routed exchange.
             comm_route_fanout = (m.get("comm_route_fanout") or None
                                  if is_comm else None)
-            # The framework's dispatch of this collective
-            # (`ServingLayers.collectives`): the rungs it is priced over.
-            comm_rungs = ([r.as_dict() for r in laws.collectives.get(comm_op, ())]
-                          if is_comm and comm_world > 1 else [])
             # The payload as the emitter built it, one instance's, as the
             # walk's law.
             law_m = (law_comm_meta.values.get(uid) or {}
@@ -1665,6 +1661,10 @@ def compute_per_op_timing(
             # The row's law, over the workload and the card, built from the
             # walk's laws: the same at every point of the cell, so written
             # once (`ServingLayers.written`).
+            facts = {"count_per_step": cnt, "act_dtype": adt_name, "is_comm": is_comm,
+                     "comm_op": comm_op, "comm_world": comm_world,
+                     "comm_base_stride": comm_base_stride,
+                     "comm_route_fanout": comm_route_fanout}
             written = law_written.setdefault((uid, converts), {})
             law = written.get("law") or written.setdefault("law", law_columns(build_row_exprs(
                 count=cnt, flops=flops_one, act_in=act_in_one,
@@ -1675,20 +1675,14 @@ def compute_per_op_timing(
                 demand=asked_law,
                 weight_total=weight_total_pr, metadata_total=meta_total_pr,
                 comm_payload=comm_payload_one,
-                comm_factor=(comm_factor(comm_op, comm_world,
-                                         comm_route_fanout)
-                             if is_comm else 0.0),
                 comm_priced=is_comm and comm_world > 1,
-                comm_rungs=len(comm_rungs)), laws.book))
+                # The algorithms its envelope ranges over: the time is
+                # their minimum on the card (`comm_cost.Envelope`).
+                comm_algorithms=row_algorithms(facts)), laws.book))
             # This row at the walk's point: its law read there on the card
             # (`LawBook.row_at`), the one reading every re-evaluation of it
             # makes, and published through the one rendering
             # (`row_roofline.point_columns`).
-            facts = {"count_per_step": cnt, "act_dtype": adt_name, "is_comm": is_comm,
-                     "comm_op": comm_op, "comm_world": comm_world,
-                     "comm_base_stride": comm_base_stride,
-                     "comm_route_fanout": comm_route_fanout,
-                     "comm_rungs": comm_rungs}
             card = RowCard(op_peak, peak_hbm_bw_bytes_per_sec, fabric,
                            launch_floor_s)
             row_at = laws.book.row_at(
@@ -2108,9 +2102,6 @@ def compute_per_op_timing(
                 # collective (a Ulysses CP exchange is flat, and that is a
                 # fact about it rather than a missing one).
                 "comm_route_fanout": comm_route_fanout,
-                # The framework's dispatch rungs the collective is priced
-                # over, so another card reads the same ladder.
-                "comm_rungs": comm_rungs,
                 "comm_collective_in_shape": (
                     [int(v) for v in m.get("collective_in_shape") or []]
                     if is_comm else []
@@ -2132,6 +2123,10 @@ def compute_per_op_timing(
                 "comm_bw_label": point.get("comm_bw_label"),
                 "comm_bytes_formula": point.get("comm_bytes_formula"),
                 "t_comm_formula": point.get("t_comm_formula"),
+                # The algorithm the collective's envelope chose at this
+                # point and every one it was chosen among
+                # (`comm_cost.Envelope.choice`); None off a collective.
+                "comm_choice": point.get("comm_choice"),
                 # Per-phase breakdown for the popover — empty for non-comm
                 # and intra-only collectives (which collapse to one phase),
                 # populated for cross-node hierarchical AR (three phases:

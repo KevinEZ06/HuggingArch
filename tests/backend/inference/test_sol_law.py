@@ -209,7 +209,7 @@ def test_a_batched_floor_form_is_the_point_one():
         assert (batched.index, batched.width) == (scalar.index, scalar.width)
         assert batched.constant == pytest.approx(scalar.constant, rel=1e-12)
         for ours, theirs in zip(batched.terms, scalar.terms, strict=True):
-            assert ours == pytest.approx(theirs, rel=1e-12)
+            assert ours.flat() == pytest.approx(theirs.flat(), rel=1e-12)
 
     [row] = servingLawPoints(
         record, card=card, contexts=(8192,), decodeBatches=(10**9, 1, 8),

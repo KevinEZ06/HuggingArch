@@ -5627,6 +5627,50 @@ register_ref("mhc_fused_post_pre",
              RefSpec(_hc_fused_post_pre_inputs, _hc_fused_post_pre_reference))
 
 
+def _hc_post_combine_norm_inputs(inv: Invocation, device: str, gen: Any
+                                 ) -> Dict[str, Any]:
+    """The Blackwell seam launch's cell: the post operands, the CARRIED
+    previous `pre`, and the next sublayer's norm gain. `pre` is drawn in the
+    range the sigmoid split leaves it (one to two), as the Mega-MHC cell
+    draws it."""
+    import torch
+    out = _hc_post_inputs(inv, device, gen)
+    out.update({
+        "pre": 1.0 + torch.rand(
+            *_shape(inv, "pre"), dtype=torch.float32, device=device,
+            generator=gen),
+        "norm_weight": torch.randn(
+            *_shape(inv, "norm_weight"), dtype=_dtype(inv.dtype),
+            device=device, generator=gen),
+    })
+    return out
+
+
+def _hc_post_combine_norm_reference(inputs: Dict[str, Any]) -> Any:
+    """The launch's two canonical writes side by side: the normalised
+    sublayer input and the new multi-copy residual.
+
+    The collapse reads the residual AS THE GRAPH CARRIES IT, in the
+    activation dtype — the round trip the fusion removes — so the reference
+    rounds the post-mix before reducing it, exactly as
+    `_hc_fused_post_pre_reference` does for the other joined span.
+    """
+    import torch
+    residual = hc_post_mix(inputs).to(inputs["residual"].dtype)
+    reduced = (inputs["pre"].float().unsqueeze(-1)
+               * residual.float()).sum(dim=1)
+    normed = reduced * torch.rsqrt(
+        reduced.square().mean(-1, keepdim=True)
+        + float(inputs["norm_eps"]))
+    layer_input = normed * inputs["norm_weight"].float()
+    return torch.cat([layer_input, residual.flatten(1).float()], dim=-1)
+
+
+register_ref("mhc_post_combine_norm",
+             RefSpec(_hc_post_combine_norm_inputs,
+                     _hc_post_combine_norm_reference))
+
+
 def _hc_mega_post_pre_inputs(inv: Invocation, device: str, gen: Any
                              ) -> Dict[str, Any]:
     """The Mega-MHC cell: the post operands, the projection, the CARRIED

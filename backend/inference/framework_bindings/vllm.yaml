@@ -3,12 +3,9 @@
 # kernel's key depends on that vLLM, not the model, makes (`kv_block_size`,
 # and where it reads `ssm_chunk_size`); which launch it selects for a
 # quantised matmul (`precision_launches`); the output widths the kernels it
-# dispatches to REQUIRE of a declared role (`edge_dtypes`); and which
-# all-reduce algorithm it runs on a payload inside one NVLink domain
-# (`collectives`). Nothing else lives
-# here: framework source is a reference for an implementation, a fusion
-# pattern, a measured kernel's identity and that dispatch; the bytes and the
-# link traversals each algorithm costs are `comm_volume.ALGORITHMS`'.
+# dispatches to REQUIRE of a declared role (`edge_dtypes`). Nothing else
+# lives here: framework source is a reference for an implementation, a
+# fusion pattern and a measured kernel's identity.
 # Which release measured a dispatch, and at what latency, is the corpus row's
 # provenance (`framework_version`, date, contributor). Which provider
 # implementation vLLM dispatches to is declared below in `kernel_dispatches`,
@@ -327,97 +324,13 @@ kernel_dispatches:
            kv_block_size: [16]}
     source_anchor: "The same FA3 resolution (vllm/v1/attention/backends/fa_utils.py:94-104, vllm/v1/attention/backends/flash_attn.py:432-440, vllm/v1/attention/backends/flash_attn.py:296-318); the decode path reads the paged cache through the block table and calls the varlen FA kernel (vllm/v1/attention/backends/flash_attn.py:1177-1305, vllm/v1/attention/backends/flash_attn.py:1399-1424), the audited default cache page is 16 (vllm/config/cache.py:72), and the page is in this identity because the provider resolves it into the impl_id"
 
-# The all-reduce vLLM runs on a tensor-parallel payload inside one NVLink
-# domain, by payload: the first rung the card admits and the payload fits
-# wins, NCCL's schedule past them all (`comm_cost.collective_ladder`; the
-# card's topology is `gpu_specs.csv` `nvlink_gbps` / `nvls`). One
-# representative threshold per algorithm, where the estimate changes under
-# common deployments; vLLM's per-(capability, world) buffer caps, its
-# environment switches and its CUDA-graph details are billed as below, not
-# modelled.
-#
-# The path. At the default `-O2` (config/vllm.py:427) the AR+RMSNorm fusion
-# pass is on for TP>1 on SM90 and the SM100 family with flashinfer installed
-# (config/vllm.py:171-195, :294), and an all-reduce it does not absorb tries
-# FlashInfer first (distributed/device_communicators/cuda_communicator.py:
-# 362-396; `VLLM_ALLREDUCE_USE_FLASHINFER` defaults on, envs.py:278). On one
-# node FlashInfer runs its MNNVL backend, which needs the NVSwitch multicast
-# (flashinfer_all_reduce.py:143-178), and vLLM leaves the one-shot/two-shot
-# choice to FlashInfer's AUTO (compilation/passes/fusion/allreduce_rms_fusion.py:
-# 158-168). In flashinfer-python 0.7.0.post1 (requirements/cuda.txt:13) AUTO
-# takes one-shot when `num_tokens * hidden * world * elem_size <= 1 MiB`
-# (flashinfer/comm/trtllm_mnnvl_ar.py:34-51): each rank writes its payload once
-# to the multicast address and reduces the N copies it reads back
-# (trtllm_mnnvl_allreduce.cuh:916-990), else two-shot, a scatter and a
-# multicast broadcast (:1280-1335). Where FlashInfer does not run (a capability
-# it has no table for: A100, RTX-4090) vLLM's custom all-reduce does the same
-# on fully NVLink-connected GPUs (custom_all_reduce.py:499-514): one stage
-# below 256 KiB at 6-8 ranks and 512 KiB at 4, two stages above
-# (csrc/custom_all_reduce.cuh:291-310) — the 1 MiB-over-the-group rung bills
-# both.
-#
-# Billed, not modelled: FlashInfer's payload cap is 0.5 MiB at TP8 on SM90,
-# 1 MiB on SM100 (allreduce_rms_fusion.py:104-127) — one 1 MiB rung bills
-# both. Past it vLLM runs torch symmetric memory's `multimem_all_reduce_`
-# (NVLS) at the world sizes it lists (symm_mem.py:26-31, 137-154;
-# `VLLM_ALLREDUCE_USE_SYMM_MEM` defaults on, envs.py:277): 4, 6 and 8 on
-# Hopper, 6 and 8 on Blackwell, one NVLS rung each; a 4-rank Blackwell group
-# runs FlashInfer's two-shot to 32 MiB on SM100 (:110-115) and NCCL past it.
-# On SM103 the fused AR+RMSNorm pass caps at 64 MiB at both 4 and 8 ranks
-# (:116-121) while the standalone all-reduce's tuned cap is 64 MiB at 8 and
-# 80 MiB at 4 (all_reduce_utils.py:85-92): the SM103 rung takes 64 MiB, and a
-# 4-rank payload of 64-80 MiB is billed NCCL's — the same bytes, its hops
-# apart. A 2-rank
-# group runs FlashInfer's two-shot to 64 MiB, which costs what NCCL's ring
-# does at 2 ranks. The NVLS rung has no cap: past symmetric memory's
-# 64-128 MiB NCCL runs, and is billed NVLS too — an assumption (NCCL picks
-# its NVLS algorithm on such a fabric; that choice is not in vLLM's source).
-# On SM103 (B300, GB300) a prefill payload thus stays two-shot to 64 MiB
-# (flashinfer_all_reduce.py:56-70). Without NVLink (PCIe cards) every all-reduce
-# is billed as NCCL's, though vLLM's custom kernel runs a two-GPU PCIe group
-# (custom_all_reduce.py:512). Sequence parallelism's custom all-gather and
-# reduce-scatter (custom_all_reduce.py:570-660,
-# models/common/ops/sequence_parallel.py:24-36) are not the default serving
-# path and are billed as NCCL's. Across NVLink domains vLLM runs NCCL
-# (FlashInfer refuses a multi-node Hopper group, flashinfer_all_reduce.py:
-# 165-175), priced as the hierarchical schedule.
-#
-# Group sizes — what decides the algorithm, so each rung states it
-# (`worlds`). FlashInfer has a table for 2, 4, 8 (and 16 on SM100/SM103)
-# ranks and is off for any other (allreduce_rms_fusion.py:104-127,
-# flashinfer_all_reduce.py:421-430); the custom all-reduce takes 2, 4, 6, 8
-# (custom_all_reduce.py:121, :500); symmetric memory 2, 4, 6, 8
-# (all_reduce_utils.py:58-83), multimem at 4, 6, 8 on Hopper and 6, 8 on
-# Blackwell (symm_mem.py:26-31). A group of 32 or 72 ranks in one NVL72 rack
-# runs none of them: NCCL.
-collectives:
-  all_reduce:
-    - algorithm: one_shot
-      max_bytes_times_world: 1048576
-      worlds: [2, 4, 6, 8, 16]
-      source_anchor: "group sizes: FlashInfer's table (vllm/compilation/passes/fusion/allreduce_rms_fusion.py:104-127, checked at vllm/distributed/device_communicators/flashinfer_all_reduce.py:421-430) and the custom all-reduce's, at most 8 (vllm/distributed/device_communicators/custom_all_reduce.py:121, vllm/distributed/device_communicators/custom_all_reduce.py:500); FlashInfer's MNNVL all-reduce, AUTO strategy (vllm/distributed/device_communicators/flashinfer_all_reduce.py:143-178, vllm/compilation/passes/fusion/allreduce_rms_fusion.py:158-168, flashinfer pinned at requirements/cuda.txt:13); custom 1stage on fully connected GPUs (csrc/custom_all_reduce.cuh:291-310)"
-    - algorithm: two_shot
-      max_bytes: 67108864
-      when: { min_compute_capability: "10.3" }
-      worlds: [2, 4, 8, 16]
-      source_anchor: "group sizes of FlashInfer's SM103 table (vllm/compilation/passes/fusion/allreduce_rms_fusion.py:116-121); SM103's tuned standalone FlashInfer MNNVL cap (vllm/distributed/device_communicators/all_reduce_utils.py:85-92, vllm/distributed/device_communicators/flashinfer_all_reduce.py:56-70)"
-    - algorithm: two_shot
-      max_bytes: 1048576
-      worlds: [2, 4, 6, 8, 16]
-      source_anchor: "group sizes as the one-shot rung's (the custom all-reduce's 2stage at 6, vllm/distributed/device_communicators/custom_all_reduce.py:121); FlashInfer's all-reduce cap by capability and world (vllm/compilation/passes/fusion/allreduce_rms_fusion.py:104-127, vllm/distributed/device_communicators/flashinfer_all_reduce.py:421-449)"
-    - algorithm: two_shot
-      max_bytes: 33554432
-      when: { min_compute_capability: "10.0" }
-      worlds: [4]
-      source_anchor: "FlashInfer's SM100 4-rank cap, 32 MiB (vllm/compilation/passes/fusion/allreduce_rms_fusion.py:110-115); symmetric memory runs no multimem at 4 ranks on SM100 (vllm/distributed/device_communicators/symm_mem.py:26-31)"
-    - algorithm: nvls
-      when: { below_compute_capability: "10.0" }
-      worlds: [4, 6, 8]
-      source_anchor: "group sizes torch symmetric memory runs multimem at on SM90 (vllm/distributed/device_communicators/symm_mem.py:26-31) and has a cap for (vllm/distributed/device_communicators/all_reduce_utils.py:58-83); torch symmetric memory's multimem all-reduce (vllm/distributed/device_communicators/symm_mem.py:137-154), dispatched at vllm/distributed/device_communicators/cuda_communicator.py:427-431"
-    - algorithm: nvls
-      when: { min_compute_capability: "10.0" }
-      worlds: [6, 8]
-      source_anchor: "group sizes torch symmetric memory runs multimem at on SM100/SM103 (vllm/distributed/device_communicators/symm_mem.py:26-31) and has a cap for (vllm/distributed/device_communicators/all_reduce_utils.py:58-83); torch symmetric memory's multimem all-reduce (vllm/distributed/device_communicators/symm_mem.py:26-31, vllm/distributed/device_communicators/symm_mem.py:137-154), dispatched at vllm/distributed/device_communicators/cuda_communicator.py:427-431"
+# No collective algorithm lives here. A standalone collective is priced as
+# its envelope — the fastest algorithm the card's fabric can run
+# (`comm_cost.Envelope`, docs/inference_cost_model.md "Collective
+# pricing") — the same under every framework: which kernel vLLM happens to
+# dispatch at a payload, and its workspace caps, are not the bound. A
+# communication FUSION (an all-reduce folded into a norm or a GEMM) is a
+# launch-structure fact and is declared below like any other.
 
 op_implementations:
   # V1 FlashAttention backend (v1/attention/backends/flash_attn.py:1052); FA3
@@ -492,11 +405,28 @@ op_implementations:
   # sigmoid_beta=True, use_qk_l2norm_in_kernel=True). Both Glm5Next classes
   # run it (model_executor/models/registry.py:121, :423). Kimi-K3's decode
   # is the two entries below.
+  # ... and the same span in PREFILL, where it is FlashKDA's chunked
+  # forward, exactly as Kimi-K3's is below: `_flashkda_prefill`
+  # (models/glm5next/common/kda.py:385-425, called :710) hands
+  # `torch.ops._flashkda_C.fwd` the raw gate logits, the raw beta, `A_log`,
+  # `dt_bias` and the lower bound, and the kernel l2-normalises q/k and
+  # applies the bounded gate itself (:400-406). FlashKDA is the `auto`
+  # default (`_resolve_kda_prefill_backend`, :137-160) on compute capability
+  # major 9 / 10 / 12, head width 128, BF16 and a bounded gate. Same
+  # assumption as the Kimi-K3 entry: the kernel is built from an external
+  # repository and may run more than one kernel behind that one op, and none
+  # of them is a standalone gate, beta or l2-norm launch.
   fused_recurrent_kda:
-    source_anchor: "vllm.models.glm5next.nvidia.ops.third_party.kda.kernels.fused_recurrent_kda (vllm/models/glm5next/nvidia/ops/third_party/kda/kernels.py:148) -> fused_recurrent.fused_recurrent_gated_delta_rule_fwd_kernel (vllm/models/glm5next/nvidia/ops/third_party/kda/fused_recurrent.py:44), from vllm/models/glm5next/common/kda.py:760"
+    source_anchor: "vllm.models.glm5next.nvidia.ops.third_party.kda.kernels.fused_recurrent_kda (vllm/models/glm5next/nvidia/ops/third_party/kda/kernels.py:148) -> fused_recurrent.fused_recurrent_gated_delta_rule_fwd_kernel (vllm/models/glm5next/nvidia/ops/third_party/kda/fused_recurrent.py:44), from vllm/models/glm5next/common/kda.py:760; prefill: torch.ops._flashkda_C.fwd (vllm/models/glm5next/common/kda.py:418), from Glm5NextLinearAttention._flashkda_prefill (vllm/models/glm5next/common/kda.py:385-425, call vllm/models/glm5next/common/kda.py:710), selected by _resolve_kda_prefill_backend (vllm/models/glm5next/common/kda.py:137-160)"
     when:
-      phase: [decode]
-      architectures: [Glm5NextForConditionalGeneration, Glm5NextForCausalLM]
+      - phase: [decode]
+        architectures: [Glm5NextForConditionalGeneration, Glm5NextForCausalLM]
+      - phase: [prefill]
+        architectures: [Glm5NextForConditionalGeneration, Glm5NextForCausalLM]
+        device: [cuda]
+        min_compute_capability: "9.0"
+        activation_dtype: [bf16]
+        dims: { d_lin_k_head: [128] }
   # Kimi-K3 KDA decode. The whole mixer —
   # three short convs, gate, beta, l2norm, recurrence, gated output norm —
   # is one native launch, `ops.fused_kda_decode`
@@ -535,11 +465,43 @@ op_implementations:
       activation_dtype: [bf16]
       dims: { n_verify: [1], d_lin_k_head: [128], s_conv_kernel: [4] }
       world_local: { world: tp_attention, dim: n_lin_v_heads, local_in: [12, 24, 48, 96] }
+  # The same span in PREFILL, where it is FlashKDA's chunked forward:
+  # `_flashkda_prefill` hands `torch.ops._flashkda_C.fwd` the RAW gate
+  # (`g1_ns`), the RAW beta, `A_log`, `dt_bias` and `lower_bound`
+  # (models/kimi_k3/nvidia/kda.py:380-420, called :1245-1265), and q / k
+  # un-normalised with the 1/sqrt(d) scale — every element of the gate
+  # chain, the beta sigmoid and both l2 norms are the kernel's arguments,
+  # not launches before it; nothing in the KDA layer spells them in Python
+  # (no `l2norm`, no sigmoid on the gate path anywhere in kda.py). FlashKDA
+  # is the default prefill backend on SM90 and newer
+  # (`resolve_kda_prefill_backend`, :463-502, `--kda-prefill-backend` at
+  # "auto"): compute capability major 9, 10 or 12, head width 128, BF16
+  # activations and a bounded gate (`is_flashkda_supported`, :341-357) —
+  # `min_compute_capability: "9.0"` states that major for every SKU
+  # gpu_specs.csv lists, as the decode entry above does; below it the Triton
+  # `chunk_kda_with_fused_gate` (:1300-1312,
+  # `use_qk_l2norm_in_kernel=True`) also takes them in-kernel, but its gate
+  # is the separate chunk-cumsum launch (`fused_kda_gate`'s sglang form),
+  # so this entry does not claim that card.
+  # Assumption stated rather than conditioned: FlashKDA's chunked pipeline
+  # is built from an external repository
+  # (cmake/external_projects/flashkda.cmake) and may run more than one
+  # kernel behind that one op; what the audited tree shows is that NONE of
+  # them is a standalone gate, beta or l2-norm launch, which is what this
+  # plan's members are. Billing the span as one launch under-counts those
+  # workspace passes; billing the eight elementwise rows it replaced
+  # claimed launches vLLM does not run at all.
   fused_recurrent_kda_per_channel:
-    source_anchor: "vllm.models.kimi_k3.nvidia.ops.third_party.kda.fused_recurrent.fused_recurrent_kda_packed_decode (vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py:582, kernel vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py:487), from vllm/models/kimi_k3/nvidia/kda.py:1338"
+    source_anchor: "vllm.models.kimi_k3.nvidia.ops.third_party.kda.fused_recurrent.fused_recurrent_kda_packed_decode (vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py:582, kernel vllm/models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py:487), from vllm/models/kimi_k3/nvidia/kda.py:1338; prefill: torch.ops._flashkda_C.fwd (vllm/models/kimi_k3/nvidia/kda.py:405), from _flashkda_prefill (vllm/models/kimi_k3/nvidia/kda.py:1245-1265), selected by resolve_kda_prefill_backend (vllm/models/kimi_k3/nvidia/kda.py:463-502)"
     when:
-      phase: [decode]
-      architectures: [KimiK3ForConditionalGeneration]
+      - phase: [decode]
+        architectures: [KimiK3ForConditionalGeneration]
+      - phase: [prefill]
+        architectures: [KimiK3ForConditionalGeneration]
+        device: [cuda]
+        min_compute_capability: "9.0"
+        activation_dtype: [bf16]
+        dims: { d_lin_k_head: [128] }
   # The three KDA short convs as one launch over the packed q|k|v row. Both
   # KDA classes keep one packed filter and state and convolve the merged
   # projection's q|k|v slice in one call, but not in the same phases:
@@ -561,36 +523,29 @@ op_implementations:
   # (models/glm5next/common/kda.py:236-254), run once (:460), both phases.
   # Kimi-K3: `in_proj_qkvgfab` over q | k | v | g | f_a | b
   # (models/kimi_k3/nvidia/kda.py:625-652), run once (:870-880); `f_b_proj`
-  # stays its own GEMM (:881) in both models. Except one K3 path: at
+  # stays its own GEMM (:881) in both models. One K3 path splits it: at
   # attention TP 8 (`_KDA_TP_SIZE`, low_latency_gemm.py:65, checked :976),
   # on a device with a low-latency table (SM90, SM100, SM103/107,
-  # :670-679), with BF16 weights, a CUDA-graph decode step of at most 14
+  # :670-679), with BF16 weights, a CUDA-graph decode step of AT MOST 14
   # tokens runs the packed weight as TWO GEMMs on two streams — q|k|v|g and
   # f_a|b (`run_kda_projection_overlap`, :735-822, enabled :966-997, taken
-  # at kda.py:845-866). Two launches are not this one, and the parallel
-  # pattern cannot split six siblings four and two, so that cell is left
-  # unfused (six launches billed for vLLM's two) and the K3 alternatives
-  # below are the complement of it: prefill; decode at any local head count
-  # but 12 (96 heads / TP 8); decode below SM90; decode in another dtype.
-  # vLLM's own test is the world degree (`tp_size == 8`); the vocabulary asks
-  # a degree through the per-rank count it leaves (`world_local`), so the
-  # list is every per-rank head count 96 splits into except 12 — K3 has 96
-  # KDA heads, and a TP that does not divide them is refused before this.
+  # at kda.py:845-866; the bound is `KDA_PROJECTION_OVERLAP_MAX_TOKENS = 14`,
+  # low_latency_gemm.py:59, the sweep's measured crossover, or 2 where the
+  # other installer sets it, :995). That cell is billed on the default path
+  # like every other token-count threshold (docs/inference_cost_model.md,
+  # "How precisely to model a dispatch condition"): a decode step of 15
+  # tokens or more — every batch a serving deployment runs — takes the one
+  # packed launch this entry bills, and the assumption stated here is that
+  # the sub-15-token steps run the same way. Stating it as a condition is
+  # not possible anyway (no token-count key exists, by that same rule), and
+  # the per-rank head counts this entry used to list to exclude TP 8 said
+  # "12 local heads" where the source says "at most 14 tokens" — a proxy for
+  # a fact the graph does not carry.
   merged_column_parallel_linear_wide:
     source_anchor: "vllm.models.glm5next.common.kda._Glm5NextMergedColumnParallelLinear (vllm/models/glm5next/common/kda.py:239), from Glm5NextLinearAttention.forward (vllm/models/glm5next/common/kda.py:460); vllm.models.kimi_k3.nvidia.kda._KimiGDNMergedColumnParallelLinear (vllm/models/kimi_k3/nvidia/kda.py:644), from KimiK3DeltaAttention.forward (vllm/models/kimi_k3/nvidia/kda.py:870)"
     when:
-      - architectures: [Glm5NextForConditionalGeneration, Glm5NextForCausalLM]
-      - architectures: [KimiK3ForConditionalGeneration]
-        phase: [prefill]
-      - architectures: [KimiK3ForConditionalGeneration]
-        phase: [decode]
-        world_local: { world: tp_attention, dim: n_lin_v_heads, local_in: [96, 48, 32, 24, 16, 8, 6, 4, 3, 2, 1] }
-      - architectures: [KimiK3ForConditionalGeneration]
-        phase: [decode]
-        below_compute_capability: "9.0"
-      - architectures: [KimiK3ForConditionalGeneration]
-        phase: [decode]
-        activation_dtype: [fp16, fp32]
+      architectures: [Glm5NextForConditionalGeneration, Glm5NextForCausalLM,
+                      KimiK3ForConditionalGeneration]
   # Kimi-K3 Attention Residuals before the FFN: `_post_attn_norm` hands the
   # attention output to `attn_res` as the prefix's `delta`
   # (models/kimi_k3/nvidia/model.py:1050-1068), and the one launch adds it,
@@ -721,8 +676,44 @@ op_implementations:
   # for compiled models, and `fused_allreduce_rms_norm`
   # (models/common/ops/fused_allreduce_rms_norm.py:23) called directly by the
   # eager DeepSeek-V3.2 / GLM-5 DSA layers (models/deepseek_v32/nvidia/model.py:144, :158).
+  #
+  # DECODE only, as an all-reduce size cap is billed: both routes run the
+  # same FlashInfer kernel and both refuse a payload that does not fit its
+  # workspace — the eager call through `_can_use_flashinfer`
+  # (layers/fused_allreduce_gemma_rms_norm.py:68-87, the bound `_max_token_num`
+  # :56-65), the compile pass through `is_applicable_for_range`
+  # (allreduce_rms_fusion.py:1128-1132, `max_token_num` :1011-1028), off the
+  # same `FI_ALLREDUCE_FUSION_MAX_SIZE_MB` table (:104-127). A token count is
+  # no condition key, so the rule for one
+  # (docs/inference_cost_model.md:238, "Only shifts launch counts at edge
+  # sizes ... bill the default serving path — prefill reads as large-token,
+  # decode as small-token") puts the entry on the phase: prefill, a chunk of
+  # thousands of tokens, bills the all-reduce and the norm apart; decode
+  # bills them fused.
+  # Two assumptions that statement carries, stated because neither is a key
+  # this vocabulary can ask:
+  #   * the cap is per world size and card, not per phase: SM100 is 1 MB at
+  #     TP 8 (73 tokens at hidden 7168 BF16) but 32 MB at TP 4 and 64 MB at
+  #     TP 2; SM103 is 4 MB at TP 8 (292 tokens) and 64 MB at TP 2 / TP 4.
+  #     So at a narrow TP a 4096-token prefill chunk DOES fit and vLLM fuses
+  #     it, where this entry bills it apart. World DEGREE is the fact — not
+  #     a dim's divisibility by it, which is all `world_local` asks — so no
+  #     condition here states it; the entry is the wide-TP serving layout's
+  #     answer, and errs toward more launches than vLLM runs.
+  #   * a decode step beyond the cap (SM100 TP 8 is 73 tokens, so a large
+  #     batch or a long verify is past it) runs them apart too, as the
+  #     published decode points at batch 1024 do; the same rule bills the
+  #     phase, not the point.
+  # Which route a model takes is vLLM's own dispatch and not asked here: the
+  # eager call is the DSA layers', and the compile pass fires for the
+  # torch.compile'd models — not the classes that default to breakable CUDA
+  # graphs (config/vllm.py:74-101), whose graphs (DeepSeek-V4/V4.1, Kimi-K3,
+  # GLM-5.3-Flash, ...) mix their residual in their own seam launches anyway,
+  # so this plan's naive chain is not theirs to match.
   allreduce_fused_rmsnorm:
-    source_anchor: "vllm.compilation.passes.fusion.allreduce_rms_fusion.AllReduceFusedAddRMSNormPattern (vllm/compilation/passes/fusion/allreduce_rms_fusion.py:410)"
+    source_anchor: "vllm.compilation.passes.fusion.allreduce_rms_fusion.AllReduceFusedAddRMSNormPattern (vllm/compilation/passes/fusion/allreduce_rms_fusion.py:410); eager: vllm.models.common.ops.fused_allreduce_rms_norm.fused_allreduce_rms_norm (vllm/models/common/ops/fused_allreduce_rms_norm.py:23), from vllm/models/deepseek_v32/nvidia/model.py:144, vllm/models/deepseek_v32/nvidia/model.py:158; the token bound vllm/model_executor/layers/fused_allreduce_gemma_rms_norm.py:56-87"
+    when:
+      phase: [decode]
   # DSv3-style noaux_tc router (sigmoid + bias + grouped top-k + gather +
   # renormalize + scale) in one launch, `torch.ops._moe_C.grouped_topk`
   # (_custom_ops.py:2372), reached through `fused_grouped_topk`
@@ -738,8 +729,8 @@ op_implementations:
   # latent-KV rotations are never one shared-rotary call — below SM100 both
   # sit in the q/KV insert launch (`fused_qnorm_rope_kv_insert_no_q_norm`),
   # and on SM10x the q rotation moves into the mega-attention kernel
-  # (`fused_mla_norm_rope_attn_rope_cast`, not bound here yet) while the KV
-  # rotation stays in the insert (see that entry).
+  # (`fused_mla_norm_rope_attn_rope_cast`) while the KV rotation stays in
+  # the insert, which has no plan of its own (see that entry).
   fused_qk_rope:
     source_anchor: "vllm._custom_ops.rotary_embedding (vllm/_custom_ops.py:210), from RotaryEmbedding.forward_cuda (vllm/model_executor/layers/rotary_embedding/base.py:244)"
     when:
@@ -807,21 +798,59 @@ op_implementations:
   # rotates, quantises and inserts the KV; the q rotation moves into the
   # attention kernel (`fused_norm_rope_attn_rope_cast_{decode,fwd}`,
   # flash_mla_mega_attn.py:345, :449), with the sparse attention, the
-  # output's inverse RoPE and its FP8 cast. That wider launch has a plan,
-  # `fused_mla_norm_rope_attn_rope_cast` (bound for DeepInfer, which runs the
-  # same FlashMLA kernel), but it is not bound here yet: vLLM takes it only
-  # where, after tensor parallelism, every `wo_a` group keeps WV_GROUP_SIZE
-  # local heads (`is_available_for`, flash_mla_mega_attn.py:151-172), a TP
-  # condition this binding does not state yet, and the KV-only insert the
-  # layer leaves behind (`apply_q_rope=False`) has no plan of its own. Until
-  # both are stated, on SM10x the q and KV rotations are billed unfused (more
-  # launches than vLLM runs, never a grouping it does not run). SM12x keeps
-  # this path (model.py:233-234) but is below no bound here; no SM12x SKU is
-  # listed.
+  # output's inverse RoPE and its FP8 cast — the plan
+  # `fused_mla_norm_rope_attn_rope_cast`, bound below; what the layer leaves
+  # behind is the KV-only half of this kernel, stated in the next comment.
+  # SM12x keeps this path
+  # (model.py:233-234) but is below no bound here; no SM12x SKU is listed.
   fused_qnorm_rope_kv_insert_no_q_norm:
     source_anchor: "vllm.models.deepseek_v41.attention.DeepseekV4Attention._fused_qnorm_rope_kv_insert (vllm/models/deepseek_v41/attention.py:1011)"
     when:
       below_compute_capability: "10.0"
+  # The same kernel on SM10x is KV-ONLY, and no plan states that boundary
+  # yet: with `accepts_unnormed_unroped_query` the layer calls it with
+  # `apply_q_rope=False` (deepseek_v41/attention.py:1084), so it rotates,
+  # quantises and inserts the latent row and leaves q to the attention
+  # kernel — except for the zero-pad to `padded_heads`
+  # (attention.py:1065-1070, `get_padded_num_q_heads` is 64 or 128,
+  # nvidia/flashmla.py:67-74), which at a narrower shard is a
+  # `[tokens, 64, 512]` write the graph has no node for. A KV-only plan
+  # would bill the rotation and the re-join as one launch and that pad as
+  # nothing; wiring it needs the pad answered and a measurement route of its
+  # own (`kernel_bench` signature + reference + provider, the sibling pair in
+  # providers/rope.py:1704). Until then the latent rotation and its re-join
+  # bill unfused — two launches where vLLM runs one, never a grouping it
+  # does not run.
+  # DeepSeek-V4.1's SM10x core attention in ONE launch: the query's RoPE,
+  # the sparse attention with its sinks, the output's inverse RoPE and its
+  # MXFP8 cast — `torch.ops._flashmla_C.fused_norm_rope_attn_rope_cast_fwd`
+  # (nvidia/flash_mla_mega_attn.py:449-468) in prefill and
+  # `..._decode` (:345-365) in decode, from
+  # `DeepseekV4MegaAttnAttention`, which `_select_dsv4_attn_cls` makes the
+  # default on SM100 (nvidia/model.py:235-243). The same FlashMLA kernel
+  # DeepInfer runs, hence the shared plan. The `wo_a` einsum then reads the
+  # kernel's already-rotated, already-quantised output and rotates and casts
+  # nothing (`_o_proj`, :212-236; the skip is `o_proj.py:62-64`), which is
+  # why `fused_inv_rope` does not bill here.
+  # `is_available_for` (:150-172) asks, beyond SM100 and the built kernel:
+  # `n_heads % tp == 0`, `o_groups % tp == 0`, and
+  # `n_local_heads // n_local_groups == WV_GROUP_SIZE` (8, common/ops/
+  # fused_layout.py:20) with `n_local_heads % 8 == 0`. The deployment half
+  # of that is one question here — `world_local` on the group count, the
+  # stricter of the two divisions for every V4.1 checkpoint (8 groups, 64
+  # heads: a TP that divides the groups divides the heads). The geometry
+  # half, 8 heads per `wo_a` group, is the checkpoint's and is stated rather
+  # than conditioned: V4.1-Flash is 64 heads over 8 groups, and the ratio is
+  # TP-invariant where both divide. A V4.1 checkpoint with another ratio
+  # would need it asked.
+  fused_mla_norm_rope_attn_rope_cast:
+    source_anchor: "vllm._flashmla_C.fused_norm_rope_attn_rope_cast_fwd / _decode (vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:449, vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:345), from DeepseekV4MegaAttnAttention (vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:145, selected vllm/models/deepseek_v41/nvidia/model.py:235-243, eligibility vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:150-172)"
+    when:
+      architectures: [DeepseekV41ForCausalLM]
+      device: [cuda]
+      min_compute_capability: "10.0"
+      below_compute_capability: "11.0"
+      world_local: { world: tp_attention, dim: n_out_lora_groups, divides: true }
   # DeepSeek-V4.1 Engram after `wkv`: key/value split, normalised-dot gate
   # and gated add into every residual copy in one Triton launch,
   # `_fused_engram_post_wkv_kernel` (models/deepseek_v41/common/engram.py:1186),
@@ -883,10 +912,12 @@ op_implementations:
   # span and stated here rather than split into a twin plan (one naive
   # pattern may bind once per file, and the reduce + norm subgraph is the
   # same). Two dispatches the default path does not take, stated rather than
-  # conditioned: Mega-MHC (`can_use_mega_mhc`, DeepGEMM on SM100; the plan
-  # `mhc_mega_post_pre`, which DeepInfer runs by default) and the
-  # coefficient overlap stream (`mhc_pre_delayed_overlap`, FULL cudagraphs
-  # at <= 16 tokens). The layer-0 entry `mhc_pre_delayed_tilelang`
+  # conditioned: the coefficient overlap stream
+  # (`mhc_pre_delayed_overlap`, FULL cudagraphs at <= 16 tokens,
+  # `MHC_OVERLAP_MAX_TOKENS` deepseek_v41/nvidia/ops/mhc.py:37, selected
+  # nvidia/model.py:473-487). Mega-MHC, the third dispatch, IS the default
+  # SM100 path and is bound below (`mhc_mega_post_pre`).
+  # The layer-0 entry `mhc_pre_delayed_tilelang`
   # (tilelang.py:74) is the GEMM + the epilogue without a post; the stack
   # exit is `mhc_post_tilelang` (deepseek_v41/nvidia/model.py:1152) plus
   # `hc_collapse_triton` (:1070) and the model RMSNorm — the same reduce +
@@ -929,6 +960,43 @@ op_implementations:
     when:
       architectures: [DeepseekV4ForCausalLM, Glm5NextForConditionalGeneration]
       device: [cuda]
+  # DeepSeek-V4.1's shifted seam on SM100, in ONE DeepGEMM launch: the
+  # previous sublayer's post-mix, this sublayer's coefficient projection
+  # with its Sinkhorn, the carried-pre reduce and the sublayer RMSNorm —
+  # `mega_mhc` through `mhc_shifted_post_pre_deep_gemm`
+  # (models/deepseek_v41/nvidia/ops/mega_mhc.py:47-101, the one op at :72),
+  # taken by `mhc_shifted_post_pre` (nvidia/ops/mhc.py:284-303) on the
+  # default path, ahead of the TileLang launches above (:305) — which is
+  # why this entry and theirs are not two conditions on one dispatch: the
+  # mega pattern is the larger, so where it matches it is the launch taken
+  # (`match_order`), and the TileLang entries keep the seams it does not
+  # reach (the layer-0 entry, which has no previous post, and the stack
+  # exit).
+  # `can_use_mega_mhc` (mega_mhc.py:31-44) and `is_mega_mhc_supported`
+  # (:16-28): device capability family 100, hidden size a multiple of 1024,
+  # `hc_mult == 4` (`dims: {n_hidden_copies: [4]}` — V4.1's four residual
+  # copies), DeepGEMM present, at most 1 << 20 tokens, a carried pre-mix and
+  # a norm weight (every seam but the layer-0 entry has both), and
+  # `capture_aux` off. The two it asks that this entry states rather than
+  # conditions: the hidden-size divisor (V4.1-Flash is 5120, and no corpus
+  # HC checkpoint fails it — the same statement the TileLang entries make
+  # about their 128 divisor), and the token bound, which no served batch
+  # approaches. `capture_aux` is the MTP draft layer's aux-hidden capture
+  # (nvidia/model.py:581), not this walk's main stack.
+  # Not taken, stated rather than conditioned (as above): under FULL
+  # cudagraphs at <= 16 tokens the overlap stream runs instead, and when
+  # the MoE finalize is deferred into the fused all-reduce the seam is that
+  # all-reduce's epilogue (ops/mhc.py:220-253) — both decode-side paths this
+  # binding bills on the default schedule.
+  mhc_mega_post_pre:
+    source_anchor: "vllm.models.deepseek_v41.nvidia.ops.mega_mhc.mhc_shifted_post_pre_deep_gemm (vllm/models/deepseek_v41/nvidia/ops/mega_mhc.py:47, the deep_gemm.mega_mhc call vllm/models/deepseek_v41/nvidia/ops/mega_mhc.py:72), from mhc_shifted_post_pre (vllm/models/deepseek_v41/nvidia/ops/mhc.py:284-303), eligibility is_mega_mhc_supported / can_use_mega_mhc (vllm/models/deepseek_v41/nvidia/ops/mega_mhc.py:16-44)"
+    crosses: component
+    when:
+      architectures: [DeepseekV41ForCausalLM]
+      device: [cuda]
+      min_compute_capability: "10.0"
+      below_compute_capability: "11.0"
+      dims: { n_hidden_copies: [4] }
   # DeepSeek-V4's hyper-connection head (norm + fn GEMM + sigmoid gate +
   # weighted reduce over the copies) in one TileLang launch,
   # `hc_head_fused_kernel_tilelang` (model_executor/kernels/mhc/tilelang.py:1041
@@ -1005,8 +1073,8 @@ op_implementations:
   # from models/deepseek_v4/nvidia/ops/o_proj.py:66). The call is skipped when
   # the attention already hands back a quantised output (o_proj.py:62-64):
   # V4.1's SM10x mega attention folds the inverse RoPE and cast into its own
-  # launch (see `fused_qnorm_rope_kv_insert_no_q_norm` for why its plan,
-  # `fused_mla_norm_rope_attn_rope_cast`, is not bound here yet), V4.1's small-batch
+  # launch (the `fused_mla_norm_rope_attn_rope_cast` entry above, which is
+  # the larger plan and takes those nodes there), V4.1's small-batch
   # SM100 path folds it into the wo_a GEMM (nvidia/ops/fused_wo_a.py), and
   # DeepSeek-V4 only behind the opt-in FlashInfer sparse backend. There this
   # entry bills a launch vLLM folds into a wider one — one too many, never a

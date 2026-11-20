@@ -19,7 +19,7 @@ from backend.measure.measure_matrix import MeasureMatrix
 from backend.measure.auto_sweep import MeasuredFormula, PointMeasure
 from backend.measure.lookup import Key
 from backend.inference.parallel_config import ParallelConfig
-from backend.inference.row_roofline import FloorForm
+from backend.inference.row_roofline import FloorForm, FloorTerm
 from backend.inference.sweep_grid import (
     FRONTIER_BATCH_GRID,
     FRONTIER_DRAFT_TOKENS,
@@ -58,7 +58,7 @@ def test_the_frontier_keeps_only_points_nothing_beats_on_both_axes():
 
 def _one_term(t):
     """A step of one term, `t` seconds at any floors."""
-    return FloorForm.termwise([(0, (t, 0.0, 0.0, 0.0))], 1).to_json()
+    return FloorForm.termwise([(0, FloorTerm.of(t, [], 0.0))], 1).to_json()
 
 
 def _timed_item(seq, *, batch=4, plain_s=0.01, drafts=None,
@@ -414,7 +414,7 @@ def test_a_serving_entry_draws_each_k_and_floor_off_its_step_forms():
     step; a plain point without its form is not an entry of this schema."""
     sk = str(GALLERY_SEQ_LENS[0])
     item = _timed_item(sk)
-    item["draft"] = {"2": FloorForm(0.01, ((0.004, 0.0, 0.0, 1000.0),)).to_json()}
+    item["draft"] = {"2": FloorForm(0.01, (FloorTerm.of(0.004, [], 1000.0),)).to_json()}
     view = f.FrontierView("B200", draft_tokens=2, acceptance_rate=0.5,
                           launch_floor_us=1.0)
     dec = f._at_view(item, view)["sol"]["phases"]["decode"]
@@ -525,7 +525,7 @@ def test_the_partial_track_swaps_measured_terms_at_the_view_s_floors(
     # Term 0 launch-bound (2 launches), term 1 compute-bound (6 ms): the
     # fold measured term 1 at 4 ms, so the floors move only term 0.
     item["floors"] = FloorForm.termwise(
-        [(0, (0.001, 0.0, 0.0, 2.0)), (1, (0.006, 0.0, 0.0, 0.0))], 2).to_json()
+        [(0, FloorTerm.of(0.001, [], 2.0)), (1, FloorTerm.of(0.006, [], 0.0))], 2).to_json()
     entry = {"model_id": "m", "frontier": {}, "layouts": [], "error": None,
              "_theory": [{**item, "measures": {"decode": {}}}]}
     for launch_us, sol_s in ((1.0, 0.007), (3000.0, 0.012)):
@@ -566,7 +566,7 @@ def test_a_form_not_over_the_formula_s_terms_is_an_engine_error(monkeypatch):
     sk = str(GALLERY_SEQ_LENS[0])
     item = _timed_item(sk, batch=1)
     item["floors"] = FloorForm.termwise(
-        [(0, (0.001, 0.0, 0.0, 0.0)), (1, (0.006, 0.0, 0.0, 0.0))], 2).to_json()
+        [(0, FloorTerm.of(0.001, [], 0.0)), (1, FloorTerm.of(0.006, [], 0.0))], 2).to_json()
     stored = f._Stored("m", None)
     out = stored.drawn(f.FrontierView("B200"), {
         "model_id": "m", "frontier": {}, "layouts": [], "error": None,

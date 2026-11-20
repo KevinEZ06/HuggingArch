@@ -11,9 +11,18 @@
 #   kv_rope_slice, kv_norope_slice = slice(kv), slice(kv)
 #   kv_concat         = concat(kv_norope_slice, rope_emb(kv_rope_slice))  # the cached SWA row
 #
-# A separate plan rather than an `optional` norm: an optional node stands on
-# one internal edge, and the norm is the query side's first node — it reads
-# the external q.
+# A separate plan rather than an `optional` norm. The matcher would now take
+# one (an optional node may stand on the pattern's own external operand,
+# `schema/fusion.PatternNode.read_through`), but the measurement would not:
+# a plan's name is its route to a cell (`op_signatures_catalog`'s
+# `binds_ops`, `kernel_bench/providers/rope.py:1704`, and the two references
+# `refs.py:4298-4303`, which close over `q_norm` True / False). One folded
+# plan is one name, so one signature and ONE reference — and the oracle has
+# to compute the function the launch computed, which here is two functions,
+# vLLM's own `apply_q_norm` flag. Nothing could tell them apart after the
+# match either: `when:` asks facts of the walk, and whether an optional
+# member was bound is not one of them. Two spans, two cells, two names —
+# as `gelu_and_mul` sits beside `silu_and_mul`.
 #
 # vLLM (audited at v0.32.0) runs it as one launch per layer, prefill and
 # decode alike, BELOW compute capability 10.0: `DeepseekV4Attention._fused_qnorm_rope_kv_insert`

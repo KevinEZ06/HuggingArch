@@ -19,31 +19,28 @@ walk counts it:
     metadata        = floor(Min(asked, weight_total) x metadata / weight)
     access          = weight_read + metadata + act
     comm_payload    = comm_one                                 (one instance)
-    comm_volume     = ring_factor x comm_payload x n           (per-rank bytes)
     comm_bytes      = comm_payload                 (what the collective prices)
     t_compute       = flops / PEAK_FLOPS
     t_memory        = (weight_read + metadata + act) / PEAK_BW
     t_comm          = comm_bytes x COMM_S_PER_BYTE + COMM_LATENCY_S
-                      (by payload range, below)
+                      (the envelope over algorithms, below)
     t_launch        = n x LAUNCH_S                  (a row that launches)
     t_op            = Max(t_compute, t_memory, t_comm, t_launch)
 
 `COMM_LATENCY_S` is the collective's fixed time over the step (each phase's
 fabric latency per step it takes, `comm_cost.collective_latency`), present
-only where the collective is priced. Which algorithm runs the collective —
-and so what a byte costs and how many traversals it waits on — is the
-framework's dispatch by payload (`comm_cost.collective_ladder`): a
-collective whose framework declares rungs (`row["comm_rungs"]`) is priced
-as cases over its payload,
+only where the collective is priced. A collective that more than one
+algorithm runs (`comm_volume.algorithms_for`: an all-reduce) is priced as
+its envelope (`comm_cost.Envelope`), the minimum over the algorithms,
 
-    t_comm = comm_bytes x COMM_S_PER_BYTE_r<k> + COMM_LATENCY_S_r<k>
-               for the first k with comm_bytes <= COMM_MAX_BYTES_r<k>,
-             comm_bytes x COMM_S_PER_BYTE + COMM_LATENCY_S  past them all,
+    t_comm = Min_a(comm_bytes x COMM_S_PER_BYTE_<a> + COMM_LATENCY_S_<a>)
 
-each range's bound, rate and fixed time the card's (a range the card does
-not admit has bound 0): another point lands in the range its own payload
-does. At one point the range is fixed, so the time stays linear in the
-link latency (`FloorForm`). `LAUNCH_S` is the shortest one kernel
+NCCL's under the bare names, each other algorithm's under its own suffix,
+every rate and fixed time the card's (an algorithm the card's fabric cannot
+run takes NCCL's, so it never wins): another point, another card or
+another link latency each find their own minimum. The per-rank wire bytes
+(`RowAt.comm_volume`) are the chosen algorithm's, read off the same
+envelope at the point. `LAUNCH_S` is the shortest one kernel
 launch takes (the request's `launch_floor_us`): a row that runs a
 kernel — it moves bytes or FLOPs and is not a collective, whose own floor
 is its latency — takes at least that per instance, however little it does.
@@ -117,16 +114,13 @@ from backend.arch.eval.storage import is_expert_axis
 from backend.arch.eval.transforms import Workload
 from backend.arch.law_text import as_written, read_walk_law
 from backend.measure.auto_sweep import compile_law
-from backend.arch.layout.comm_volume import (RouteFanout,
-                                             collective_per_rank_bytes)
-from .comm_cost import (CollectiveRung, CollectiveSignature, Fabric, Segment,
-                        ladder_segment, price_collective)
+from backend.arch.layout.comm_volume import NCCL, algorithms_for
+from .comm_cost import CollectiveSignature, Envelope, Fabric, price_collective
 from .gpu_specs import NoPeakBandwidth, NoPeakForDtype
 from .intensity import arithmetic_intensity, intensity_formula
 from .phase_formulas import (_collective_bytes_formula, _t_comm_formula_for_row,
                              _t_compute_formula_for_row,
                              _t_memory_formula_for_row, _t_op_formula_for_row)
-from backend.code_trace.memo import memoize
 
 #: The workload a point sets: the batch, the prompt, the output, the cached
 #: prefix and the verify width (`transforms.Workload.symbols`), the symbols
@@ -141,7 +135,7 @@ COMM_S_PER_BYTE = sp.Symbol("COMM_S_PER_BYTE", nonnegative=True)
 COMM_LATENCY_S = sp.Symbol("COMM_LATENCY_S", nonnegative=True)
 LAUNCH_S = sp.Symbol("LAUNCH_S", nonnegative=True)
 #: The arguments every row law is compiled over; a collective's symbols
-#: follow them (`comm_names`), as many as its rungs ask.
+#: follow them (`comm_names`), two per algorithm its envelope ranges over.
 _ARGS = (*WORKLOAD, PEAK_FLOPS, PEAK_BW, LAUNCH_S)
 #: A point's names, in the order the laws are compiled over.
 POINT_NAMES = tuple(symbol.name for symbol in WORKLOAD)
@@ -155,27 +149,28 @@ _ARG_NAMES: Tuple[str, ...] = tuple(arg.name for arg in _ARGS)
 
 
 
-def rung_symbols(k: int) -> Tuple[sp.Symbol, sp.Symbol, sp.Symbol]:
-    """The card symbols of a collective's payload range `k` (the
-    framework's `k`-th rung): its bound, its seconds per byte and its fixed
-    time."""
-    return (sp.Symbol(f"COMM_MAX_BYTES_r{k}", nonnegative=True),
-            sp.Symbol(f"COMM_S_PER_BYTE_r{k}", nonnegative=True),
-            sp.Symbol(f"COMM_LATENCY_S_r{k}", nonnegative=True))
+def candidate_symbols(algorithm: str) -> Tuple[sp.Symbol, sp.Symbol]:
+    """The card symbols of one algorithm of a collective's envelope: its
+    seconds per byte and its fixed time — NCCL's under the bare names, any
+    other's with its name appended."""
+    if algorithm == NCCL:
+        return COMM_S_PER_BYTE, COMM_LATENCY_S
+    return (sp.Symbol(f"{COMM_S_PER_BYTE.name}_{algorithm}", nonnegative=True),
+            sp.Symbol(f"{COMM_LATENCY_S.name}_{algorithm}", nonnegative=True))
 
 
-def row_rungs(row: Mapping[str, Any]) -> Tuple[CollectiveRung, ...]:
-    """The framework's dispatch rungs the row's collective is priced over
-    (`comm_cost.CollectiveRung`, carried on the row): none for a row that
+def row_algorithms(row: Mapping[str, Any]) -> Tuple[str, ...]:
+    """The algorithms the row's collective's envelope ranges over
+    (`comm_volume.algorithms_for` its op): NCCL's alone for a row that
     prices no collective."""
     sig = CollectiveSignature.of(row)
-    return () if sig is None else sig.rungs
+    return (NCCL,) if sig is None else algorithms_for(sig.op)
 
 
 #: The expressions a row carries, by name (the module docstring states each).
 EXPR_NAMES = ("flops", "act_in", "act_out", "convert", "kv_read",
               "weight_read", "metadata", "access", "comm_payload",
-              "comm_volume", "comm_bytes", "t_compute", "t_memory", "t_comm",
+              "comm_bytes", "t_compute", "t_memory", "t_comm",
               "t_launch", "t_op")
 
 
@@ -360,7 +355,8 @@ class RowAt(NamedTuple):
     metadata: int = 0
     #: One instance's payload.
     comm_payload: float = 0.0
-    #: Per-rank interconnect bytes over the row's instances (ring factor in).
+    #: Per-rank interconnect bytes over the row's instances: the wire bytes
+    #: of the algorithm the collective's envelope chose at this point.
     comm_volume: float = 0.0
     #: One instance's priced payload: `comm_payload` where the collective
     #: is priced, else 0.
@@ -429,13 +425,13 @@ class RowRoofline:
              ) -> Tuple[float, List[Dict[str, Any]]]:
         """`(t_comm, phase rows)` of the collective `sig` names
         (`comm_cost.CollectiveSignature`, off the row) whose payload is
-        `tensor_bytes`, priced on `fabric` by the algorithm the framework's
-        rungs give that payload there (`comm_cost.collective_ladder`)."""
-        seg = ladder_segment(sig.ladder(fabric), float(tensor_bytes))
+        `tensor_bytes`, priced on `fabric` by the algorithm its envelope
+        chooses there (`comm_cost.Envelope.choose`)."""
+        chosen = sig.envelope(fabric).choose(float(tensor_bytes))
         return price_collective(
             op=sig.op, world=sig.world, tensor_bytes=float(tensor_bytes),
             count_per_step=sig.count, fabric=fabric, base_stride=sig.stride,
-            algorithm=seg.algorithm, fanout=sig.route_fanout,
+            algorithm=chosen.algorithm, fanout=sig.route_fanout,
             t_sym=t_sym, t_sub=t_sub)
 
 
@@ -455,33 +451,27 @@ class RowCard(NamedTuple):
         return cls(row.get("peak_flops_per_sec_for_op") or peak_flops,
                    peak_bw, fabric, launch_s)
 
-    def comm_ladder(self, row: Mapping[str, Any]) -> Tuple[Segment, ...]:
-        """The row's collective on this fabric, range by payload range
-        (`comm_cost.collective_ladder`): one per rung the row carries, then
-        NCCL's past them — each with the seconds `price_collective` charges
-        per payload byte and the fixed time over the step. One free range
-        off a collective and for a group of one."""
+    def comm_envelope(self, row: Mapping[str, Any]) -> Optional[Envelope]:
+        """The row's collective's envelope on this fabric
+        (`comm_cost.Envelope`); None off a collective and for a group of
+        one."""
         sig = CollectiveSignature.of(row)
-        if sig is None:
-            return (Segment("", math.inf, 0.0, 0.0),)
-        return sig.ladder(self.fabric)
+        return None if sig is None else sig.envelope(self.fabric)
 
     def comm_values(self, row: Mapping[str, Any]) -> Tuple[float, ...]:
         """The card's values of the row law's collective symbols, in the
-        order `comm_names` names them: the last range's rate and fixed time,
-        then each rung's bound, rate and fixed time."""
-        ladder = self.comm_ladder(row)
-        out = [ladder[-1].s_per_byte, ladder[-1].latency_s]
-        for seg in ladder[:-1]:
-            out += [seg.max_bytes, seg.s_per_byte, seg.latency_s]
-        return tuple(out)
+        order `comm_names` names them: each algorithm's rate and fixed time
+        (`Envelope.law_values`). Free off a collective."""
+        envelope = self.comm_envelope(row)
+        if envelope is None:
+            return (0.0, 0.0)
+        return tuple(v for pair in envelope.law_values() for v in pair)
 
 
-def comm_names(rungs: int) -> Tuple[sp.Symbol, ...]:
-    """A row law's collective symbols for a collective of `rungs` rungs, in
-    `RowCard.comm_values`' order."""
-    return (COMM_S_PER_BYTE, COMM_LATENCY_S,
-            *(sym for k in range(rungs) for sym in rung_symbols(k)))
+def comm_names(algorithms: Sequence[str] = (NCCL,)) -> Tuple[sp.Symbol, ...]:
+    """A row law's collective symbols for an envelope over `algorithms`
+    (`row_algorithms`), in `RowCard.comm_values`' order."""
+    return tuple(sym for a in algorithms for sym in candidate_symbols(a))
 
 
 def _exact(v: Any) -> sp.Expr:
@@ -501,9 +491,9 @@ def _exact(v: Any) -> sp.Expr:
 def build_row_exprs(*, count: int, flops: Any, act_in: Any, act_out: Any,
                     convert: Any = 0, kv_read: Any = 0, demand: Any,
                     weight_total: float, metadata_total: float,
-                    comm_payload: Any = 0, comm_factor: float = 0.0,
-                    comm_priced: bool = False,
-                    comm_rungs: int = 0) -> Dict[str, sp.Expr]:
+                    comm_payload: Any = 0, comm_priced: bool = False,
+                    comm_algorithms: Sequence[str] = (NCCL,)
+                    ) -> Dict[str, sp.Expr]:
     """One row's law as expressions over the workload and the card symbols
     (the module docstring). `flops`, `act_in`, `act_out`, `convert`,
     `kv_read` and `comm_payload` are one instance's, each the walk's own law
@@ -513,9 +503,9 @@ def build_row_exprs(*, count: int, flops: Any, act_in: Any, act_out: Any,
     leaf's resident weights (`weight_demand`): the leaf's own
     rows times what one of them reads. `comm_priced` says the collective is
     priced (a group of more than one rank); its payload is the row's
-    either way. `comm_rungs` is how many rungs the framework's dispatch of
-    the collective has: its time is cases over the payload, one per rung,
-    then the last range (the module docstring)."""
+    either way. `comm_algorithms` are the algorithms its envelope ranges
+    over (`row_algorithms`): its time is their minimum (the module
+    docstring)."""
     n = sp.Integer(int(count))
 
     def whole(law: Any) -> sp.Expr:
@@ -541,12 +531,9 @@ def build_row_exprs(*, count: int, flops: Any, act_in: Any, act_out: Any,
     t_memory = (weight_read + metadata + act) / PEAK_BW
     t_comm: sp.Expr = sp.Integer(0)
     if comm_priced:
-        t_comm = comm_bytes * COMM_S_PER_BYTE + COMM_LATENCY_S
-        if comm_rungs:
-            t_comm = sp.Piecewise(*(
-                (comm_bytes * rate + fixed, comm_bytes <= bound)
-                for bound, rate, fixed in map(rung_symbols, range(comm_rungs))),
-                (t_comm, True))
+        arms = [comm_bytes * rate + fixed for rate, fixed
+                in map(candidate_symbols, comm_algorithms)]
+        t_comm = arms[0] if len(arms) == 1 else as_written(sp.Min, *arms)
     # A row launches a kernel when it moves anything and is not a
     # collective (whose floor is its latency, priced or not).
     launches = payload == 0 and not (flops_e == 0 and act == 0
@@ -562,7 +549,6 @@ def build_row_exprs(*, count: int, flops: Any, act_in: Any, act_out: Any,
         "metadata": metadata,
         "access": weight_read + metadata + act,
         "comm_payload": payload,
-        "comm_volume": _exact(comm_factor) * payload * n,
         "comm_bytes": comm_bytes,
         "t_compute": t_compute,
         "t_memory": t_memory,
@@ -579,21 +565,6 @@ def _exact_number(value: Any) -> Any:
     if isinstance(value, Fraction):
         return sp.Rational(value.numerator, value.denominator)
     return sp.Integer(value) if isinstance(value, int) else sp.Float(value)
-
-
-def comm_factor(op: str, world: int,
-                route_fanout: Optional[Mapping[str, Any]] = None) -> float:
-    """Per-rank interconnect bytes per payload byte of one instance of a
-    collective (`collective_per_rank_bytes` is linear in the payload); 0
-    for a group of one.
-
-    `route_fanout` is a routed exchange's top-k fan-out as the row carries
-    it (`RouteFanout.as_dict`): the rank-level dedup is part of the bytes
-    the layer itself publishes, so the logical column and the card's price
-    of a single-node exchange are one number."""
-    return collective_per_rank_bytes(
-        op, world, 1.0,
-        RouteFanout.from_dict(route_fanout) if route_fanout else None)
 
 
 def law_columns(exprs: Mapping[str, sp.Expr], book: "LawBook"
@@ -613,9 +584,10 @@ def law_columns(exprs: Mapping[str, sp.Expr], book: "LawBook"
 #: Every name a law may read, by family: the workload's counts and its
 #: routing skew `rho` (`transforms.Workload.symbols`), the card's HBM
 #: bandwidth, a peak (`PEAK_FLOPS` on a row; `PEAK_FLOPS_<dtype>` once a
-#: step sums rows of several dtypes), a collective's seconds per byte
-#: (likewise `COMM_S_PER_BYTE_<collective>`) and fixed time
-#: (`COMM_LATENCY_S[_<collective>]`), the card's launch floor (`LAUNCH_S`),
+#: step sums rows of several dtypes), a collective algorithm's seconds per
+#: byte (likewise `COMM_S_PER_BYTE[_<collective>][_<algorithm>]`) and fixed
+#: time (`COMM_LATENCY_S[_<collective>][_<algorithm>]`), the card's launch
+#: floor (`LAUNCH_S`),
 #: and the measured side's
 #: launches `n_<k>` and launch time `T_<k>` of a step's term `k`. Closed:
 #: laws cross processes and the disk, and a re-read trusts no other name.
@@ -623,7 +595,6 @@ _LAW_NAME = re.compile(
     r"(?P<workload>B|s_input|s_output|s_prefix|s_verify|rho)"
     r"|(?P<bw>PEAK_BW)|(?P<peak>PEAK_FLOPS(_\w+)?)"
     r"|(?P<comm>COMM_S_PER_BYTE(_\w+)?)|(?P<latency>COMM_LATENCY_S(_\w+)?)"
-    r"|(?P<bound>COMM_MAX_BYTES(_\w+)?)"
     r"|(?P<launch_floor>LAUNCH_S)|(?P<launches>n_\d+)"
     r"|(?P<launch_time>T_\d+)")
 
@@ -636,11 +607,11 @@ def law_symbol(name: str) -> sp.Symbol:
         raise ValueError(
             f"a law may not read {name!r}: its names are {', '.join(POINT_NAMES)}, "
             "PEAK_BW, PEAK_FLOPS[_<dtype>], COMM_S_PER_BYTE[_<collective>], "
-            "COMM_LATENCY_S[_<collective>], COMM_MAX_BYTES[_<collective>], "
+            "COMM_LATENCY_S[_<collective>], "
             "LAUNCH_S, n_<k>, T_<k>")
     if m.group("workload"):
         return _WORKLOAD_BY_NAME[name]
-    if (m.group("comm") or m.group("latency") or m.group("bound")
+    if (m.group("comm") or m.group("latency")
             or m.group("launch_floor")
             or m.group("launches") or m.group("launch_time")):
         return sp.Symbol(name, nonnegative=True)
@@ -746,6 +717,7 @@ class LawBook:
         one at load) and a dtype column it lacks is refused where a card is
         in hand (`NoPeakForDtype`, `NoPeakBandwidth`), never priced free."""
         wire = row["roofline_expr"]
+        envelope = card.comm_envelope(row)
         comm = card.comm_values(row)
         args = (*(point_value(point[name]) for name in POINT_NAMES),
                 card.peak_flops if card.peak_flops and card.peak_flops > 0
@@ -756,13 +728,18 @@ class LawBook:
         entry = self._row_laws.get(id(wire))
         if entry is None or entry[0] is not wire:
             names = (*_ARG_NAMES, *(sym.name for sym in comm_names(
-                (len(comm) - 2) // 3)))
+                row_algorithms(row))))
             entry = self._row_laws[id(wire)] = (wire, self.compiled(
                 tuple(wire[name] for name in EXPR_NAMES), names))
         at = dict(zip(EXPR_NAMES, entry[1](*args), strict=True))
         times = RowTimes(float(at["t_compute"]), float(at["t_memory"]),
                          float(at["t_comm"]), float(at["t_op"]),
                          float(at["t_launch"]))
+        # The wire bytes are the algorithm's the time is: the envelope's
+        # choice at this payload, the same minimum the law took.
+        payload = float(at["comm_bytes"])
+        volume = (envelope.choose(payload).wire_per_byte * payload
+                  if envelope is not None and payload > 0 else 0.0)
         return RowAt(flops=int(at["flops"]), access=int(at["access"]),
                      act_out=int(at["act_out"]), times=times,
                      act_in=int(at["act_in"]),
@@ -770,8 +747,8 @@ class LawBook:
                      weight_read=int(at["weight_read"]),
                      metadata=int(at["metadata"]),
                      comm_payload=float(at["comm_payload"]),
-                     comm_volume=float(at["comm_volume"]),
-                     comm_bytes=float(at["comm_bytes"]))
+                     comm_volume=volume,
+                     comm_bytes=payload)
 
 
 def evaluate_law(text: str, values: Mapping[str, Any]) -> Any:
@@ -802,7 +779,6 @@ def row_law(row: Mapping[str, Any]) -> Dict[str, Any]:
         # A routed exchange's dedup travels with the row: a re-read on
         # another card re-levels the same fan-out there.
         "comm_route_fanout": row.get("comm_route_fanout"),
-        "comm_rungs": row.get("comm_rungs") or [],
         "peak_flops_per_sec_for_op": row.get("peak_flops_per_sec_for_op"),
         "act_dtype": row.get("act_dtype"),
     }
@@ -817,7 +793,8 @@ def bare_row(row: Mapping[str, Any]) -> Dict[str, Any]:
     (`batch_sweep.rows_at`) drop the same columns."""
     out = {key: value for key, value in row.items()
            if not key.endswith("_formula")
-           and key not in ("comm_phases", "comm_bw_bytes_per_sec",
+           and key not in ("comm_phases", "comm_choice",
+                           "comm_bw_bytes_per_sec",
                            "comm_bw_label", "comm_collective_in_shape",
                            "comm_collective_out_shape")}
     badge = out.get("source_badge") or {}
@@ -952,6 +929,13 @@ COLUMNS: Tuple[Column, ...] = (
            share=Share.RANK, on_module_table=False),
     Column("metadata_bytes_per_rank", source="metadata", additive=True,
            share=Share.RANK, on_module_table=False),
+    # The bytes that cross a rank's link: the wire bytes of the algorithm
+    # the collective's envelope chose at this point on this card
+    # (`RowAt.comm_volume`), so the figure the time divides. It is not the
+    # ring's volume and not monotone in the payload: past the crossover from
+    # one-shot ((N-1)·T) to NVLS ((N-1)/N·T) a larger batch moves about N
+    # times fewer bytes, and another card choosing another algorithm moves
+    # different bytes for the same payload.
     Column("comm_bytes_per_rank", source="comm_volume", additive=True,
            share=Share.RANK),
     Column("comm_tensor_bytes", source="comm_payload", additive=True,
@@ -1073,10 +1057,12 @@ def point_columns(at: RowAt, row: Mapping[str, Any], card: RowCard, *,
     world = int(row["comm_world"] or 0)
     sig = CollectiveSignature.of(row)
     phases: List[Dict[str, Any]] = []
+    choice: Optional[Dict[str, Any]] = None
     if sig is not None:
         phases = RowRoofline.comm(
             sig, tensor_bytes=at.comm_bytes, fabric=card.fabric,
             t_sym=t_sym, t_sub=t_sub)[1]
+        choice = sig.envelope(card.fabric).choice(at.comm_bytes)
     bw, label = 0.0, ""
     if phases:
         bottleneck = max(phases, key=lambda ph: ph["t_phase_s"])
@@ -1095,11 +1081,15 @@ def point_columns(at: RowAt, row: Mapping[str, Any], card: RowCard, *,
         "comm_bw_label": label,
         # One phase is the row itself; the breakdown lists two or more.
         "comm_phases": phases if len(phases) > 1 else [],
+        # Which algorithm priced the collective and every one it was chosen
+        # among, off the envelope the time read (`Envelope.choice`).
+        "comm_choice": choice,
         "comm_bytes_formula": comm_formula,
         "t_comm_formula": (_t_comm_formula_for_row(
             t_comm_s=t.t_comm, comm_bytes_per_rank=at.comm_volume,
             comm_bw_bytes_per_sec=bw, comm_bw_label=label, comm_world=world,
-            comm_bytes_formula=comm_formula, comm_phases=phases, cnt=cnt)
+            comm_bytes_formula=comm_formula, comm_phases=phases, cnt=cnt,
+            choice=choice)
             if is_comm else None),
         "t_op_formula": _t_op_formula_for_row(
             t_compute_s=t.t_compute, t_memory_s=t.t_memory,
@@ -1147,23 +1137,25 @@ def peak_symbol(act_dtype: Optional[str]) -> sp.Symbol:
 
 def collective_symbol(row: Mapping[str, Any],
                       rate: sp.Symbol = COMM_S_PER_BYTE) -> sp.Symbol:
-    """One of the row law's collective symbols (`comm_names`: a rate, a
-    fixed time or a range's bound), as a step's law names it: one symbol per
+    """One of the row law's collective symbols (`comm_names`: an
+    algorithm's rate or fixed time), as a step's law names it: the
     signature (`comm_cost.CollectiveSignature.symbol_suffix`) — everything
-    `RowCard.comm_ladder` prices besides the fabric, which one step's rows
-    share."""
+    `RowCard.comm_envelope` prices besides the fabric, which one step's rows
+    share — then the algorithm's own suffix (`candidate_symbols`)."""
     sig = CollectiveSignature.of(row)
     if sig is None:
         return rate
-    base, _r, k = rate.name.rpartition("_r")
-    stem, suffix = (base, f"_r{k}") if _r and k.isdigit() else (rate.name, "")
-    return law_symbol(f"{stem}{sig.symbol_suffix}{suffix}")
+    for family in (COMM_S_PER_BYTE, COMM_LATENCY_S):
+        if rate.name.startswith(family.name):
+            algorithm = rate.name[len(family.name):]
+            return law_symbol(f"{family.name}{sig.symbol_suffix}{algorithm}")
+    raise ValueError(f"{rate.name} is not a collective's symbol")
 
 
 def _row_comm_names(row: Mapping[str, Any]) -> Tuple[sp.Symbol, ...]:
-    """The collective symbols the row's law reads (`comm_names`): none for a
-    row that prices no collective, which `row_rungs` already says."""
-    return comm_names(len(row_rungs(row)))
+    """The collective symbols the row's law reads (`comm_names` over
+    `row_algorithms`)."""
+    return comm_names(row_algorithms(row))
 
 
 def lifted_law(row: Mapping[str, Any], name: str) -> sp.Expr:
@@ -1231,20 +1223,79 @@ class StepTerm:
         return bool(self.row["zero_cost"])
 
 
+def comm_pairs(pairs: Iterable[Tuple[float, float]]
+               ) -> Tuple[Tuple[float, float], ...]:
+    """A collective's envelope as `(bandwidth time, traversals)` pairs,
+    `b + c α` each, with a candidate that never finishes (an infinite
+    term: one the fabric cannot run, `comm_cost.Candidate.refused`) and
+    every pair another one is no slower than at any `α >= 0` left out (the
+    first of two equal ones kept): what `FloorForm` keeps of the envelope.
+    Exact — only a pair that can never be the minimum goes."""
+    pairs = [(b, c) for b, c in pairs
+             if math.isfinite(b) and math.isfinite(c)]
+    kept = []
+    for i, (b, c) in enumerate(pairs):
+        if any((b2 <= b and c2 <= c) and ((b2, c2) != (b, c) or j < i)
+               for j, (b2, c2) in enumerate(pairs) if j != i):
+            continue
+        kept.append((b, c))
+    return tuple(kept)
+
+
+class FloorTerm(NamedTuple):
+    """One term of a `FloorForm`: `max(a, min_j(b_j + c_j α), n L)`. `a` is
+    the row's compute or memory time, whichever binds; `pairs` its
+    collective's envelope, one `(b, c)` per algorithm that can be the
+    minimum at some `α` (`comm_pairs`; none off a collective); `n` its
+    launches."""
+    a: float
+    pairs: Tuple[Tuple[float, float], ...]
+    n: float
+
+    @classmethod
+    def of(cls, a: float, pairs: Iterable[Tuple[float, float]],
+           n: float) -> "FloorTerm":
+        """The term, its envelope pruned (`comm_pairs`) and a pair that
+        moves nothing (`(0, 0)`) left out."""
+        return cls(float(a), tuple(p for p in comm_pairs(pairs) if any(p)),
+                   float(n))
+
+    def at(self, alpha: float, launch: float) -> float:
+        comm = min((b + c * alpha for b, c in self.pairs), default=0.0)
+        return max(self.a, comm, self.n * launch)
+
+    def floored(self) -> bool:
+        """Whether the term moves with either floor."""
+        return bool(self.n) or any(c for _b, c in self.pairs)
+
+    def flat(self) -> Tuple[float, ...]:
+        """Its coefficients in a row: what a ray is read off."""
+        return (self.a, self.n, *(x for pair in self.pairs for x in pair))
+
+    def scaled(self, other: "FloorTerm") -> "FloorTerm":
+        """This term plus `other`, which lies on its ray."""
+        return FloorTerm(self.a + other.a,
+                         tuple((b + b2, c + c2) for (b, c), (b2, c2)
+                               in zip(self.pairs, other.pairs, strict=True)),
+                         self.n + other.n)
+
+
 @dataclass(frozen=True)
 class FloorForm:
     """A step's SOL time as a function of its two floors alone — one link
     traversal's latency `α` and the shortest a launch takes `L` — with
     every other part of each row's law read at the step's point on its card:
 
-        t(α, L) = K + Σ_k max(a_k, b_k + c_k α, n_k L)
+        t(α, L) = K + Σ_k max(a_k, min_j(b_kj + c_kj α), n_k L)
 
-    `a` is the row's compute or memory time, whichever binds; `b` its
-    collective's bandwidth time and the RDMA latency its cross-node hops
-    wait beyond α (a card fact, `comm_cost.Fabric.hop_latency`), `c` the
-    link traversals it waits on over the step (`COMM_LATENCY_S` is
-    `c α` plus that RDMA part); `n` its launches
-    (`t_launch = n L`). A row whose time moves with neither floor adds
+    `a` is the row's compute or memory time, whichever binds; each `(b, c)`
+    one algorithm of its collective's envelope (`comm_cost.Envelope`): `b`
+    its bandwidth time and the RDMA latency its cross-node hops wait beyond
+    α (a card fact, `comm_cost.Fabric.hop_latency`), `c` the link
+    traversals it waits on over the step (`COMM_LATENCY_S` is `c α` plus
+    that RDMA part) — the envelope is a minimum, so which algorithm wins
+    moves with `α`; `n` its launches (`t_launch = n L`). A term is a
+    `FloorTerm`. A row whose time moves with neither floor adds
     into `K`. Each coefficient is the row's law read twice
     (`LawBook.row_at`): on the card with both floors 0 and with both 1, so
     the form is the law's and not a second statement of it. Another `α`
@@ -1255,7 +1306,7 @@ class FloorForm:
     draft_forwards=…)`): a draft forward's term is the same form, weighted.
     A pipelined step is the caller's to refuse."""
     constant: float
-    terms: Tuple[Tuple[float, float, float, float], ...]
+    terms: Tuple[FloorTerm, ...]
     #: Each term's index among the step's terms (`StepSum.terms`, the
     #: measured formula's), when the form keeps them apart (`termwise`);
     #: empty for a `collapsed` form, whose terms are rays, not step terms.
@@ -1294,8 +1345,7 @@ class FloorForm:
     def at(self, link_latency_s: float, launch_floor_s: float) -> float:
         """The step's SOL time at these floors (seconds)."""
         return self.constant + sum(
-            max(a, b + c * link_latency_s, n * launch_floor_s)
-            for a, b, c, n in self.terms)
+            term.at(link_latency_s, launch_floor_s) for term in self.terms)
 
     def terms_at(self, link_latency_s: float, launch_floor_s: float,
                  steps: Iterable[int]) -> float:
@@ -1311,63 +1361,61 @@ class FloorForm:
         if stray:
             raise ValueError(f"step terms {stray[:5]} are not among this "
                              f"form's {self.width}")
-        return sum(max(a, b + c * link_latency_s, n * launch_floor_s)
-                   for k, (a, b, c, n) in zip(self.index, self.terms, strict=True)
+        return sum(term.at(link_latency_s, launch_floor_s)
+                   for k, term in zip(self.index, self.terms, strict=True)
                    if k in wanted)
 
     @classmethod
-    def termwise(cls, terms: Iterable[Tuple[int, Tuple[float, float, float, float]]],
+    def termwise(cls, terms: Iterable[Tuple[int, FloorTerm]],
                  width: int) -> "FloorForm":
-        """The form of a step's `width` terms, `(step-term index,
-        coefficients)` pairs each kept apart under its index so a reader
-        can price any of them alone (`terms_at`); terms with every
-        coefficient 0 are left out."""
-        kept = [(k, t) for k, t in terms if any(t)]
+        """The form of a step's `width` terms, `(step-term index, term)`
+        pairs each kept apart under its index so a reader can price any of
+        them alone (`terms_at`); terms with every coefficient 0 are left
+        out."""
+        kept = [(k, t) for k, t in terms if any(t.flat())]
         if any(not 0 <= k < width for k, _t in kept):
             raise ValueError(f"a step term past the step's {width}")
         return cls(0.0, tuple(t for _k, t in kept), tuple(k for k, _t in kept),
                    int(width))
 
     @classmethod
-    def collapsed(cls, constant: float,
-                  terms: Iterable[Tuple[float, float, float, float]]
+    def collapsed(cls, constant: float, terms: Iterable[FloorTerm]
                   ) -> "FloorForm":
         """The form of `constant` and `terms`, every set of terms equal up
-        to a positive weight collapsed into one: `w x max(a, b + cα, nL)`
-        is `max(wa, wb + wcα, wnL)`, so terms on one ray add. Exact: the
+        to a positive weight collapsed into one: `w x max(a, min(b + cα),
+        nL)` is `max(wa, min(wb + wcα), wnL)`, so terms on one ray add. Exact: the
         ray of a term is its coefficients over its first nonzero one, as
         rationals (`Fraction` of each float), so only terms that are
         exactly proportional share one. The one constructor a builder
         calls when its terms need not be told apart (`CardForm.bind`); a
         form whose terms a reader prices one by one is `termwise`."""
-        merged: Dict[Tuple[Fraction, ...], List[float]] = {}
+        merged: Dict[Tuple[Any, ...], FloorTerm] = {}
         for term in terms:
-            pivot = Fraction(next((x for x in term if x), 0.0))
+            flat = term.flat()
+            pivot = Fraction(next((x for x in flat if x), 0.0))
             if not pivot:
                 continue
-            ray = tuple(Fraction(x) / pivot for x in term)
-            if ray in merged:
-                merged[ray] = [s + x for s, x in zip(merged[ray], term,
-                                                    strict=True)]
-            else:
-                merged[ray] = list(term)
-        return cls(float(constant),
-                   tuple((a, b, c, n) for a, b, c, n in merged.values()))
+            ray = (len(term.pairs), *(Fraction(x) / pivot for x in flat))
+            merged[ray] = merged[ray].scaled(term) if ray in merged else term
+        return cls(float(constant), tuple(merged.values()))
 
     def to_json(self) -> Dict[str, Any]:
-        """Columnar: the constant and one array per coefficient."""
+        """Columnar: the constant, `a` and `n` one number per term, and
+        `pairs` one `[[b, c], …]` list per term."""
         return {"constant": self.constant,
-                **{name: [term[i] for term in self.terms]
-                   for i, name in enumerate("abcn")},
+                "a": [term.a for term in self.terms],
+                "pairs": [[list(pair) for pair in term.pairs]
+                          for term in self.terms],
+                "n": [term.n for term in self.terms],
                 **({"index": list(self.index), "width": self.width}
                    if self.width else {})}
 
     @classmethod
     def from_json(cls, d: Mapping[str, Any]) -> "FloorForm":
         return cls(float(d["constant"]), tuple(
-            (float(a), float(b), float(c), float(n))
-            for a, b, c, n in zip(d["a"], d["b"], d["c"], d["n"],
-                                  strict=True)),
+            FloorTerm(float(a), tuple((float(b), float(c)) for b, c in pairs),
+                      float(n))
+            for a, pairs, n in zip(d["a"], d["pairs"], d["n"], strict=True)),
             tuple(int(k) for k in d.get("index") or ()),
             int(d.get("width") or 0))
 
@@ -1394,9 +1442,10 @@ class CardForm:
     draft's forwards), with the row's dtype and its collective's signature
     in the side tables (`dtypes`, `sigs`). The card enters only at `bind`:
     the peak is the card's column of the row's dtype, and the collective's
-    payload range is decided on that card (`collective_ladder`) on ONE
-    forward's payload, as the row's law decides it — an inadmissible rung
-    collapses there exactly as on a fresh walk.
+    envelope is the card's (`comm_cost.Envelope`), each algorithm the
+    card's fabric runs priced on ONE forward's payload, as the row's law
+    prices it — an algorithm the card cannot run drops out there exactly as
+    on a fresh walk.
 
     Built in the walk's worker from the rows' laws (`LawBook.row_at`: the
     components are card-independent; the launch count is the floors-0/1
@@ -1422,9 +1471,8 @@ class CardForm:
     #: (-1: no priced collective).
     terms: Tuple[Tuple[float, float, int, float, int, float, int], ...]
     dtypes: Tuple[str, ...] = ()
-    #: Per priced collective signature: the facts `collective_ladder` reads
-    #: (op, world, count_per_step, base_stride, the framework's rungs), as
-    #: canonical JSON.
+    #: Per priced collective signature: the facts its envelope reads besides
+    #: the card (`comm_cost.CollectiveSignature.key`), as canonical JSON.
     sigs: Tuple[str, ...] = ()
 
     @classmethod
@@ -1481,11 +1529,15 @@ class CardForm:
         bandwidth is refused the same way (`NoPeakBandwidth`): `bytes / bw`
         with no `bw` prices every byte at zero seconds, which says the card
         is infinitely fast. `w` forwards of `max(a, b + cα, nL)` is
-        `max(wa, wb + wcα, wnL)`."""
-        ladders = [(_sig_ladder(sig, fabric, 0.0), _sig_ladder(sig, fabric, 1.0))
-                   for sig in self.sigs]
+        `max(wa, min(wb + wcα), wnL)`."""
+        # Each envelope read at link latency 0 and 1 s: its fixed time is
+        # affine in α (`comm_cost.Fabric.hop_latency`).
+        envelopes = [tuple(CollectiveSignature.from_key(sig).envelope(
+                         fabric._replace(step_latency=alpha))
+                           for alpha in (0.0, 1.0))
+                     for sig in self.sigs]
         constant = 0.0
-        terms: List[Tuple[float, float, float, float]] = []
+        terms: List[FloorTerm] = []
         for flops, access, di, n, si, payload, w in self.terms:
             t_compute = 0.0
             if flops:
@@ -1505,20 +1557,23 @@ class CardForm:
                         or peak_bw <= 0):
                     raise NoPeakBandwidth(gpu_sku or "This GPU")
                 t_memory = access / peak_bw
-            b = c = 0.0
+            pairs: Tuple[Tuple[float, float], ...] = ()
             if si >= 0 and payload > 0:
                 # The fixed time is affine in the link latency: what a hop
                 # waits at α = 0 (a cross-node hop's own RDMA latency) is
-                # floor-free, the rest is the hops α multiplies.
-                at0, at1 = (ladder_segment(ladder, payload)
-                            for ladder in ladders[si])
-                b = payload * at0.s_per_byte + at0.latency_s
-                c = at1.latency_s - at0.latency_s
-            a, b, c, n = w * max(t_compute, t_memory), w * b, w * c, w * n
-            if c == 0 and n == 0:
-                constant += max(a, b)
+                # floor-free, the rest is the hops α multiplies. A candidate
+                # the card cannot run never finishes at either, and is left
+                # out (`comm_pairs`).
+                at0, at1 = (e.law_values() for e in envelopes[si])
+                pairs = tuple(
+                    (w * (payload * s0 + l0), w * (l1 - l0))
+                    if math.isfinite(l0) else (math.inf, math.inf)
+                    for (s0, l0), (_s1, l1) in zip(at0, at1, strict=True))
+            term = FloorTerm.of(w * max(t_compute, t_memory), pairs, w * n)
+            if term.floored():
+                terms.append(term)
             else:
-                terms.append((a, b, c, n))
+                constant += term.at(0.0, 0.0)
         return FloorForm.collapsed(constant, terms)
 
     def to_json(self) -> Dict[str, Any]:
@@ -1532,18 +1587,6 @@ class CardForm:
                    int(t[4]), float(t[5]), int(t[6])) for t in d["terms"]),
             tuple(str(x) for x in d.get("dtypes") or ()),
             tuple(str(s) for s in d.get("sigs") or ()))
-
-
-@memoize(maxsize=4096)
-def _sig_ladder(sig: str, fabric: Fabric, step_latency: float
-                ) -> Tuple[Segment, ...]:
-    """A collective signature's ladder on `fabric` (`CardForm.sigs`) at
-    link latency `step_latency` — read at 0 and at 1 s, a segment's
-    `latency_s` is the floor-free part and the hops coefficient one link
-    traversal multiplies. One per (signature, card, latency): every point
-    of a walk shares its collectives' signatures."""
-    return CollectiveSignature.from_key(sig).ladder(
-        fabric._replace(step_latency=step_latency))
 
 
 @dataclass(frozen=True)

@@ -411,7 +411,7 @@ class _StubAnalysis(AnalysisResult):
                 **law_columns(build_row_exprs(
                     count=28, flops=1_000_000 / 28, act_in=1_000_000 / 28,
                     act_out=0, demand=0, weight_total=0,
-                    metadata_total=0, comm_factor=0.0, comm_priced=False),
+                    metadata_total=0, comm_priced=False),
                     LawBook()),
             },
             ],

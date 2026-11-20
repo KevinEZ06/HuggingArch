@@ -72,7 +72,7 @@ HuggingArch is an analytical planner, not a profiler or a runtime.
 | **Attention** | MHA, GQA, MLA, sparse (DSA), sliding window, linear attention and SSM hybrids — 186 reusable component DAGs. |
 | **Quantization** | FP8, FP4 / MXFP4 / NVFP4, AWQ, GPTQ, ModelOpt, compressed-tensors. |
 | **GPUs** | 15 SKUs: A100 through GB300. |
-| **Frameworks** | vLLM, sglang, and DeepInfer fusion bindings (91 fusion plans). |
+| **Frameworks** | vLLM, sglang, and DeepInfer fusion bindings (94 fusion plans). |
 
 ## Learn more
 

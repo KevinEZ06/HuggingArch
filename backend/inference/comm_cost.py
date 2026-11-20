@@ -20,16 +20,17 @@ intra-node reduce-scatter, then a smaller inter-node all-reduce, then
 intra-node all-gather. A flat `2(N-1)/N · T / rdma_bw` under-counts
 because the RDMA hop only moves `T/N_intra` per rank.
 
-Inside one NVLink domain a framework does not run NCCL's schedule on every
-all-reduce: it dispatches by payload to its own one-shot and two-shot
-kernels and, above them, to NVLS where the switch reduces
-(`comm_volume.ALGORITHMS`). Which payload takes which is the framework's
-binding (`framework_bindings`, `collectives:`, read here as
-`CollectiveRung`s); whether the topology admits an algorithm is the card's
-(`gpu_specs`: an NVLink domain, NVLS). `collective_ladder` is the one
-place both are put together: the payload ranges and, for each, the bytes
-and hops it is priced at — the walk's row, the row's law and every re-read
-of it on another card or at another payload read that one answer.
+A collective's time is its ENVELOPE: the fastest, at its payload, of the
+algorithms that run it (`comm_volume.ALGORITHMS`: one-shot, two-shot and
+NVLS all-reduces inside one NVLink domain, NCCL's schedule everywhere) that
+the card's fabric can run (`Envelope`). Which ones it can run is a hardware
+fact and nothing else — an NVLink domain, a switch that reduces, the group
+inside one node (`Fabric`, off `gpu_specs`) — so the price is the same under
+every framework: a framework that falls back to a slower path is slower
+than this bound, not a different bound. Each algorithm's time is the α-β
+law (`price_collective`, `collective_latency`), so a small payload takes a
+one-traversal algorithm and a large one the algorithm that moves the fewest
+bytes, by the same law at every payload.
 
 `collective_per_rank_bytes` is re-exported so older callers keep the
 same import. At N=1 every formula collapses to zero.
@@ -42,11 +43,15 @@ import re
 from typing import Tuple, Any, Dict, List, Mapping, NamedTuple, Optional, Sequence
 
 from backend.arch.ops import collective_schedule, sp_axis_effect
-from backend.arch.layout.comm_volume import (ALGORITHMS, COMM_OPS, NCCL,
-                                             RouteFanout, ring_factor_symbolic)
+from backend.arch.layout.comm_volume import (ALGORITHMS, COMM_OPS,
+                                             FABRIC_CAPABILITIES, NCCL,
+                                             STAGE_KINDS, RouteFanout,
+                                             algorithms_for,
+                                             ring_factor_symbolic)
 from backend.arch.layout.comm_volume import (
     collective_per_rank_bytes as collective_per_rank_bytes,
 )
+from backend.code_trace.memo import memoize
 from . import gpu_specs
 from .phase_formulas import _fmt_si
 
@@ -94,10 +99,10 @@ class Fabric(NamedTuple):
     link traversal's latency (s, the request's `comm_latency_us`) and what
     a traversal across nodes waits on beyond it (`inter_latency`, the
     card's `rdma_hop_latency_us`; `hop_latency`), and what its topology
-    admits of a framework's own all-reduces (`gpu_specs.has_nvlink_domain`,
-    `has_nvls`) beside the compute capability a dispatch tests. A fabric
-    built from bandwidths alone admits none of them: NCCL's schedule
-    prices every collective, every hop at the one link latency."""
+    admits of the all-reduces that need more than a link
+    (`gpu_specs.has_nvlink_domain`, `has_nvls`). A fabric built from
+    bandwidths alone admits none of them: NCCL's schedule prices every
+    collective, every hop at the one link latency."""
     gpus_per_node: Optional[int]
     intra_bw: Optional[float]
     inter_bw: Optional[float]
@@ -106,7 +111,6 @@ class Fabric(NamedTuple):
     step_latency: float = 0.0
     nvlink: bool = False
     nvls: bool = False
-    compute_capability: Optional[str] = None
     inter_latency: float = 0.0
 
     @classmethod
@@ -130,6 +134,51 @@ class Fabric(NamedTuple):
         return self.step_latency + (self.inter_latency if where == "inter"
                                     else 0.0)
 
+    def offers(self) -> Dict[str, bool]:
+        """Each fabric capability (`comm_volume.FABRIC_CAPABILITIES`) and
+        whether this fabric has it, with why not where it does not."""
+        return {"nvlink": self.nvlink, "nvls": self.nvls}
+
+    def lacks(self, capability: str) -> str:
+        """What a refusal says of a capability this fabric does not have."""
+        return {"nvlink": f"card has no NVLink domain ({self.intra_label})",
+                "nvls": "card has no NVLink multicast (NVLS)"}[capability]
+
+    def refusal(self, algorithm: str, *, op: str, world: int,
+                base_stride: int) -> Optional[str]:
+        """Why this fabric cannot run `algorithm` for a collective `op` of
+        `world` ranks `base_stride` apart, or None when it can.
+
+        Hardware facts only: the capabilities the algorithm needs
+        (`CollectiveAlgorithm.needs`), each the NVLink domain's, so an
+        algorithm that needs any runs only on a group inside one node
+        (`members_per_node`). One that needs none — NCCL's schedule — runs
+        everywhere. Asking for an algorithm that does not run `op` at all
+        is the caller's error (`comm_volume.algorithms_for` lists those
+        that do)."""
+        run = ALGORITHMS[algorithm]
+        if not run.runs(op):
+            raise ValueError(f"{algorithm} runs only {sorted(run.ops)}, "
+                             f"not {op}")
+        if not run.needs:
+            return None
+        n = int(world)
+        inside = members_per_node(n, self.gpus_per_node, base_stride)
+        if inside < n:
+            return (f"the group spans {-(-n // inside)} nodes; "
+                    f"{algorithm.replace('_', '-')} runs inside one NVLink "
+                    "domain")
+        offers = self.offers()
+        for capability in sorted(run.needs):
+            if not offers[capability]:
+                return self.lacks(capability)
+        return None
+
+
+if set(Fabric(None, None, None).offers()) != FABRIC_CAPABILITIES:
+    raise ValueError("Fabric.offers answers other capabilities than "
+                     "comm_volume.FABRIC_CAPABILITIES declares")
+
 
 def topology(gpu: Optional["gpu_specs.GPUSpec"]) -> Dict[str, Any]:
     """What a card's sheet row says of its fabrics beyond their bandwidths,
@@ -139,13 +188,7 @@ def topology(gpu: Optional["gpu_specs.GPUSpec"]) -> Dict[str, Any]:
         return {}
     return {"nvlink": gpu_specs.has_nvlink_domain(gpu),
             "nvls": gpu_specs.has_nvls(gpu),
-            "compute_capability": gpu.compute_capability or None,
             "inter_latency": gpu_specs.inter_hop_latency_s(gpu)}
-
-
-def _capability(text: str) -> Tuple[int, int]:
-    major, _dot, minor = str(text).partition(".")
-    return int(major), int(minor)
 
 
 def members_per_node(world: Any, gpus_per_node: Any, base_stride: Any) -> int:
@@ -157,8 +200,8 @@ def members_per_node(world: Any, gpus_per_node: Any, base_stride: Any) -> int:
     `base_stride` is the size of the parallelism nested INSIDE this group
     (`layout.mesh.base_stride`), so a TP collective (members adjacent) has
     1 and an EP collective over `tp_moe_expert` has that degree. The one
-    statement of it: which fabric a group's traffic crosses, which rungs a
-    framework's dispatch admits and how a routed exchange's destinations
+    statement of it: which fabric a group's traffic crosses, which
+    algorithms its fabric admits and how a routed exchange's destinations
     are placed are three readings of this one number, and they were three
     spellings of it."""
     n = max(int(world or 1), 1)
@@ -283,113 +326,153 @@ def placement_levels(world: Any, gpus_per_node: Any, base_stride: Any
     return tuple(level for level in levels if level.destinations > 1)
 
 
-class CollectiveRung(NamedTuple):
-    """One entry of a framework's all-reduce dispatch (`framework_bindings`,
-    `collectives:`): the algorithm it runs (`comm_volume.ALGORITHMS`) on a
-    payload of at most `max_bytes` (inclusive) and at most
-    `max_bytes_times_world` summed over the group, in a group whose size
-    is one of `worlds` (the sizes the framework's kernel accepts; a group of
-    any other size runs NCCL), on a card whose compute capability is at
-    least `min_compute_capability` and below `below_compute_capability`. A
-    row carries its collective's rungs (`as_dict`), so a re-read of it on
-    another card needs no binding."""
+class Candidate(NamedTuple):
+    """One algorithm of a collective's envelope on one fabric: the seconds
+    `price_collective` charges per payload byte and the fixed time over the
+    step's instances (`collective_latency`), the per-rank wire bytes per
+    payload byte over those instances (the sum of its phases' bytes), the
+    link traversals ONE instance waits on, its stages in order
+    (`(kind, label)`, `comm_volume.STAGE_KINDS`), and — where the fabric
+    cannot run it — why not (`Fabric.refusal`).
+
+    A refused candidate has no price: it never finishes (an infinite fixed
+    time, `REFUSED`), so it is never the minimum of anything it sits in —
+    the row law's `Min` included — and nothing borrows another algorithm's
+    price for it."""
     algorithm: str
-    max_bytes: Optional[int] = None
-    max_bytes_times_world: Optional[int] = None
-    min_compute_capability: Optional[str] = None
-    below_compute_capability: Optional[str] = None
-    worlds: Tuple[int, ...] = ()
-
-    def cap(self, world: int) -> float:
-        """The largest payload (bytes, inclusive) this rung takes in a
-        group of `world`."""
-        caps = [math.inf]
-        if self.max_bytes is not None:
-            caps.append(float(self.max_bytes))
-        if self.max_bytes_times_world is not None:
-            caps.append(float(self.max_bytes_times_world) / int(world))
-        return min(caps)
-
-    def runs_on(self, fabric: Fabric, *, world: int, base_stride: int) -> bool:
-        """Whether the card's topology and capability admit this rung for a
-        group of `world` ranks `base_stride` apart: every member in one
-        NVLink domain, the topology the algorithm needs, and the capability
-        the framework tests."""
-        n = int(world)
-        if n <= 1 or members_per_node(
-                n, fabric.gpus_per_node, base_stride) < n:
-            return False
-        if n not in self.worlds:
-            return False
-        needs = ALGORITHMS[self.algorithm].needs
-        if (needs == "nvlink" and not fabric.nvlink) or (
-                needs == "nvls" and not fabric.nvls):
-            return False
-        if self.min_compute_capability or self.below_compute_capability:
-            if not fabric.compute_capability:
-                return False
-            cc = _capability(fabric.compute_capability)
-            if (self.min_compute_capability
-                    and cc < _capability(self.min_compute_capability)):
-                return False
-            if (self.below_compute_capability
-                    and cc >= _capability(self.below_compute_capability)):
-                return False
-        return True
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {k: (list(v) if k == "worlds" else v)
-                for k, v in self._asdict().items() if v is not None}
-
-    @classmethod
-    def from_dict(cls, d: Mapping[str, Any]) -> "CollectiveRung":
-        d = dict(d)
-        return cls(**{**d, "worlds": tuple(int(w) for w in d.get("worlds", ()))})
-
-
-class Segment(NamedTuple):
-    """One payload range of a collective on a card: payloads up to
-    `max_bytes` (inclusive, past the ranges before it) run `algorithm`, at
-    `s_per_byte` seconds per payload byte and `latency_s` fixed over the
-    step's instances."""
-    algorithm: str
-    max_bytes: float
     s_per_byte: float
     latency_s: float
+    wire_per_byte: float
+    hops: int
+    stages: Tuple[Tuple[str, str], ...] = ()
+    refusal: Optional[str] = None
+
+    @property
+    def feasible(self) -> bool:
+        return self.refusal is None
+
+    def t(self, payload: float) -> float:
+        """This algorithm's time over the step at a payload of `payload`
+        bytes per instance; infinite where the fabric cannot run it."""
+        if not self.feasible:
+            return math.inf
+        return float(payload) * self.s_per_byte + self.latency_s
+
+    @classmethod
+    def refused(cls, algorithm: str, reason: str) -> "Candidate":
+        """`algorithm`, which the fabric cannot run, for `reason`."""
+        return cls(algorithm, 0.0, math.inf, 0.0, 0,
+                   ALGORITHMS[algorithm].stages, reason)
+
+
+#: The payloads a candidate's curve is sampled at (`Envelope.choice`): 25
+#: points evenly spaced in log from 1 KiB to 1 GiB.
+CURVE_PAYLOADS: Tuple[int, ...] = tuple(
+    round(1024 * 2 ** (20 * i / 24)) for i in range(25))
+
+
+class Envelope(NamedTuple):
+    """A collective's ENVELOPE on one fabric: every algorithm that runs its
+    op (`comm_volume.algorithms_for`, in that order), each priced on the
+    fabric (`Candidate`). Its time at a payload is the minimum over them;
+    ties go to the earlier. A candidate the fabric cannot run is listed,
+    refused, and never finishes, so the minimum is over the feasible ones —
+    NCCL's schedule always among them.
+
+    One shape on every card (the row law's `Min` names every candidate,
+    `law_values`), and `choose` is that minimum's argument: everything a
+    row publishes about its collective — its time, its wire bytes, its
+    per-phase rows, the `comm_choice` column — reads that one choice. The
+    envelope carries the collective and the fabric it was priced for, so a
+    reader cannot hand it a card it was not built on."""
+    sig: "CollectiveSignature"
+    fabric: "Fabric"
+    candidates: Tuple[Candidate, ...]
+
+    def choose(self, payload: float) -> Candidate:
+        """The fastest feasible candidate at `payload` bytes per instance."""
+        return min((c for c in self.candidates if c.feasible),
+                   key=lambda c: c.t(payload))
+
+    def law_values(self) -> Tuple[Tuple[float, float], ...]:
+        """Each candidate's (seconds per byte, fixed time), in order: what
+        the row law's `Min` reads. A refused one's fixed time is infinite."""
+        return tuple((c.s_per_byte, c.latency_s) for c in self.candidates)
+
+    def choice(self, payload: float) -> Dict[str, Any]:
+        """The `comm_choice` a row publishes at `payload` (bytes per
+        instance): the collective, the fabric facts that decided which
+        algorithms were feasible, the one chosen, the envelope itself on the
+        curve grid, and every candidate with its time and wire bytes over
+        the row's instances (null where refused, with the reason), its
+        curve — the same law over `CURVE_PAYLOADS` — and what it is
+        (`description`, `stages`, `note`, declared beside the algorithm)."""
+        sig, fabric = self.sig, self.fabric
+        n = int(sig.world)
+        stride = max(int(sig.stride or 1), 1)
+        inside = members_per_node(n, fabric.gpus_per_node, stride)
+        spans = -(-n // inside)
+        chosen = self.choose(payload)
+        return {
+            "op": sig.op, "world": n, "count": int(sig.count),
+            # The group that holds rank 0: its members `stride` apart on the
+            # mesh (`members_per_node`).
+            "ranks": [k * stride for k in range(n)],
+            "payload_bytes": float(payload),
+            "fabric": {
+                "link": fabric.inter_label if spans > 1 else fabric.intra_label,
+                "nvls": bool(fabric.nvls),
+                "gpus_per_node": int(fabric.gpus_per_node or 1),
+                "nodes_spanned": int(spans),
+            },
+            "algorithm": chosen.algorithm,
+            "envelope_curve": [[p, c.t(p), c.algorithm]
+                               for p in CURVE_PAYLOADS
+                               for c in (self.choose(p),)],
+            "candidates": [{
+                "algorithm": c.algorithm,
+                "description": ALGORITHMS[c.algorithm].description,
+                "note": ALGORITHMS[c.algorithm].note,
+                "stages": [{"kind": kind, "label": label}
+                           for kind, label in c.stages],
+                "feasible": c.feasible,
+                "reason": c.refusal,
+                "t_s": c.t(payload) if c.feasible else None,
+                "wire_bytes_per_rank": (c.wire_per_byte * float(payload)
+                                        if c.feasible else None),
+                "hops": c.hops if c.feasible else None,
+                "curve": ([[p, c.t(p)] for p in CURVE_PAYLOADS]
+                          if c.feasible else []),
+            } for c in self.candidates],
+        }
 
 
 class CollectiveSignature(NamedTuple):
-    """One collective as everything but the card: what `collective_ladder`
-    reads besides the fabric.
+    """One collective as everything but the card: what its envelope
+    (`Envelope`) reads besides the fabric.
 
     A row's collective is priced in more than one place — the walk's own
     row, a re-read of that row on another card or at another batch
     (`row_roofline.CardForm`), the step's law in the browser
     (`sol_law`) — and all of them have to name the SAME collective and
-    price it the same way. The facts were spelled out at each: five places
-    wrote `(op, world, count, stride, rungs)` in three notations (a kwargs
-    call, a JSON object, an underscore-joined symbol name) and nothing held
-    them to each other. A sixth fact would have had to be added five times.
+    price it the same way. So the facts are a type, and its notations are
+    its projections: `key` (the canonical JSON a cached form and a law
+    record carry), `symbol_suffix` (the name a step's law prices this
+    collective under — two collectives that differ in any fact here must
+    differ in that name, or one's price is read for the other) and
+    `envelope` (the pricing itself).
 
-    So the facts are a type, and the three notations are its three
-    projections: `key` (the canonical JSON a cached form and a law record
-    carry), `symbol_suffix` (the name a step's law prices this collective
-    under — two collectives that differ in any fact here must differ in
-    that name, or one's price is read for the other) and `ladder` (the
-    pricing itself).
-
-    `route_fanout` is the sixth fact: a routed MoE exchange's top-k
-    fan-out, which prices its dedup (`comm_volume.RouteFanout`). It is part
-    of the signature and not of the card because two expert pools of
-    different top-k in ONE step — a speculative draft's 128-choose-3 pool
-    beside the main 384-choose-6 — are two prices, and a symbol naming only
-    `(op, world, count, stride)` would hand one of them the other's.
+    `route_fanout` is a routed MoE exchange's top-k fan-out, which prices
+    its dedup (`comm_volume.RouteFanout`). It is part of the signature and
+    not of the card because two expert pools of different top-k in ONE step
+    — a speculative draft's 128-choose-3 pool beside the main 384-choose-6
+    — are two prices, and a symbol naming only `(op, world, count, stride)`
+    would hand one of them the other's.
     """
     op: str
     world: int
     count: int
     stride: int
-    rungs: Tuple[CollectiveRung, ...] = ()
     route_fanout: Optional[RouteFanout] = None
 
     @classmethod
@@ -406,8 +489,6 @@ class CollectiveSignature(NamedTuple):
         return cls(op=str(row["comm_op"]), world=int(row["comm_world"]),
                    count=int(row["count_per_step"]),
                    stride=int(row["comm_base_stride"]),
-                   rungs=tuple(CollectiveRung.from_dict(r)
-                               for r in row.get("comm_rungs") or ()),
                    route_fanout=(RouteFanout.from_dict(fanout)
                                  if fanout else None))
 
@@ -416,12 +497,10 @@ class CollectiveSignature(NamedTuple):
         """These facts as canonical JSON: what a cached card-independent
         form carries instead of the row (`CardForm.sigs`), and what a law
         record names its collectives by (`sol_law`). A collective with no
-        fan-out states none, so a record written before routed exchanges
-        were deduped reads back as the collective it was."""
+        fan-out states none."""
         facts: Dict[str, Any] = {
             "op": self.op, "world": self.world, "count": self.count,
-            "stride": self.stride,
-            "rungs": [r.as_dict() for r in self.rungs]}
+            "stride": self.stride}
         if self.route_fanout is not None:
             facts["route_fanout"] = self.route_fanout.as_dict()
         return json.dumps(facts, sort_keys=True)
@@ -432,8 +511,6 @@ class CollectiveSignature(NamedTuple):
         fanout = d.get("route_fanout")
         return cls(op=str(d["op"]), world=int(d["world"]),
                    count=int(d["count"]), stride=int(d["stride"]),
-                   rungs=tuple(CollectiveRung.from_dict(r)
-                               for r in d.get("rungs") or ()),
                    route_fanout=(RouteFanout.from_dict(fanout)
                                  if fanout else None))
 
@@ -442,71 +519,63 @@ class CollectiveSignature(NamedTuple):
         """What a step's law appends to a collective card symbol's name
         (`row_roofline.collective_symbol`, `sol_law.cardBinding`) so that
         rows of different collectives add: one name per distinct
-        signature.
-
-        The rungs are the one fact of the signature this name leaves out,
-        and may be: they are the FRAMEWORK's dispatch of this collective,
-        which one walk's rows all share (`ServingLayers.collectives` is per
-        op), so two rows of one step cannot differ in them while agreeing
-        on everything else. `key` carries them, because a cached form and a
-        law record are re-read on another card and have to re-price the
-        ladder."""
+        signature."""
         out = f"_{self.op}_{self.world}_{self.count}_{self.stride}"
         if self.route_fanout is not None:
             out += self.route_fanout.symbol_suffix
         return out
 
-    def ladder(self, fabric: "Fabric") -> Tuple[Segment, ...]:
-        """This collective's payload ranges on `fabric`
-        (`collective_ladder`)."""
-        return collective_ladder(
-            op=self.op, world=self.world, count_per_step=self.count,
-            base_stride=self.stride, fabric=fabric, rungs=self.rungs,
-            fanout=self.route_fanout)
+    def envelope(self, fabric: "Fabric") -> Envelope:
+        """This collective's envelope on `fabric` (`collective_envelope`)."""
+        return collective_envelope(self, fabric)
 
 
-def collective_ladder(*, op: str, world: int, count_per_step: int,
-                      base_stride: int, fabric: Fabric,
-                      rungs: Sequence[CollectiveRung] = (),
-                      fanout: Optional[RouteFanout] = None
-                      ) -> Tuple[Segment, ...]:
-    """A collective's payload ranges on `fabric`: one per rung of the
-    framework's dispatch, in its order, then NCCL's schedule for every
-    payload past them. A rung the card does not admit is an empty range
-    (`max_bytes` 0) priced as NCCL's, so the ladder has one shape on every
-    card and a zero payload costs what it does without one. `fanout` is the
-    routed exchange's top-k fan-out where the collective is one. The one
-    answer to which algorithm a payload takes (`Segment.of`) and what it
-    costs."""
-    def priced(algorithm: str) -> Tuple[float, float]:
-        per_byte, _rows = price_collective(
-            op=op, world=world, tensor_bytes=1.0, count_per_step=count_per_step,
-            fabric=fabric.without_latency(), base_stride=base_stride,
-            algorithm=algorithm, fanout=fanout)
-        return per_byte, collective_latency(
-            op=op, world=world, count_per_step=count_per_step,
-            fabric=fabric, base_stride=base_stride, algorithm=algorithm,
-            fanout=fanout)
-
-    nccl = priced(NCCL)
+@memoize(maxsize=8192)
+def collective_envelope(sig: CollectiveSignature, fabric: Fabric) -> Envelope:
+    """The envelope of the collective `sig` on `fabric`: each algorithm that
+    runs its op priced there — per payload byte on the fabric with free
+    steps, its fixed time by its own phases' hops, each at its fabric's hop
+    latency (`collective_latency`, `Fabric.hop_latency`) —
+    and refused where the fabric cannot run it (`Fabric.refusal`). One per
+    (collective, card): every point of a walk shares its collectives."""
     out = []
-    for rung in rungs:
-        if rung.runs_on(fabric, world=world, base_stride=base_stride):
-            out.append(Segment(rung.algorithm, rung.cap(world),
-                               *priced(rung.algorithm)))
-        else:
-            out.append(Segment(NCCL, 0.0, *nccl))
-    out.append(Segment(NCCL, math.inf, *nccl))
-    return tuple(out)
+    for algorithm in algorithms_for(sig.op):
+        refusal = fabric.refusal(algorithm, op=sig.op, world=sig.world,
+                                 base_stride=sig.stride)
+        if refusal is not None:
+            out.append(Candidate.refused(algorithm, refusal))
+            continue
+        per_byte, rows = price_collective(
+            op=sig.op, world=sig.world, tensor_bytes=1.0,
+            count_per_step=sig.count, fabric=fabric.without_latency(),
+            base_stride=sig.stride, algorithm=algorithm,
+            fanout=sig.route_fanout)
+        out.append(Candidate(
+            algorithm, per_byte,
+            collective_latency(
+                op=sig.op, world=sig.world, count_per_step=sig.count,
+                fabric=fabric, base_stride=sig.stride, algorithm=algorithm,
+                fanout=sig.route_fanout),
+            sum(float(r["bytes_per_rank"]) for r in rows),
+            sum(int(r["hops"]) for r in rows),
+            ALGORITHMS[algorithm].stages or tuple(map(_phase_stage, rows))))
+    return Envelope(sig, fabric, tuple(out))
 
 
-def ladder_segment(ladder: Sequence[Segment], tensor_bytes: float) -> Segment:
-    """The range a payload of `tensor_bytes` falls in: the first whose
-    bound holds it, as the row's law chooses (`row_roofline`)."""
-    for seg in ladder:
-        if tensor_bytes <= seg.max_bytes:
-            return seg
-    return ladder[-1]
+def _phase_stage(phase: Mapping[str, Any]) -> Tuple[str, str]:
+    """One phase of NCCL's schedule (`collective_phases`) as a stage: a hop
+    between nodes, or inside one node a reduce-scatter, an all-gather, a
+    direct exchange (an all-to-all, a point-to-point send) or a ring."""
+    name = str(phase["name"])
+    label = (f"{name.replace('_', ' ')} over {phase['fabric_label']}, "
+             f"{phase['world']} ranks")
+    if phase["fabric"] == "inter":
+        return "inter_node", label
+    if name in STAGE_KINDS:
+        return name, label
+    if collective_schedule(name) == "point_to_point":
+        return "all_to_all", label
+    return "ring", label
 
 
 def collective_latency(*, op: str, world: int, count_per_step: int,
@@ -539,7 +608,7 @@ def price_collective(
     t_sub: Optional[str] = None,
 ) -> Tuple[float, List[Dict[str, Any]]]:
     """One collective's time and per-phase rows on `fabric`, run by
-    `algorithm` (`collective_ladder` chooses it for a payload).
+    `algorithm` (`Envelope.choose` chooses it for a payload).
 
     The anchor row in `phases` and the Gallery's re-stamp of the same
     layout on another card both call this, so a second card is priced by
@@ -601,7 +670,7 @@ def collective_phases(
 
     `algorithm` (`comm_volume.ALGORITHMS`) runs a group that fits one
     node as one phase at its bytes and hops; anything but NCCL's schedule is
-    refused for a group that does not (`collective_ladder` never asks).
+    refused for a group that does not (`Fabric.refusal` never offers it).
     Every phase states its `algorithm` and `hops`.
 
     `fanout` is the top-k fan-out of a ROUTED MoE exchange
@@ -708,11 +777,6 @@ def collective_phases(
     # across the fabrics the card's levels name (`routed_shares`).
     if fanout is not None:
         levels = placement_levels(n, g, s)
-        if algorithm != NCCL:
-            raise ValueError(
-                f"a routed {op} of {n} ranks runs NCCL's schedule, not "
-                f"{algorithm}: the framework's own kernels dispatch "
-                "all-reduces")
         shares = routed_shares(fanout, n, levels)
         total_sym = RouteFanout.symbolic_text("N_ranks")
         total_sub = fanout.factor_text(n, 1, n)

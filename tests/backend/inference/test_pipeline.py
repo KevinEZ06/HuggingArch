@@ -307,6 +307,9 @@ class TestPerOpTimingShape(unittest.TestCase):
             # (intra-RS + inter-AR-on-shard + intra-AG); empty list on
             # single-phase rows (intra-only or non-comm).
             "comm_phases",
+            # Which algorithm the collective's envelope chose and every one
+            # it was chosen among (`comm_cost.Envelope.choice`).
+            "comm_choice",
             # The row's law over the workload's counts and the card — the
             # sweep substitutes it; the anchor row's numbers are the same
             # law at the anchor's point — and whether it costs nothing.
@@ -403,10 +406,6 @@ class TestPerOpTimingShape(unittest.TestCase):
             # Per-op roofline peak (driven by the row's dtype, not the
             # global dominant-weight column).
             "peak_flops_per_sec_for_op",
-            # The framework's all-reduce dispatch the row's collective is
-            # priced over (`comm_cost.CollectiveRung`), so another card
-            # reads the same ladder.
-            "comm_rungs",
             # A route exchange's fan-out (`RouteFanout`: picks, targets,
             # placed) that `ring_factor` prices it by; None on every other
             # collective and every compute row.

@@ -126,6 +126,7 @@ class TestShippedSchemesLoad(unittest.TestCase):
                 "mhc_fused_post_pre",
                 "mhc_mega_post_pre",
                 "mhc_post",
+                "mhc_post_combine_norm",
                 "mhc_pre_big_fuse",
                 "mhc_pre_gemm",
                 "mhc_pre_gemm_stream",
@@ -350,6 +351,9 @@ class TestShippedBindingsLoad(unittest.TestCase):
                 # inverse RoPE + FP8 quant.
                 "fused_qnorm_rope_kv_insert",
                 "fused_qnorm_rope_kv_insert_no_q_norm",
+                # DeepSeek-V4.1's SM10x core attention: q rope + sparse
+                # attention + inverse rope + MXFP8 cast in one launch.
+                "fused_mla_norm_rope_attn_rope_cast",
                 "fused_overlap_compress_norm_rope_store",
                 "fused_compress_norm_rope_store",
                 # The q-LoRA and latent-KV a-norms in one launch.
@@ -388,6 +392,9 @@ class TestShippedBindingsLoad(unittest.TestCase):
                 "mhc_pre_gemm_stream",
                 "mhc_pre_big_fuse",
                 "mhc_fused_post_pre",
+                # ... and DeepSeek-V4.1's SM100 default, the whole seam in
+                # one DeepGEMM launch.
+                "mhc_mega_post_pre",
                 # SSM / linear-attention mixers: the short conv with its SiLU,
                 # and the gated output RMSNorm.
                 "causal_conv1d",
@@ -653,6 +660,104 @@ class TestShippedBindingsLoad(unittest.TestCase):
         self.assertIsNone(vllm["moe_topk_softmax"])
         self.assertIsNone(vllm["moe_topk_softmax_bias"])
 
+    def test_a_checkpoint_class_the_framework_renames_reaches_its_entries(self):
+        """sglang serves a DeepSeek-V4.1 checkpoint with its
+        `DeepseekV4ForCausalLM` class — the config normalizer rewrites
+        `architectures` (srt/configs/deepseek_v41.py:36-38) before any
+        dispatch reads it — so an entry naming the class sglang dispatches
+        on covers the checkpoint class that resolves to it, and an entry
+        naming a checkpoint class covers only that checkpoint.
+
+        The fact is declared ONCE (`architecture_served_as`) and read where
+        a condition's architecture lists are parsed. Without it an entry
+        that forgot to spell both names dropped V4.1 silently — the
+        DeepSeek-V4 router's fp32-logit requirement (`edge_dtypes`) is one
+        that did.
+        """
+        sglang = get_binding("sglang")
+        self.assertEqual(dict(sglang.architecture_served_as),
+                         {"DeepseekV41ForCausalLM": "DeepseekV4ForCausalLM"})
+        v4 = [when.graph for entry in sglang.edge_dtypes for when in entry.whens
+              if "DeepseekV4ForCausalLM" in when.graph.architectures]
+        self.assertTrue(v4, "an edge dtype names sglang's V4 class")
+        for graph in v4:
+            self.assertIn("DeepseekV41ForCausalLM", graph.architectures)
+        # An entry naming the CHECKPOINT class stays that narrow: only a
+        # V4.1 checkpoint spells the shifted hyper-connection seam.
+        stream = [when.graph.architectures
+                  for op, impl in sglang.op_implementations
+                  if op == "mhc_pre_gemm_stream" for when in impl.whens]
+        self.assertEqual(stream, [("DeepseekV41ForCausalLM",)])
+        # vLLM declares no renaming: its registry maps each class to its own
+        # model, so its entries name the checkpoint classes themselves.
+        self.assertEqual(get_binding("vllm").architecture_served_as, ())
+
+    def test_every_condition_of_every_binding_is_resolved(self):
+        """The oracle for `architecture_served_as`: EVERY condition a
+        binding holds, collected through its public surface rather than
+        through the resolver's own recursion, names checkpoint classes.
+
+        The rule: a condition is written in the FRAMEWORK's vocabulary and
+        asked against the CHECKPOINT's (`Program.architectures`), so a name
+        that is a class the framework resolves TO must appear beside every
+        class that resolves to it. A name that is itself a declared
+        checkpoint class stays narrow, which is how an entry says "only
+        this checkpoint spells this graph".
+
+        Collected here from `op_implementations`, `precision_launches`,
+        `edge_dtypes` and `kernel_dispatches` — the four places a condition
+        lives — because the first spelling of this resolution was a map
+        handed to each parser and the one parser that did not pass it on
+        (`edge_dtypes`) dropped a requirement silently. A fifth place that
+        this test does not reach is a fifth place that can drift.
+        """
+        for name, binding in FRAMEWORK_BINDINGS.items():
+            served = dict(binding.architecture_served_as)
+            conditions = []
+            for _op, impl in binding.op_implementations:
+                conditions.extend(impl.whens)
+            for launch in binding.precision_launches:
+                conditions.extend(launch.whens)
+            for entry in binding.edge_dtypes:
+                conditions.extend(entry.whens)
+            for dispatch in binding.kernel_dispatches:
+                conditions.extend(dispatch.whens)
+            graphs = [c.graph for c in conditions]
+            self.assertTrue(graphs, name)
+            for graph in graphs:
+                for listed in (graph.architectures,
+                               graph.excluded_architectures):
+                    for declared, serving in served.items():
+                        if serving in listed:
+                            self.assertIn(declared, listed, (name, listed))
+        # Exactly one framework declares a resolution today; the others
+        # serve each checkpoint class with a class of its own name.
+        self.assertEqual(
+            {n for n, b in FRAMEWORK_BINDINGS.items()
+             if b.architecture_served_as}, {"sglang"})
+
+    def test_the_shifted_seam_is_told_apart_by_its_carried_stream(self):
+        """sglang's same-sublayer seam launches are kept off DeepSeek-V4.1 by
+        a GRAPH fact, not a model name.
+
+        Both schedules flatten the residual copies before the mix GEMM, so
+        the patterns match either; what differs is where the collapse's
+        pre-mix comes from. A shifted block declares the carried stream
+        (`components/library/dsv41_hc_block.yaml`, `reads: [hc_pre_mix]`)
+        and a same-sublayer block declares none, which is what
+        `block_reads_stream` asks — so a future checkpoint on either
+        schedule is answered without touching this file.
+        """
+        sglang = get_binding("sglang")
+        for op in ("mhc_pre_gemm", "mhc_fused_post_pre"):
+            whens = [w for _op, impl in sglang.op_implementations
+                     if _op == op for w in impl.whens]
+            self.assertTrue(whens, op)
+            for when in whens:
+                self.assertIs(when.graph.block_reads_stream, False, op)
+                # The name list is not what separates them any more.
+                self.assertEqual(when.graph.excluded_architectures, (), op)
+
     def test_sglang_rotates_deepseek_v4_q_and_kv_apart(self):
         """sglang's DeepSeek-V4 class (which also serves V4.1 checkpoints)
         never rotates q and the latent KV in one shared-rotary call, so the
@@ -706,13 +811,13 @@ class TestShippedBindingsLoad(unittest.TestCase):
         self.assertIn("fused_qk_rope",
                       {op for op, _c, _x in b.dispatched()})
 
-    def test_a_binding_chooses_an_algorithm_and_prices_nothing(self):
+    def test_a_binding_chooses_no_algorithm_and_prices_nothing(self):
         """A binding holds what the FRAMEWORK decides and nothing else: its
-        fusion patterns, the paged-KV page its cache manager allocates in,
-        and which all-reduce algorithm it runs on a payload (`collectives`).
-        No pipeline wire, no bytes or link traversals of its own — what an
-        algorithm costs is `comm_volume.ALGORITHMS`', the same under every
-        framework.
+        fusion patterns and the paged-KV page its cache manager allocates
+        in. No pipeline wire, no bytes or link traversals of its own, and
+        no collective algorithm: a standalone collective is priced as its
+        envelope over the algorithms the card's fabric runs
+        (`comm_cost.Envelope`), the same under every framework.
 
         `kv_block_size` is here rather than in a request default because the
         framework owns the cache manager; it is a page size, not a wire.
@@ -721,24 +826,19 @@ class TestShippedBindingsLoad(unittest.TestCase):
         `edge_dtypes` likewise: the width the kernel this framework
         dispatches to REQUIRES a declared role's output at, which is a fact
         of that kernel's interface and not a price of its own.
+        `architecture_served_as` likewise: the class this framework resolves
+        a checkpoint's declared architecture to before any of its dispatches
+        reads the model class.
         """
-        from backend.arch.layout.comm_volume import ALGORITHMS
-        from backend.inference.comm_cost import CollectiveRung
         self.assertEqual(
             FrameworkBinding.KEYS,
             {"framework", "audited_at", "op_implementations", "kv_block_size",
-             "ssm_chunk_size", "collectives", "precision_launches",
-             "edge_dtypes", "kernel_dispatches"})
-        self.assertEqual(set(CollectiveRung._fields), {
-            "algorithm", "max_bytes", "max_bytes_times_world",
-            "min_compute_capability", "below_compute_capability",
-            "worlds"})
+             "ssm_chunk_size", "precision_launches",
+             "edge_dtypes", "kernel_dispatches", "architecture_served_as"})
         for binding in FRAMEWORK_BINDINGS.values():
             self.assertFalse(hasattr(binding, "pipeline_wire"))
             self.assertFalse(hasattr(binding, "comm_cost"))
-            for _op, rungs in binding.collectives:
-                for rung, _graph in rungs:
-                    self.assertIn(rung.algorithm, ALGORITHMS)
+            self.assertFalse(hasattr(binding, "collectives"))
 
     def test_fused_qk_norm_rope_plan_has_four_node_chain(self):
         # The plan is the (q_norm, k_norm, q_rope, k_rope) chain the
@@ -1017,14 +1117,24 @@ naive_pattern:
         self.assertTrue(nodes["scale"].optional)
         self.assertFalse(nodes["total"].optional)
 
-    def test_an_optional_node_off_one_internal_edge_is_rejected(self):
-        # With no internal input there is no edge for its reader to read
-        # through when the node is absent.
+    def test_an_optional_node_off_two_internal_edges_is_rejected(self):
+        # Two internal inputs: eliding the node leaves its reader two
+        # producers and no one edge to read through.
         self._write("through.yaml", self._PASS_THROUGH.format(
-            scale_inputs="external.w", output="total.out"))
+            scale_inputs="act.out, act.out", output="total.out"))
         with self.assertRaises(ValueError) as ctx:
             reload_fusion_schemes(str(self.tmp))
-        self.assertIn("one internal input", str(ctx.exception))
+        self.assertIn("stands on ONE edge", str(ctx.exception))
+
+    def test_an_optional_node_on_an_external_operand_loads(self):
+        # A step the launch folds in that stands on the pattern's own input
+        # — a router's gate temperature on the logits. Absent, its reader
+        # reads that operand directly, so the pattern is well formed.
+        self._write("through.yaml", self._PASS_THROUGH.format(
+            scale_inputs="external.x", output="total.out"))
+        nodes = reload_fusion_schemes(str(self.tmp))["through"].naive_pattern.nodes
+        self.assertTrue(nodes["scale"].optional)
+        self.assertEqual(nodes["scale"].read_through(), "external.x")
 
     def test_an_optional_node_naming_a_port_is_rejected(self):
         self._write("through.yaml", self._PASS_THROUGH.format(
@@ -1657,7 +1767,6 @@ class TestAnchorsResolveAtTheAuditedCommit(unittest.TestCase):
             lengths: dict = {}
             anchors = [(op, impl.source_anchor)
                        for op, impl in binding.op_implementations]
-            anchors += [("collectives", a) for a in binding.collective_anchors]
             anchors += [("precision_launches", launch.source_anchor)
                         for launch in binding.precision_launches]
             anchors += [("edge_dtypes", entry.source_anchor)

@@ -26,8 +26,8 @@ from tests.sweep_parity import rescale_phase, rescale_rows, response_cell
 from backend.arch.eval.transforms import Workload
 from backend.inference.comm_cost import Fabric
 from backend.inference.row_roofline import (
-    LawBook, RowRoofline, RowTimes, build_row_exprs, comm_factor, law_columns,
-    row_law)
+    LawBook, RowRoofline, RowTimes, build_row_exprs, law_columns,
+    row_algorithms, row_law)
 
 _PEAK_FLOPS = 1.0e15
 _PEAK_BW = 1.0e12
@@ -75,8 +75,11 @@ def _row(*, flops_fixed=0, flops_per_request=200, act_fixed=0,
             weight_total=weight_total,
             metadata_total=metadata_total,
             comm_payload=B * per * comm_per_request,
-            comm_factor=comm_factor(comm_op, comm_world) if is_comm else 0.0,
-            comm_priced=is_comm and comm_world > 1), _BOOK),
+            comm_priced=is_comm and comm_world > 1,
+            comm_algorithms=row_algorithms({
+                "is_comm": is_comm, "comm_op": comm_op,
+                "comm_world": comm_world, "count_per_step": 1,
+                "comm_base_stride": 1})), _BOOK),
         # Walked at the anchor batch; no shape, dims or display facts.
         "shape_law": None,
         "point_law": {"point": {**_POINT, "B": 4}, "ports": [], "wire": None, "dims": None,

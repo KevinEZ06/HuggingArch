@@ -1160,8 +1160,12 @@ def _dag_bindings(pattern: Any, nodes: Sequence[Any],
                    state: _Binding, side: int) -> List[_Binding]:
         """Bind the pattern edge `head.tail` to the graph edge
         `(producer, port)`. A node declared `optional` that the producer
-        is not is read through: the edge binds to the node's own internal
-        input instead, and the node is absent from the match."""
+        is not is read through: the edge binds to the node's own one input
+        instead, and the node is absent from the match. That input may be
+        the pattern's own external operand — a step the kernel folds in
+        that stands on the launch's input (a router's gate temperature on
+        the logits), absent where the checkpoint does not spell it — and
+        the operand then binds to this producer."""
         if not isinstance(producer, int) or producer not in by_uid:
             return []
         if not tail or port == tail:
@@ -1171,8 +1175,16 @@ def _dag_bindings(pattern: Any, nodes: Sequence[Any],
         spec = declared[head]
         if not spec.optional or head in state.bound:
             return []
-        (through,) = spec.internal_inputs()
+        through = spec.read_through()
+        if through is None:
+            return []
         through_head, _, through_tail = through.partition(".")
+        if through_head == "external":
+            if state.external.get(through_tail, producer) != producer:
+                return []               # two operands claim one producer
+            current = state.copy()
+            current.external[through_tail] = producer
+            return [current]
         return _bind_edge(through_head, through_tail, producer, port,
                           state, side)
 
@@ -1377,6 +1389,18 @@ class GraphCondition:
       consumer takes that format, says so here (vLLM V4.1's
       `fused_q_kv_rmsnorm_quant`, deepseek_v41/common/ops/query_quant.py).
 
+    * `block_reads_stream` — whether the BLOCK the match sits in declares a
+      cross-layer stream read (`BlockGraph.reads`, carried as
+      `BlockMeta.stream_reads`): the layer takes a value an earlier layer
+      produced, outside its own inputs. It is what tells a SHIFTED sublayer
+      schedule from a same-sublayer one where both spell the same arithmetic:
+      DeepSeek-V4.1's hyper-connection block collapses the copies with the
+      pre-mix the PREVIOUS sublayer published and declares `reads:
+      [hc_pre_mix]`, while DeepSeek-V4's and GLM-5.3-Flash's blocks declare
+      none and compute theirs in place. The frameworks dispatch on a config
+      flag there (`hc_pre_from_prev_sublayer`), which this is the graph's
+      statement of; a match with no block occurrence answers neither way.
+
     * `routed` — whether the match sits inside the dispatch zone, between a
       `permute` and its `combine` (`Program.node_is_routed`): every member
       routed (True) or none (False); a match that straddles the zone answers
@@ -1409,6 +1433,7 @@ class GraphCondition:
     readers_eat: Optional[str] = None
     roles: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
     routed: Optional[bool] = None
+    block_reads_stream: Optional[bool] = None
 
     def admits_program(self, program: Any, analysis: Any) -> bool:
         """The questions the whole walk answers: the model class, and the
@@ -1437,6 +1462,15 @@ class GraphCondition:
         (`readers_eat`)."""
         node_dims = analysis.node_dims
         members = {node.uid: node for node in bound.values()}
+        if self.block_reads_stream is not None:
+            blocks = {analysis.program.block_of(uid) for uid in members}
+            blocks.discard(None)
+            if not blocks:
+                return False            # no block: answers neither way
+            reads = {bool(analysis.program.blocks[b].meta.stream_reads)
+                     for b in blocks}
+            if reads != {self.block_reads_stream}:
+                return False
         if self.routed is not None and {
                 analysis.program.node_is_routed(node)
                 for node in members.values()} != {self.routed}:

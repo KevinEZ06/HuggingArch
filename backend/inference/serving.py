@@ -285,11 +285,6 @@ class ServingLayers:
     #: leaf it stands before, so it is in the region exactly when that leaf
     #: is, as a graft is in a MoE dispatch zone exactly when its consumer is.
     kv_region: FrozenSet[int] = frozenset()
-    #: The framework's all-reduce dispatch, by collective op
-    #: (`FrameworkBinding.collectives`): the rungs each collective row is
-    #: priced over (`comm_cost.collective_ladder`). Empty without a binding:
-    #: NCCL's schedule prices every collective.
-    collectives: Mapping[str, Tuple[Any, ...]] = field(default_factory=dict)
     #: Each row's laws as the row carries them, after the rewrite and before
     #: it, by `(uid, whether its operand conversion is dropped on the
     #: card)`: the same at every point of the cell, so written once, by the
@@ -701,7 +696,4 @@ def build_serving_layers(cell: Any, *,
         step_rows=step_tokens, book=book,
         kv_region=frozenset(analysis.rule.head_repartition_kv_producers) | {
             site.node.uid for site in (casts.sites if casts else ())
-            if site.consumer in analysis.rule.head_repartition_kv_producers},
-        collectives=(framework_binding.collectives_for(
-                         analysis.program, analysis)
-                     if framework_binding is not None else {}))
+            if site.consumer in analysis.rule.head_repartition_kv_producers})

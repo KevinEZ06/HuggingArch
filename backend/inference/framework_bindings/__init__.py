@@ -56,23 +56,13 @@ keys above that the deployment and the graph decide; it says whether the
 framework runs its kernel for that step.
 
 A binding says nothing about communication: no pipeline wire, no payload a
-cut hands on, no pipeline support. Framework source is a reference for an
-implementation, a fusion pattern, a measured kernel's identity, and the
-all-reduce dispatch below — nothing else — so a pipeline crossing is priced
-the same under every framework, from the graph's dataflow.
-
-`collectives:` is the framework's all-reduce dispatch inside one NVLink
-domain: an ordered list of rungs, each an algorithm of
-`comm_volume.ALGORITHMS` and the payload it takes (`max_bytes`, and/or
-`max_bytes_times_world` over the group) and the smallest group it runs
-in (`worlds`, the group sizes its kernel accepts), with a `when:` over the card's
-compute capability where the framework's choice depends on it. The first
-rung the card admits (its topology, `gpu_specs`) and the payload fits wins;
-past them NCCL's schedule runs (`comm_cost.collective_ladder`). Only what
-changes the estimate under common deployments is declared — one
-representative threshold per algorithm, not the framework's buffer caps,
-environment switches or CUDA-graph tables; the binding comments state what
-is billed instead.
+cut hands on, no pipeline support, and no collective algorithm. Framework
+source is a reference for an implementation, a fusion pattern and a
+measured kernel's identity — nothing else — so a pipeline crossing is
+priced the same under every framework, from the graph's dataflow, and a
+standalone collective as its envelope over the algorithms the card's fabric
+runs (`comm_cost.Envelope`). A communication fusion (an all-reduce folded
+into a norm or a GEMM) is a launch, and is bound like any other.
 """
 from __future__ import annotations
 
@@ -81,7 +71,8 @@ from backend.arch.yaml_load import load_yaml
 import logging
 import os
 import re
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import (dataclass, field, fields,
+                         fields as dataclass_fields, is_dataclass, replace)
 from types import MappingProxyType
 from typing import (Any, ClassVar, Dict, FrozenSet, Mapping, NamedTuple,
                     Optional, Tuple, Union)
@@ -98,8 +89,6 @@ from backend.inference.fusion_plans import FUSION_SCHEMES
 from backend.inference import gpu_specs
 from backend.inference.gpu_specs import get_gpu, peak_families
 from backend.inference.op_signatures import op_bindings
-from backend.arch.layout.comm_volume import ALGORITHMS, NCCL
-from backend.inference.comm_cost import CollectiveRung
 
 
 _logger = logging.getLogger(__name__)
@@ -397,7 +386,8 @@ class DispatchCondition:
       only when every operand slot it has is plain BF16.
       `excluded_architectures`, `head_dim`,
       `rotation_covers_head`, `dims`, `phase`, `world_local: {world, dim,
-      divides: true | local_in: [...]}`, `readers_eat`, `roles`, `routed` — the part the walk answers, asked during the rewrite
+      divides: true | local_in: [...]}`, `readers_eat`, `roles`, `routed`,
+      `block_reads_stream` — the part the walk answers, asked during the rewrite
       (`eval.fusion.GraphCondition`). `phase` names phases of `dims.PHASES`;
       it is the walk's, not the deployment's, because one deployed binding
       rewrites both of an estimate's walks.
@@ -420,7 +410,8 @@ class DispatchCondition:
                       "architectures",
                       "excluded_architectures", "head_dim",
                       "rotation_covers_head", "dims", "phase",
-                      "world_local", "readers_eat", "roles", "routed"})
+                      "world_local", "readers_eat", "roles", "routed",
+                      "block_reads_stream"})
 
     #: The keys a CARD decides, each naming the `ServingDeployment` field it
     #: reads — the fields `ServingDeployment.at` fills off the sheet row.
@@ -647,6 +638,11 @@ class DispatchCondition:
         routed = raw.get("routed")
         if routed is not None and not isinstance(routed, bool):
             raise ValueError(f"{where}: `when.routed` is a bool")
+        reads_stream = raw.get("block_reads_stream")
+        if reads_stream is not None and not isinstance(reads_stream, bool):
+            raise ValueError(
+                f"{where}: `when.block_reads_stream` is a bool — whether the "
+                "block this match sits in declares a cross-layer stream read")
         eats = raw.get("readers_eat")
         if eats is not None and eats not in ACTIVATION_FORMATS:
             raise ValueError(
@@ -684,7 +680,8 @@ class DispatchCondition:
                                  world_local=local,
                                  readers_eat=eats,
                                  roles=declared_roles,
-                                 routed=routed),
+                                 routed=routed,
+                                 block_reads_stream=reads_stream),
             server_flag_value=value)
 
 
@@ -810,10 +807,9 @@ def _check_card_fact_classification() -> None:
     silently wrong — which is how an RTX-4090 walk came to be published as
     six other cards' answer (`capacity._refuse_unless_one_class`).
 
-    A column may be both (`compute_capability` is: a dispatch reads it and
-    a collective rung's window reads it; a peak column is, by value and by
-    presence). The third bucket may not overlap either — "descriptive" is
-    a statement that nothing reads it, so it cannot also be read. A new
+    A column may be both (a peak column is, by value and by presence).
+    The third bucket may not overlap either — "descriptive" is a statement
+    that nothing reads it, so it cannot also be read. A new
     CSV column with no `GPUSpec` field never gets this far: `_parse_row`
     refuses it where the sheet is read.
     """
@@ -1263,15 +1259,6 @@ class FrameworkBinding:
     #: `RowIdentity`. Empty only on a binding built in code without one; a
     #: file must declare it.
     ssm_chunk_size_from: Tuple[str, ...] = ()
-    #: The framework's all-reduce dispatch inside one NVLink domain, by
-    #: collective op: its rungs in order (`comm_cost.CollectiveRung`; the
-    #: module docstring), each with the part of its `when:` the walk answers
-    #: (`GraphCondition`: the model class, the framework's own dispatch key)
-    #: and the `source_anchor` that shows it. A walk asks for its own
-    #: (`collectives_for`).
-    collectives: Tuple[Tuple[str, Tuple[Tuple[CollectiveRung, GraphCondition],
-                                        ...]], ...] = ()
-    collective_anchors: Tuple[SourceAnchor, ...] = ()
     #: Launches this framework selects for a quantised matmul, in file order.
     precision_launches: Tuple[PrecisionLaunch, ...] = ()
     #: Roles whose output the kernel this framework dispatches to requires
@@ -1284,21 +1271,23 @@ class FrameworkBinding:
     #: restate weight dtype, quant scheme, activation format, or MMA dtype.
     kernel_dispatches: Tuple[KernelDispatch, ...] = ()
 
+    #: The class this framework SERVES a checkpoint's declared architecture
+    #: with, where the two differ: `{<declared class>: <serving class>}`.
+    #: sglang's V4.1 config normalizer rewrites `architectures` to
+    #: `DeepseekV4ForCausalLM`, so every dispatch of sglang's that reads the
+    #: model class reads THAT name for a V4.1 checkpoint. Declared once here
+    #: and read once, where a condition's `architectures` /
+    #: `excluded_architectures` are parsed (`DispatchCondition.parse`), so an
+    #: entry names the class the framework dispatches on and the checkpoint
+    #: classes resolving to it belong to that entry by construction —
+    #: rather than each entry remembering to list both names.
+    architecture_served_as: Tuple[Tuple[str, str], ...] = ()
+
     #: The fields of a binding file.
     KEYS = frozenset({"framework", "audited_at", "op_implementations",
-                      "kv_block_size", "ssm_chunk_size", "collectives",
+                      "kv_block_size", "ssm_chunk_size",
                       "precision_launches", "edge_dtypes",
-                      "kernel_dispatches"})
-
-    def collectives_for(self, program: Any, analysis: Any
-                        ) -> Dict[str, Tuple[CollectiveRung, ...]]:
-        """The all-reduce dispatch the walk `analysis` of `program` is
-        served with: every rung whose condition the walk admits
-        (`GraphCondition.admits_program`, the matcher a fusion's `when:`
-        is asked through), in order."""
-        return {op: tuple(rung for rung, graph in rungs
-                          if graph.admits_program(program, analysis))
-                for op, rungs in self.collectives}
+                      "kernel_dispatches", "architecture_served_as"})
 
     def edge_dtypes_for(self, program: Any, analysis: Any
                         ) -> Tuple[Tuple[Tuple[str, ...], str], ...]:
@@ -1703,6 +1692,83 @@ def _kernel_dispatches(raw: Any, fname: str,
     return tuple(out)
 
 
+def _serving_classes(listed: Tuple[str, ...],
+                     served_as: Mapping[str, str]) -> Tuple[str, ...]:
+    """`listed` — the classes the FRAMEWORK dispatches on — as the
+    CHECKPOINT classes that reach them: each listed name, plus every
+    declared class the framework resolves to it (`architecture_served_as`).
+
+    A condition is written in the framework's vocabulary and asked against
+    the checkpoint's (`Program.architectures`), and this is the one place
+    the two meet."""
+    resolved = tuple(declared for declared, serving in served_as.items()
+                     if serving in listed and declared not in listed)
+    return listed + resolved
+
+
+def _resolved_architectures(value: Any, served_as: Mapping[str, str]) -> Any:
+    """`value` with EVERY `GraphCondition` in it read through `served_as`.
+
+    One pass over the whole parsed binding, rather than a map each parser
+    is handed: a binding holds conditions in four places today
+    (`op_implementations`, `precision_launches`, `edge_dtypes`,
+    `kernel_dispatches`) and a fifth would be a fifth place to remember. The first spelling of this did hand each parser the
+    map, and `edge_dtypes` was the one that did not pass it on — the
+    DeepSeek-V4 router's fp32-logit requirement silently stopped reaching a
+    V4.1 checkpoint. So the recursion walks this module's own structures
+    (dataclasses and named tuples defined here) and the plain containers
+    between them, and nothing outside them: a new field holding conditions
+    is covered the day it is added.
+    """
+    if isinstance(value, GraphCondition):
+        return replace(
+            value,
+            architectures=_serving_classes(value.architectures, served_as),
+            excluded_architectures=_serving_classes(
+                value.excluded_architectures, served_as))
+    if isinstance(value, (list, tuple)):
+        parts = [_resolved_architectures(item, served_as) for item in value]
+        fields_of = getattr(type(value), "_fields", None)
+        if fields_of is not None:                      # a named tuple
+            return type(value)(*parts)
+        return type(value)(parts)
+    if (is_dataclass(value) and not isinstance(value, type)
+            and type(value).__module__ == __name__):
+        return replace(value, **{
+            f.name: _resolved_architectures(getattr(value, f.name), served_as)
+            for f in dataclass_fields(value) if f.init})
+    return value
+
+
+def _architecture_served_as(raw: Any, fname: str) -> Mapping[str, str]:
+    """Parse `architecture_served_as:` — the class this framework serves a
+    checkpoint's declared architecture with, where it is not that
+    architecture (`FrameworkBinding.architecture_served_as`).
+
+    A framework fact, audited like every other in the file: sglang's
+    `normalize_deepseek_v41_config` rewrites a V4.1 checkpoint's
+    `architectures` to `DeepseekV4ForCausalLM` before any dispatch reads it.
+    A declared class resolves to exactly one serving class, and a serving
+    class is not itself declared away (no chains): the map is read once,
+    while a condition's architecture lists are parsed."""
+    if raw is None:
+        return MappingProxyType({})
+    if (not isinstance(raw, dict) or not raw
+            or not all(isinstance(k, str) and k and isinstance(v, str) and v
+                       for k, v in raw.items())):
+        raise ValueError(
+            f"framework_bindings/{fname}: `architecture_served_as` is "
+            f"`{{<class the checkpoint declares>: <class this framework "
+            f"serves it with>}}`")
+    cycles = sorted(set(raw) & set(raw.values()))
+    if cycles:
+        raise ValueError(
+            f"framework_bindings/{fname}: `architecture_served_as` resolves "
+            f"{cycles} both ways; a declared class names the serving class "
+            f"directly, and a serving class is not itself resolved")
+    return MappingProxyType(dict(raw))
+
+
 def _audited_at(raw: Any, fname: str) -> AuditedAt:
     if (not isinstance(raw, dict) or set(raw) != {"repo", "tag", "commit"}
             or not all(isinstance(raw[k], str) and raw[k] for k in raw)
@@ -1714,75 +1780,8 @@ def _audited_at(raw: Any, fname: str) -> AuditedAt:
     return AuditedAt(tag=raw["tag"], commit=raw["commit"], repo=raw["repo"])
 
 
-#: The keys of one `collectives:` rung.
-_RUNG_KEYS = frozenset({"algorithm", "max_bytes", "max_bytes_times_world",
-                        "worlds", "when", "source_anchor"})
-#: What a rung's `when:` may ask: the card's compute capability, and the
-#: model class the framework dispatches on.
-_RUNG_WHEN = frozenset({"min_compute_capability", "below_compute_capability",
-                        "architectures"})
-
-
-def _collectives(raw: Any, fname: str) -> Tuple[
-        Tuple[Tuple[str, Tuple[Tuple[CollectiveRung, GraphCondition], ...]], ...],
-        Tuple[SourceAnchor, ...]]:
-    """A binding's `collectives:` (the module docstring), checked: an
-    all-reduce's rungs, each a known algorithm other than NCCL's own (which
-    runs past them all), a positive cap, and the anchor that shows it."""
-    where = f"framework_bindings/{fname}: collectives"
-    if not isinstance(raw, dict):
-        raise ValueError(f"{where} maps a collective op to its rungs")
-    out, anchors = [], []
-    for op, rungs in raw.items():
-        if op != "all_reduce":
-            raise ValueError(
-                f"{where}[{op!r}]: only `all_reduce` has algorithms of its "
-                f"own ({sorted(set(ALGORITHMS) - {NCCL})}); every other "
-                "collective runs NCCL's schedule")
-        if not isinstance(rungs, list) or not rungs:
-            raise ValueError(f"{where}[{op!r}] is a non-empty list of rungs")
-        parsed = []
-        for i, rung in enumerate(rungs):
-            at = f"{where}[{op!r}][{i}]"
-            if not isinstance(rung, dict) or set(rung) - _RUNG_KEYS:
-                raise ValueError(f"{at}: a rung is {sorted(_RUNG_KEYS)}")
-            algorithm = rung.get("algorithm")
-            if algorithm not in ALGORITHMS or algorithm == NCCL:
-                raise ValueError(
-                    f"{at}: `algorithm: {algorithm!r}` is not one of "
-                    f"{sorted(set(ALGORITHMS) - {NCCL})}")
-            caps = {}
-            worlds = rung.get("worlds")
-            if (not isinstance(worlds, list) or not worlds
-                    or not all(isinstance(w, int) and not isinstance(w, bool)
-                               and w > 1 for w in worlds)):
-                raise ValueError(
-                    f"{at}: `worlds` lists the group sizes the framework's "
-                    "kernel accepts (integers > 1); a group of any other size "
-                    "runs NCCL")
-            for key in ("max_bytes", "max_bytes_times_world"):
-                v = rung.get(key)
-                if v is not None and (not isinstance(v, int)
-                                      or isinstance(v, bool) or v <= 0):
-                    raise ValueError(f"{at}: `{key}` is a positive integer")
-                caps[key] = v
-            if not isinstance(rung.get("source_anchor"), str):
-                raise ValueError(f"{at}: needs the `source_anchor` that shows it")
-            anchors.append(SourceAnchor.parse(rung["source_anchor"], at))
-            when = (DispatchCondition.parse(rung["when"], at, _RUNG_WHEN)
-                    if rung.get("when") is not None else None)
-            cc = lambda t: None if t is None else "%d.%d" % t
-            parsed.append((CollectiveRung(
-                algorithm, caps["max_bytes"], caps["max_bytes_times_world"],
-                cc(when.min_compute_capability) if when else None,
-                cc(when.below_compute_capability) if when else None,
-                tuple(sorted(set(worlds)))),
-                when.graph if when else GraphCondition()))
-        out.append((op, tuple(parsed)))
-    return tuple(out), tuple(anchors)
-
-
-def _precision_launches(raw: Any, fname: str) -> Tuple[PrecisionLaunch, ...]:
+def _precision_launches(raw: Any, fname: str
+                        ) -> Tuple[PrecisionLaunch, ...]:
     """Parse `precision_launches:`, the framework's quantised-matmul dispatch."""
     if not isinstance(raw, dict):
         raise ValueError(f"framework_bindings/{fname}: precision_launches "
@@ -2045,6 +2044,8 @@ def _load_framework_bindings_dir(
                 f"present wins. It is an axis of the `mamba2_scan` "
                 f"measurement cell, so it is declared, not defaulted; got "
                 f"{ssm_chunk!r}.")
+        served_as = _architecture_served_as(
+            data.get("architecture_served_as"), fname)
         op_impls_raw = data.get("op_implementations") or {}
         if not isinstance(op_impls_raw, dict):
             raise ValueError(
@@ -2090,24 +2091,26 @@ def _load_framework_bindings_dir(
             match_order(entry[0]),
             yaml_position[id(entry)],
         ))
-        collectives, anchors = _collectives(data.get("collectives") or {}, fname)
         precision_launches = _precision_launches(
             data.get("precision_launches") or {}, fname)
         edge_dtypes = _edge_dtypes(data.get("edge_dtypes") or {}, fname)
         kernel_dispatches = _kernel_dispatches(
             data.get("kernel_dispatches"), fname, known_fused_ops)
-        out[framework] = FrameworkBinding(
+        binding = FrameworkBinding(
             framework=framework,
+            architecture_served_as=tuple(sorted(served_as.items())),
             audited_at=audited_at,
             op_implementations=tuple(impls),
             kv_block_size=(None if kv_block is None else int(kv_block)),
             ssm_chunk_size_from=tuple(ssm_from),
-            collectives=collectives,
-            collective_anchors=anchors,
             precision_launches=precision_launches,
             edge_dtypes=edge_dtypes,
             kernel_dispatches=kernel_dispatches,
         )
+        # The one place a condition's architecture lists are read through
+        # the framework's own resolution (`_resolved_architectures`).
+        out[framework] = (_resolved_architectures(binding, served_as)
+                          if served_as else binding)
     return out
 
 

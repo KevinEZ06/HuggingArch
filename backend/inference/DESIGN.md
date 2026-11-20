@@ -63,9 +63,12 @@ Pass ordering, each pass consuming the previous:
    decode, with the decode graph swapped to phase variants the spec
    declares (absorbed MLA). Four bounds (`row_roofline.BOUNDS`): a
    collective's `t_comm` is α-β — its bytes over the link plus one link
-   latency per traversal of the latency-optimal small-message schedule
-   (`comm_volume.latency_hops`), a cross-node traversal also waiting the
-   card's RDMA hop latency (`gpu_specs.csv` `rdma_hop_latency_us`) — and a
+   latency per traversal, a cross-node traversal also waiting the card's
+   RDMA hop latency (`gpu_specs.csv` `rdma_hop_latency_us`,
+   `comm_cost.Fabric.hop_latency`) — taken as its envelope, the fastest of
+   the algorithms the card's fabric can run (`comm_cost.Envelope`:
+   one-shot, two-shot, NVLS, NCCL's schedule with
+   `comm_volume.latency_hops`), whatever the framework — and a
    kernel that is not a collective is never faster than the launch floor
    (`t_launch = n × launch_floor`). The two floors are declared once in
    `defaults.py` and a request may set its own. Rows are serial (no

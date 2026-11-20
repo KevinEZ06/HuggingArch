@@ -60,19 +60,23 @@ class PatternNode(BaseModel):
                     between them, and only `feeds` says which one is Q.
       optional    - the node may be absent: a candidate without it binds
                     with the node's one pattern reader reading the node's
-                    one internal input in its place. The node-level
+                    one input in its place. The node-level
                     counterpart of `optional_inputs` — the same kernel run
                     with one step folded away: the DSA indexer weights its
                     heads (`mul` by W) before the head sum, the QSA indexer
                     sums them unweighted, and both are one MQA-logits
                     launch. An external read only by an absent node is
                     absent from the match. An optional node is a pass-through
-                    on one internal edge: it has exactly one internal input,
-                    and either exactly one reader in the pattern and no port,
-                    or no reader at all — a SINK, the last step of the chain
-                    (a router's routed-scaling multiply, which some
-                    checkpoints do not have) — whose ports, when it is
-                    absent, name its internal input instead.
+                    on ONE edge: it has exactly one input — another member,
+                    or the pattern's own external operand, which its reader
+                    then reads directly (a router launch that takes raw
+                    logits, over a checkpoint that divides them by a gate
+                    temperature first) — and either exactly one reader in
+                    the pattern and no port, or no reader at all — a SINK,
+                    the last step of the chain (a router's routed-scaling
+                    multiply, which some checkpoints do not have) — whose
+                    ports, when it is absent, name its input instead, so an
+                    optional sink stands on an internal edge.
     """
     op: Optional[str] = None
     op_choices: Optional[List[str]] = None
@@ -118,6 +122,19 @@ class PatternNode(BaseModel):
     def internal_inputs(self) -> List[str]:
         """The `<pattern_node>.<port>` refs among `inputs`."""
         return [ref for ref in self.inputs if not ref.startswith("external.")]
+
+    def read_through(self) -> Optional[str]:
+        """The one input a reader binds to instead when this node is absent
+        (`optional`): the node's internal edge, or — a node that stands on
+        the launch's own input, like a gate temperature on the router logits
+        — that external operand. None where the node is not a pass-through
+        on one edge, which `NaivePattern._check_optional_nodes` rejects."""
+        internal = self.internal_inputs()
+        if len(internal) == 1:
+            return internal[0]
+        if not internal and len(self.inputs) == 1:
+            return self.inputs[0]
+        return None
 
     def accepts_op(self, op_name: str) -> bool:
         """Return True if `op_name` matches this pattern node's op constraint."""
@@ -304,11 +321,15 @@ class NaivePattern(BaseModel):
 
     def _check_optional_nodes(self) -> None:
         """An optional node can be elided only where eliding it leaves one
-        well-formed subgraph: it stands on one internal edge (one internal
-        input), so its reader can read through it. Inside the chain it has
-        one reader and names no port, so the fused op's outputs exist either
-        way; as a sink it has no reader, and a port that names it names its
-        internal input when it is absent (`port_node`)."""
+        well-formed subgraph: it stands on ONE edge (one input), so its
+        reader can read through it. That edge is internal — another member
+        — or the pattern's own external operand, which the reader then reads
+        directly (a router kernel that takes raw logits, over a graph whose
+        checkpoint divides them by a gate temperature first). Inside the
+        chain it has one reader and names no port, so the fused op's outputs
+        exist either way; as a sink it has no reader, and a port that names
+        it names its input when it is absent (`port_node`) — which must be a
+        member, so an optional sink stands on an internal edge."""
         nodes = self.nodes or {}
         readers: Dict[str, int] = {}
         for pn in nodes.values():
@@ -319,13 +340,19 @@ class NaivePattern(BaseModel):
         for name, pn in nodes.items():
             if not pn.optional:
                 continue
-            if len(pn.internal_inputs()) != 1:
+            if pn.read_through() is None:
                 raise ValueError(
-                    f"NaivePattern.nodes[{name!r}]: an optional node has "
-                    f"exactly one internal input (the edge its reader reads "
-                    f"through when it is absent); it has "
-                    f"{pn.internal_inputs()!r}.")
+                    f"NaivePattern.nodes[{name!r}]: an optional node stands "
+                    f"on ONE edge its reader reads through when it is "
+                    f"absent — one internal input, or (no internal input) "
+                    f"one external operand; it reads {pn.inputs!r}.")
             if readers.get(name, 0) == 0:
+                if not pn.internal_inputs():
+                    raise ValueError(
+                        f"NaivePattern.nodes[{name!r}]: an optional SINK "
+                        f"stands on an internal edge — a port that names it "
+                        f"names that member when it is absent; it reads "
+                        f"{pn.inputs!r}.")
                 continue                # a sink: its ports fall through
             if readers[name] != 1:
                 raise ValueError(

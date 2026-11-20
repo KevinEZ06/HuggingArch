@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, fetchJson, isRequestableModelId, stillComputingNote } from "../api";
 import { authContext, fetchMyCalibration, trackAnalyticsEvent } from "../auth";
 import { formatNumber } from "../format";
@@ -33,6 +33,7 @@ import {
   type SweepRow,
   type SweepSection,
 } from "../compare";
+import { hasCommChoice } from "../comm";
 import { axis, EMPTY_PARALLEL, loadFactorError, parallelOf, parseLoadFactor, useParallelShape, type Parallel } from "../parallel";
 import { filterAndSortModels, ModelOptions, useSupportedModels } from "../supportedModels";
 import { readHash, RETIRED_PRECISION_KEYS, writeHash } from "../url";
@@ -50,6 +51,11 @@ import { MemBudget } from "./MemBudget";
 import { PhaseTable } from "./PhaseTable";
 import { ResultSummary, type Estimate } from "./ResultSummary";
 import { ScalingPanel } from "./ScalingPanel";
+
+/** The Communication card draws an SVG topology and an ECharts envelope for
+ *  collectives. A single-rank deployment has no collective to show, so the
+ *  module is fetched only once a step turns out to have one. */
+const CommCard = lazy(() => import("./CommCard"));
 
 type GpusResponse = { items?: GpuItem[]; audit_parallel?: Record<string, number> };
 
@@ -1031,6 +1037,13 @@ export function Inference() {
           result={result.data}
           target={result.target}
         />
+        )}
+        {/* What each collective of the step runs on, and why it won. Nothing
+         *  to open where the step has no collective carrying its choice. */}
+        {result && hasCommChoice(result.data) && (
+          <Suspense fallback={<div className="card p-5 mb-6 text-xs text-gray-400">Drawing the collectives…</div>}>
+            <CommCard result={result.data} />
+          </Suspense>
         )}
         {/* One compute graph on the page: the encoder tab draws its own. */}
         {/* No step, no graph of one: a deployment that admits no request

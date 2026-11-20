@@ -88,26 +88,62 @@ measures empty and small collectives and launches.
 
 **What the collective latency assumes.**
 
-- *Inside one NVLink domain the framework picks the all-reduce algorithm
-  by payload.* vLLM and sglang do not run NCCL's schedule on a tensor-parallel
-  all-reduce there: below a threshold they run a one-shot kernel (every rank
-  writes its payload to every peer and reduces locally — 1 hop, a rank
-  receives `(N−1)·T`), above it a two-shot (reduce-scatter + all-gather by
-  direct writes — 2 hops, `2(N−1)/N·T`), and past that NVLS where the switch
-  reduces in the network (2 hops, `(N−1)/N·T`). The algorithms and their
-  coefficients are `comm_volume.ALGORITHMS`; which payload takes which is the
-  framework's binding (`collectives:` in `framework_bindings/*.yaml`, one
-  representative threshold per algorithm, source-anchored); whether the card
-  admits one is `gpu_specs.csv` (`nvlink_gbps`: an NVLink domain of
-  `gpus_per_node` GPUs, an HGX node or an NVL72 rack; `nvls`: the switch
-  reduces). `comm_cost.collective_ladder` puts them together, and a row's law
-  is cases over its payload, so a sweep's other batch lands in its own
-  algorithm. Buffer caps, environment switches and CUDA-graph tables are
-  billed on the default serving path and stated in the binding comments.
-- *Elsewhere, hop counts are the latency-optimal small-message schedule*
-  (Thakur, Rabenseifner & Gropp 2005; `comm_volume.latency_hops`) — NCCL's,
-  on PCIe cards, across NVLink domains and for every collective but the
-  all-reduce: a point-to-point send is 1 hop; reduce-scatter (recursive
+- *Collective pricing: a collective's time is its envelope.* It is the
+  minimum, at its payload, over the algorithms the card's fabric can run, of
+  each algorithm's α-β time (`comm_cost.Envelope`; the word is the one the
+  measured mode uses for "fastest across libraries"). The algorithms and
+  their coefficients are declared once, in `comm_volume.ALGORITHMS`:
+  one-shot (every rank writes its payload to every peer and reduces locally
+  — 1 hop, a rank receives `(N−1)·T`), two-shot (reduce-scatter +
+  all-gather by direct writes — 2 hops, `2(N−1)/N·T`), NVLS where the switch
+  reduces in the network (2 hops, `(N−1)/N·T`), and NCCL's own schedule
+  (the ring's bytes, the log-depth hops below). The first three are
+  all-reduces.
+  - *Feasibility is a hardware fact and nothing else* (`Fabric.refusal`):
+    the group inside one node (`gpus_per_node`, with the group's mesh
+    stride; an NVL72 rack is one node), an NVLink domain (`nvlink_gbps` in
+    `gpu_specs.csv`; a PCIe card has none) for one-shot and two-shot, and a
+    switch that reduces (`nvls`) for NVLS. NCCL's schedule runs everywhere
+    and is the only one across nodes, where it is priced as the
+    hierarchical schedule, and for every collective but the all-reduce,
+    including a routed MoE exchange.
+  - *No framework is asked.* The α-β law picks a one-traversal algorithm for
+    a small payload and the fewest-bytes one for a large one by itself; a
+    framework that falls back to a slower path (sglang past its 16 MiB
+    custom-all-reduce workspace, a CUDA-graph table, an environment switch)
+    is slower than the bound, not a different bound. vLLM and sglang
+    therefore price an identical standalone collective identically. What a
+    binding still owns is launch structure: a communication FUSION (an
+    all-reduce folded into an RMSNorm or a GEMM) is a fused launch and stays
+    a `framework_bindings/*.yaml` entry like any other; only the algorithm
+    that moves its bytes is the envelope's.
+  - *One law at every point.* A row's law is the symbolic minimum over the
+    candidates (`row_roofline.build_row_exprs`; a candidate the fabric
+    cannot run has no price — its fixed time is infinite, so it never
+    wins), so another batch,
+    another card or another link latency each find their own fastest
+    algorithm (`FloorForm` keeps every undominated candidate's `(b, c)`).
+    The row's wire bytes (`comm_bytes_per_rank`) are the chosen algorithm's,
+    read off the same envelope — so they depend on the card and the payload
+    and are not monotone in the batch: past the one-shot→NVLS crossover a
+    larger batch moves about N times fewer bytes. The row publishes the
+    choice as `comm_choice` (`Envelope.choice`): every candidate, feasible
+    or why not, with its time, wire bytes, hops, stages, description, note
+    and a curve over payload, and the envelope itself on the same grid
+    (`envelope_curve`, each point with the algorithm that sets it).
+  - *NVLS is priced optimistic.* Its coefficient `(N−1)/N·T` counts only the
+    peers' share of each slice, as the ring's does; the switch's fetch of a
+    rank's own slice and its multicast back also cross that rank's link, so
+    the bytes on the link are `T` each way — at N=8 about 14% more bytes
+    than priced (8/7), which makes the time about 12.5% optimistic (1/8).
+    Kept as declared until a measurement says which reading NVLS's achieved
+    bus bandwidth follows; the candidate's `note` in `comm_choice` says so.
+  - *A floor, not a rival to the measured envelope.* Once Kernel Bench
+    measures collectives, the measured envelope (the fastest library it
+    ran) should sit at or above this modelled one: this is the bound a
+    measurement is read against, not a competing answer.
+- *NCCL's hop counts are the latency-optimal small-message schedule*
+  (Thakur, Rabenseifner & Gropp 2005; `comm_volume.latency_hops`): a point-to-point send is 1 hop; reduce-scatter (recursive
   halving), all-gather (recursive doubling) and all-to-all (Bruck)
   `ceil(log2 N)`; all-reduce (reduce-scatter then all-gather)
   `2 ceil(log2 N)`; a hierarchical collective adds its phases' counts. For
@@ -265,6 +301,36 @@ a list of alternatives, and the entry holds where any of them holds.
 A stated assumption is not a silent fallback: the comment says which path is
 billed and what would change it. The cost of this choice is a small error in
 non-default configurations, almost always in launch count rather than bytes.
+
+#### The class a framework serves a checkpoint with
+
+`architectures:` is the framework's own dispatch key — the model class its
+code branches on. That is not always the class the checkpoint declares:
+sglang's DeepSeek-V4.1 config normalizer rewrites `architectures:
+["DeepseekV41ForCausalLM"]` to `["DeepseekV4ForCausalLM"]`
+(`srt/configs/deepseek_v41.py:38-39`) before any dispatch reads it, so every
+sglang branch keyed on the class — the fused-op entries, the AR-fusion
+architecture set — sees the V4 name for a V4.1 checkpoint.
+
+A binding declares that resolution once, at its head:
+
+```yaml
+architecture_served_as:
+  DeepseekV41ForCausalLM: DeepseekV4ForCausalLM   # declared: served as
+```
+
+The conditions are asked against the CHECKPOINT's class
+(`Program.architectures`), so after load every `architectures:` /
+`excluded_architectures:` list is read through that map: a name the
+framework resolves to admits every checkpoint class resolving to it, and a
+name that is itself a declared checkpoint class stays narrow — which is how
+an entry says "only this checkpoint spells this graph"
+(`mhc_pre_gemm_stream`, the shifted hyper-connection seam). The resolution
+is applied in ONE pass over the parsed binding
+(`_resolved_architectures`), not handed to each parser: a binding holds
+conditions in five places and the first spelling of this, which passed the
+map parser by parser, lost the DeepSeek-V4 router's fp32-logit requirement
+in the one parser that forgot to pass it on.
 
 ### How a pattern is written
 

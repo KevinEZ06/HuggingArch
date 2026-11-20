@@ -3344,6 +3344,30 @@ register_signature(OpSignature(
 ))
 
 register_signature(OpSignature(
+    name="mhc_post_combine_norm",
+    binds_ops=('mhc_post_combine_norm',),
+    # The post's four operands, the CARRIED `pre` the next sublayer collapses
+    # the copies with, and that sublayer's norm gain. No projection: this
+    # launch does not compute the mix vector (sglang's stats launch does,
+    # `mhc_pre_gemm_stream`), which is what separates it from
+    # `mhc_mega_post_pre`.
+    inputs=(
+        *_HC_POST_OPERANDS,
+        TensorLayout("pre", (_HC_TOKENS, "n_hidden_copies"),
+                     role="metadata"),
+        TensorLayout("norm_weight", ("d_model",), role="weight"),
+    ),
+    engine_inputs=_HC_POST_ENGINE,
+    dtype_slots=("activation",),
+    doc=("DeepSeek-V4.1's shifted hyper-connection seam as ONE launch on "
+         "Blackwell: the finished sublayer's post-mix, the next sublayer's "
+         "collapse of the copies by the carried `pre`, and that sublayer's "
+         "RMSNorm. It writes the new multi-copy residual (the next post and "
+         "the stats launch both read it) and the normalised sublayer input. "
+         "sglang `mhc_post_combine_norm_prefill`."),
+))
+
+register_signature(OpSignature(
     name="mhc_mega_post_pre",
     binds_ops=('mhc_mega_post_pre',),
     inputs=(

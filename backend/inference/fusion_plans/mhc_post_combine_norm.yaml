@@ -1,0 +1,61 @@
+# A sublayer boundary's post-mix AND the next sublayer's collapse + norm in
+# ONE launch — the wide-tile Blackwell form of DeepSeek-V4.1's shifted
+# hyper-connection seam.
+#
+# The seam, as V4.1 runs it: when a sublayer finishes, its [T, d] output is
+# spread back over the residual copies by `post` and the copies are
+# cross-mixed by `comb` (that is `mhc_post`); the NEXT sublayer then collapses
+# those copies with the pre-mix gate the PREVIOUS seam published and
+# RMS-normalises the result (that is `mhc_pre_big_fuse` on the shifted
+# schedule). Two launches, and the whole [T, hc, d] residual is written and
+# read again between them:
+#
+#   residual' = post ⊙ sublayer + comb ⊗ residual        # [T, hc, d]
+#   y         = rmsnorm(Σ_c pre_c · residual'_c)         # [T, d]
+#
+# sglang (audited at v0.5.22) fuses the pair on Blackwell:
+# `mhc_post_combine_norm_prefill` (kernels/ops/layernorm/
+# mhc_post_combine_norm_prefill.py:33, the JIT kernel
+# `MhcPostCombineNormPrefill<128>::run`), taken by `_post_fusion`
+# (srt/models/deepseek_v4_mhc.py:589, the branch at :625-648) whenever the
+# next boundary's norm is fusable. The new residual is still written — the
+# next post reads it, and so does the stats launch — so it stays an exposed
+# port; what the fusion removes is the round trip into the collapse.
+#
+# The plan is the union of `mhc_post`'s five leaves and `mhc_pre_big_fuse`'s
+# four, joined by the edge the post's output makes into the next sublayer's
+# weighted reduce. That edge crosses a component boundary (`crosses:
+# component` on the binding entry) and, between a layer's MoE post and the
+# next layer's attention collapse, the seam between two block iterations;
+# the matcher binds the previous iteration's members through the formal the
+# layer hands on (`eval.fusion.Seams`).
+#
+# Stated residual, the same one `mhc_pre_big_fuse` carries: the Sinkhorn
+# split stays a billed node. V4.1 generates its coefficients in the stats
+# launch (`mhc_pre_gemm_stream`), which is where that node's cost belongs;
+# this launch only consumes `post`, `comb` and the carried `pre`.
+#
+# Where the fused form does NOT run, the two smaller plans do, and they are
+# tried second (`match_order` puts the larger pattern first).
+
+fused_op: mhc_post_combine_norm
+
+naive_pattern:
+  nodes:
+    post_broadcast:     { op: broadcast,   inputs: [external.post] }
+    sublayer_broadcast: { op: broadcast,   inputs: [external.sublayer] }
+    post_term:          { op: mul,         inputs: [post_broadcast.out, sublayer_broadcast.out] }
+    comb_mix:           { op: hc_mix,      inputs: [external.comb, external.residual] }
+    residual_add:       { op: add,         inputs: [post_term.out, comb_mix.out] }
+    pre_broadcast:      { op: broadcast,   inputs: [external.pre] }
+    residual_weighted:  { op: mul,         inputs: [residual_add.out, pre_broadcast.out] }
+    reduced:            { op: sum_reduce,  inputs: [residual_weighted.out] }
+    norm:               { op: rmsnorm,     inputs: [reduced.out] }
+  io_mapping:
+    post:         external.post
+    sublayer:     external.sublayer
+    comb:         external.comb
+    residual:     external.residual
+    pre:          external.pre
+    output:       norm.out
+    residual_out: residual_add.out

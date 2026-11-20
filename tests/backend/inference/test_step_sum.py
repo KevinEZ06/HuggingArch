@@ -25,10 +25,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.arch.eval.transforms import Workload
 from backend.inference.defaults import COMM_LATENCY_US_DEFAULT, LAUNCH_FLOOR_US_DEFAULT
+from backend.arch.layout.comm_volume import NCCL, algorithms_for
 from backend.inference.comm_cost import Fabric
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.row_roofline import (
-    FloorForm, LawBook, StepSum, build_row_exprs, card_binding, comm_factor,
+    CardForm, FloorForm, FloorTerm, LawBook, StepSum, build_row_exprs, card_binding,
     evaluate_law, law_columns, read_row_law, RowCard)
 from tests.sweep_parity import REL, Deployment
 
@@ -52,8 +53,9 @@ def _row(uid, *, flops=200, act=4, weight=100, payload=0.0, world=1,
             count=count, flops=B * flops, act_in=B * act, act_out=0,
             demand=8 * B * weight,
             weight_total=weight, metadata_total=0, comm_payload=B * payload,
-            comm_factor=comm_factor("all_reduce", world) if is_comm else 0.0,
-            comm_priced=is_comm), LawBook()),
+            comm_priced=is_comm,
+            comm_algorithms=(algorithms_for("all_reduce") if is_comm
+                             else (NCCL,))), LawBook()),
     }
 
 
@@ -74,8 +76,12 @@ class TestTheSum:
         law = sp.sstr(StepSum.of(rows).law())
         assert {s.name for s in read_row_law(law).free_symbols} == {
             "B", "PEAK_BW", "PEAK_FLOPS_bf16", "PEAK_FLOPS_fp8_e4m3",
-            "COMM_S_PER_BYTE_all_reduce_4_1_1", "COMM_LATENCY_S_all_reduce_4_1_1",
-            "LAUNCH_S"}
+            "LAUNCH_S",
+            # The all-reduce's envelope: NCCL's under the bare signature,
+            # every other algorithm with its own suffix.
+            *(f"{family}_all_reduce_4_1_1{suffix}"
+              for family in ("COMM_S_PER_BYTE", "COMM_LATENCY_S")
+              for suffix in ("", "_one_shot", "_two_shot", "_nvls"))}
         for batch in (1, 3, 64):
             assert _at(law, batch, rows) == pytest.approx(
                 sum(_t_op(r, batch) for r in rows), rel=REL)
@@ -277,8 +283,8 @@ class TestTheFloorFormIsTheLaw:
                             peak_flops=anchor["peak_flops_per_sec"],
                             peak_bw=anchor["peak_hbm_bw_bytes_per_sec"],
                             fabric=Fabric.of(get_gpu("H100-SXM")))
-        assert any(c > 0 for _a, _b, c, _n in form.terms)
-        assert any(n > 0 for _a, _b, _c, n in form.terms)
+        assert any(c > 0 for term in form.terms for _b, c in term.pairs)
+        assert any(term.n > 0 for term in form.terms)
         for comm_us, launch_us in ((COMM_LATENCY_US_DEFAULT, LAUNCH_FLOOR_US_DEFAULT),
                                    (5.0, 0.5), (0.0, 0.0), (20.0, 4.0)):
             there = estimate_capacity(comm_latency_us=comm_us,
@@ -473,62 +479,72 @@ class TestTheCardFormIsTheLaw:
                                fabric=_FABRIC).at(0.0, 0.0) > 0
 
 
-class TestTheDispatchIsCasesOverThePayload:
-    """A collective whose framework declares rungs is priced in its law as
-    cases over its payload (`row_roofline.build_row_exprs`): the step's law
-    read at another batch lands in that batch's algorithm, as the row read
-    there does; at one point the time is linear in the link latency."""
+class TestTheEnvelopeIsTheMinimumOverAlgorithms:
+    """An all-reduce is priced in its law as the minimum over the
+    algorithms that run it (`row_roofline.build_row_exprs`,
+    `comm_cost.Envelope`), each at the card's price and an algorithm the
+    card's fabric cannot run at NCCL's: the step's law read at another
+    batch lands on that batch's fastest algorithm, as the row read there
+    does — and so does a floor form read at another link latency."""
 
     def _rows(self):
-        from backend.inference.framework_bindings import get_binding
-        from types import SimpleNamespace
-        rungs = [r.as_dict() for r in get_binding("vllm").collectives_for(
-            SimpleNamespace(architectures=()), None)["all_reduce"]]
         row = _row(0, flops=0, act=0, weight=0, payload=14336.0, world=8,
                    count=3)
-        law = law_columns(build_row_exprs(
-            count=3, flops=0, act_in=0, act_out=0, demand=0, weight_total=0,
-            metadata_total=0, comm_payload=B * 14336,
-            comm_factor=comm_factor("all_reduce", 8), comm_priced=True,
-            comm_rungs=len(rungs)), LawBook())
-        return [{**row, **law, "comm_rungs": rungs}]
+        return [{**row, "point_law": {"point": {**_POINT, "B": 8}}}]
 
-    def _fabric(self, alpha=COMM_LATENCY_US_DEFAULT * 1e-6):
+    def _fabric(self, card="H100-SXM", alpha=COMM_LATENCY_US_DEFAULT * 1e-6):
         from backend.inference.gpu_specs import get_gpu
-        return Fabric.of(get_gpu("H100-SXM"), alpha)
+        return Fabric.of(get_gpu(card), alpha)
 
-    def test_the_step_law_switches_algorithm_with_the_batch(self):
+    def _t_comm(self, rows, fabric, batch):
+        return LawBook().row_at(rows[0], {**_POINT, "B": batch}, RowCard.of(
+            rows[0], peak_flops=None, peak_bw=1.0e12, fabric=fabric)
+            ).times.t_comm
+
+    def test_the_step_law_takes_the_fastest_algorithm_at_each_batch(self):
         rows = self._rows()
-        fabric = self._fabric()
         law = sp.sstr(StepSum.of(rows).law())
-        binding = card_binding(rows, peak_flops=None, peak_bw=1.0e12,
-                               fabric=fabric)
-        a = fabric.step_latency
-        for batch, want in (
-                # B=1: one-shot — one traversal, 7 payloads in.
-                (1, 3 * (a + 7 * 14336 / 450e9)),
-                # B=16: two-shot.
-                (16, 3 * (2 * a + 1.75 * 16 * 14336 / 450e9)),
-                # B=1024: NVLS — half the ring's bytes.
-                (1024, 3 * (2 * a + 0.875 * 1024 * 14336 / 450e9))):
-            got = float(evaluate_law(law, {**_POINT, "B": batch, **binding}))
-            row_t = LawBook().row_at(rows[0], {**_POINT, "B": batch}, RowCard.of(
-                rows[0], peak_flops=None, peak_bw=1.0e12, fabric=fabric)
-                ).times.t_comm
-            assert got == pytest.approx(want, rel=1e-12), batch
-            assert row_t == pytest.approx(want, rel=1e-12), batch
+        for card, bw, cases in (
+                # NVLS switch: one-shot below α·bw/6.125 per instance, NVLS
+                # above (it moves half a two-shot's bytes in as many hops).
+                ("H100-SXM", 450e9, ((1, "one_shot"), (16, "nvls"),
+                                     (1024, "nvls"))),
+                # NVLink without a reducing switch: one-shot, then two-shot.
+                ("A100-80G-SXM", 300e9, ((1, "one_shot"), (16, "two_shot"))),
+                # No NVLink (a PCIe node of eight): NCCL's schedule at
+                # every payload.
+                ("RTX-4090", None, ((1, "nccl"), (1024, "nccl")))):
+            fabric = self._fabric(card)
+            a = fabric.step_latency
+            assert bw in (None, fabric.intra_bw), card
+            bw = fabric.intra_bw
+            binding = card_binding(rows, peak_flops=None, peak_bw=1.0e12,
+                                   fabric=fabric)
+            for batch, algorithm in cases:
+                p = batch * 14336
+                want = 3 * {"one_shot": a + 7 * p / bw,
+                            "two_shot": 2 * a + 1.75 * p / bw,
+                            "nvls": 2 * a + 0.875 * p / bw,
+                            "nccl": 6 * a + 1.75 * p / bw}[algorithm]
+                got = float(evaluate_law(law, {**_POINT, "B": batch, **binding}))
+                assert got == pytest.approx(want, rel=1e-12), (card, batch)
+                assert self._t_comm(rows, fabric, batch) == pytest.approx(
+                    want, rel=1e-12), (card, batch)
+                from backend.inference.comm_cost import CollectiveSignature
+                assert CollectiveSignature.of(rows[0]).envelope(
+                    fabric).choose(p).algorithm == algorithm, (card, batch)
 
-    def test_at_one_point_the_time_is_linear_in_the_link_latency(self):
+    def test_a_floor_form_takes_the_fastest_algorithm_at_each_latency(self):
+        """At B=8 (114,688 B per instance) NVLS wins on a free link and
+        one-shot from α ≈ 1.6 µs: a form linear in α would read one of the
+        two at every latency."""
         rows = self._rows()
-        for batch in (1, 16, 1024):
-            t = [LawBook().row_at(rows[0], {**_POINT, "B": batch}, RowCard.of(
-                rows[0], peak_flops=None, peak_bw=1.0e12,
-                fabric=self._fabric(alpha))).times.t_comm
-                for alpha in (0.0, 1e-6, 7e-6)]
-            slope = (t[1] - t[0]) / 1e-6
-            assert t[2] == pytest.approx(t[0] + slope * 7e-6, rel=1e-12)
-            # The slope is the instances times the algorithm's hops.
-            assert slope == pytest.approx(3 * (1 if batch == 1 else 2), rel=1e-9)
+        form = CardForm.of(rows, book=LawBook(), fabric=self._fabric()).bind(
+            {"bf16": 1.0e15}, peak_bw=1.0e12, fabric=self._fabric())
+        for alpha in (0.0, 1e-6, 2e-6, 20e-6):
+            want = self._t_comm(rows, self._fabric(alpha=alpha), 8)
+            assert form.at(alpha, 0.0) == pytest.approx(want, rel=1e-12), alpha
+        assert FloorForm.from_json(form.to_json()) == form
 
 
 def test_a_floor_form_collapses_proportional_terms_exactly():
@@ -536,27 +552,31 @@ def test_a_floor_form_collapses_proportional_terms_exactly():
     = max(wa, wb+wcα, wnL)`); terms that are not exactly proportional stay
     apart; the form is the same function at any floors, and its columnar
     JSON reads back as itself."""
-    from backend.inference.row_roofline import FloorForm
+    from backend.inference.row_roofline import FloorForm, FloorTerm
 
-    terms = [(0.25, 0.0, 0.0, 1.0), (0.75, 0.0, 0.0, 3.0),
-             (0.25, 0.0, 0.0, 1.0000000000000002), (1e-6, 3e-6, 4.0, 0.0),
-             (0.0, 0.0, 0.0, 0.0)]
+    terms = [FloorTerm.of(a, [(b, c)], n) for a, b, c, n in (
+        (0.25, 0.0, 0.0, 1.0), (0.75, 0.0, 0.0, 3.0),
+        (0.25, 0.0, 0.0, 1.0000000000000002), (1e-6, 3e-6, 4.0, 0.0),
+        (0.0, 0.0, 0.0, 0.0))]
+    # A term of a two-algorithm envelope, and one on its ray.
+    terms += [FloorTerm.of(0.0, [(1e-5, 1.0), (1e-6, 2.0)], 0.0),
+              FloorTerm.of(0.0, [(2e-5, 2.0), (2e-6, 4.0)], 0.0)]
     raw = FloorForm(0.5, tuple(terms))
     form = FloorForm.collapsed(0.5, terms)
-    assert len(form.terms) == 3
+    assert len(form.terms) == 4
     for floors in ((0.0, 0.0), (2.3e-6, 3.7e-6), (1e-5, 1e-7), (0.0, 0.5)):
         assert form.at(*floors) == pytest.approx(raw.at(*floors), rel=1e-15)
     assert FloorForm.from_json(json.loads(json.dumps(form.to_json()))) == form
-    assert set(form.to_json()) == {"constant", "a", "b", "c", "n"}
+    assert set(form.to_json()) == {"constant", "a", "pairs", "n"}
 
 
 def test_a_termwise_form_prices_only_the_step_terms_it_is_asked():
     """`FloorForm.terms_at`: the SOL of the named step terms alone at the
     floors given; an index past the step's width, or a collapsed form
     (whose terms are rays, not step terms), refuses."""
-    form = FloorForm.termwise([(0, (3.0, 0.0, 0.0, 0.0)),
-                               (2, (0.0, 1.0, 2.0, 0.0)),
-                               (5, (0.0, 0.0, 0.0, 0.0))], 6)
+    form = FloorForm.termwise([(0, FloorTerm.of(3.0, [], 0.0)),
+                               (2, FloorTerm.of(0.0, [(1.0, 2.0)], 0.0)),
+                               (5, FloorTerm.of(0.0, [], 0.0))], 6)
     assert form.index == (0, 2)  # an all-zero term is left out
     assert form.at(1.0, 1.0) == pytest.approx(3.0 + 3.0)
     assert form.terms_at(1.0, 1.0, [0]) == pytest.approx(3.0)
@@ -566,4 +586,5 @@ def test_a_termwise_form_prices_only_the_step_terms_it_is_asked():
     with pytest.raises(ValueError):
         form.terms_at(1.0, 1.0, [6])
     with pytest.raises(ValueError):
-        FloorForm.collapsed(0.0, [(1.0, 0.0, 0.0, 0.0)]).terms_at(0, 0, [0])
+        FloorForm.collapsed(0.0, [FloorTerm.of(1.0, [], 0.0)]).terms_at(
+            0, 0, [0])

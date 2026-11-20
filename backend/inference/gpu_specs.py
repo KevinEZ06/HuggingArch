@@ -48,8 +48,8 @@ class GPUSpec:
     #: The per-direction NVLink bandwidth. A value also declares the
     #: topology: every GPU of the card's NVLink domain (`gpus_per_node` of
     #: them — an HGX baseboard, a whole NVL72 rack) reaches every other
-    #: over NVLink, which is what a framework's peer-to-peer all-reduce
-    #: kernels require. Empty: the GPUs talk over PCIe.
+    #: over NVLink, which is what a peer-to-peer (one-shot, two-shot)
+    #: all-reduce requires (`comm_cost.Fabric.refusal`). Empty: the GPUs talk over PCIe.
     nvlink_gbps: Optional[float]
     #: `yes` when the NVLink domain's switches reduce in the network and
     #: multicast (NVLink SHARP, "NVLS": third-generation NVSwitch and later,
@@ -252,17 +252,14 @@ PEAK_COLUMNS: Mapping[str, str] = _peak_columns()
 #:   * `rdma_hop_latency_us` — `inter_hop_latency_s`, what a cross-node
 #:     link traversal adds to the request's link latency;
 #:   * `nvls`        — `has_nvls`, which all-reduce the switch admits;
-#:   * `gpus_per_node` — `gpus_per_node`, whether a group stays in a node;
-#:   * `compute_capability` — a collective rung's own window
-#:     (`comm_cost.CollectiveRung.runs_on`, off `Fabric`). It is a WALK
-#:     fact as well, through the dispatch (`DispatchCondition.CARD_KEYS`).
+#:   * `gpus_per_node` — `gpus_per_node`, whether a group stays in a node.
 #:
 #: Exhaustive over the sheet with `DESCRIPTIVE_COLUMNS` and the walk
 #: columns: a column in none of the three is refused at load
 #: (`framework_bindings._check_card_fact_classification`).
 PRICE_COLUMNS: FrozenSet[str] = frozenset({
     "mem_gib", "mem_bw_gbps", "nvlink_gbps", "pcie_gbps", "rdma_gbps",
-    "rdma_hop_latency_us", "nvls", "gpus_per_node", "compute_capability", *PEAK_COLUMNS.values()})
+    "rdma_hop_latency_us", "nvls", "gpus_per_node", *PEAK_COLUMNS.values()})
 
 #: The sheet columns no walk and no number reads — what a row says about
 #: itself, for a reader. Explicit, one entry per column with why: the third

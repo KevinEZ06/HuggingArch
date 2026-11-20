@@ -58,9 +58,14 @@ ADDED = {
         "as for prefill",
     "gpu.nvls":
         "the GPU sheet states whether a SKU's NVLink domain reduces in the "
-        "switch (NVLink SHARP), which decides whether a framework's NVLS "
-        "all-reduce runs on it (`comm_cost.collective_ladder`); the SKU "
-        "block publishes every sheet column",
+        "switch (NVLink SHARP), which decides whether an NVLS all-reduce "
+        "is among the algorithms its fabric runs (`comm_cost.Envelope`); "
+        "the SKU block publishes every sheet column",
+    "gpu.rdma_hop_latency_us":
+        "the GPU sheet states what one link traversal across nodes waits "
+        "beyond the request's link latency (45983d578, "
+        "`comm_cost.Fabric.hop_latency`); the SKU block publishes every "
+        "sheet column",
     "gpu.compute_capability":
         "the GPU sheet states each SKU's CUDA compute capability, which a "
         "framework binding's `when.min_compute_capability` asks (a kernel "
@@ -344,6 +349,24 @@ for _rows in ("per_op_timing", "per_op_timing_decode",
     REMOVED[f"{_rows}[*].source_badge.absorbed[*].shape_out_law"] = (
         _NO_SERVED_LAWS)
 
+# A collective is priced as its envelope over the algorithms the card's
+# fabric runs (`comm_cost.Envelope`): the row publishes which one was chosen
+# and every one it was chosen among, and its wire bytes are the chosen
+# algorithm's at the point, read off that envelope — no longer a law of
+# their own beside the time's. So `comm_bytes_per_rank` (and its rollup
+# `comm_bytes_agg`) keeps its name and changes its meaning: the bytes that
+# cross the link under the chosen algorithm, which depend on the card and
+# the payload and are not monotone in the batch (one-shot moves (N-1)·T,
+# NVLS (N-1)/N·T — about N times fewer past the crossover), where it was
+# the ring's 2(N-1)/N·T whatever the algorithm.
+_ENVELOPE = ("a collective's price is its envelope over algorithms; the row "
+             "publishes the choice (`Envelope.choice`) and the chosen "
+             "algorithm's wire bytes")
+for _rows in ("per_op_timing", "per_op_timing_decode",
+              "phases.prefill.flops_by_module", "phases.decode.flops_by_module"):
+    ADDED[f"{_rows}[*].comm_choice"] = _ENVELOPE
+    REMOVED[f"{_rows}[*].roofline_expr.comm_volume"] = _ENVELOPE
+
 CASES = [
     pytest.param("meta-llama/Llama-3.2-3B", id="llama"),
     pytest.param("deepseek-ai/DeepSeek-V4-Flash", id="dsv4-flash",
@@ -394,6 +417,41 @@ def test_every_registered_addition_is_published(published):
     assert sorted(path for path in ADDED if path not in seen) == [], (
         "registered in ADDED and published by no model this gate walks: "
         "drop it from ADDED, or walk a model that publishes it")
+
+
+def test_a_tensor_parallel_estimate_publishes_its_collective_choice():
+    """The pinned cases walk one GPU, where no row prices a collective, so
+    `comm_choice` is published there only as an empty column. A TP=2 walk
+    publishes it filled: every path registered in ADDED for it, the
+    choice's own fields under the per-op rows, and no registered removal —
+    and each filled choice names the row's own price."""
+    model_id = "meta-llama/Llama-3.2-3B"
+    estimate = estimate_capacity(
+        config=snapshot_config(model_id), model_id=model_id,
+        resolved=resolve_snapshot(model_id), gpu_sku="B200",
+        parallel=ParallelConfig(tp_attention=2, tp_dense_ffn=2), num_gpus=2,
+        gpu_memory_fraction=0.9, avg_input_tokens=4096, avg_output_tokens=256,
+        prefill_batch_size=2, decode_batch_size=2,
+        selection_mode="theoretical_only", measurement_scope=None)
+    now = set(_paths(estimate))
+    registered = {path for path in ADDED if path.endswith(".comm_choice")}
+    assert registered and registered <= now
+    for rows in ("per_op_timing", "per_op_timing_decode"):
+        for field in ("algorithm", "envelope_curve[*][*]", "ranks[*]",
+                      "fabric.nodes_spanned", "candidates[*].t_s",
+                      "candidates[*].stages[*].kind",
+                      "candidates[*].curve[*][*]", "candidates[*].note"):
+            assert f"{rows}[*].comm_choice.{field}" in now, (rows, field)
+    assert sorted(path for path in REMOVED if path in now) == []
+    filled = [r for r in estimate["per_op_timing"] if r.get("comm_choice")]
+    assert filled
+    for r in filled:
+        choice = r["comm_choice"]
+        chosen = next(c for c in choice["candidates"]
+                      if c["algorithm"] == choice["algorithm"])
+        assert chosen["t_s"] == pytest.approx(r["t_comm_s"], rel=1e-12)
+        assert chosen["wire_bytes_per_rank"] == pytest.approx(
+            r["comm_bytes_per_rank"], rel=1e-12)
 
 
 @pytest.mark.parametrize("model_id", CASES)

@@ -50,9 +50,9 @@ def moe_dp_ep_degree(gpu_sku: str) -> int:
 # hop latency (`gpu_specs.csv` `rdma_hop_latency_us`, a card fact, not this
 # floor; `comm_cost.Fabric.hop_latency`). A collective pays it once
 # per traversal its algorithm waits on in sequence (`comm_volume.ALGORITHMS`:
-# a one-shot all-reduce 1, a two-shot or NVLS one 2 — what a framework runs
-# inside an NVLink domain, `comm_cost.collective_ladder` — and NCCL's
-# schedule elsewhere, an all-reduce of N ranks 2 log2 N, a reduce-scatter,
+# a one-shot all-reduce 1, a two-shot or NVLS one 2 — inside an NVLink
+# domain, where the fastest of them prices it, `comm_cost.Envelope` — and
+# NCCL's schedule, an all-reduce of N ranks 2 log2 N, a reduce-scatter,
 # all-gather or all-to-all log2 N, per phase of a hierarchical schedule;
 # `comm_cost.collective_latency`). An estimate until Kernel Bench measures
 # collectives; the request may set its own (`comm_latency_us`).

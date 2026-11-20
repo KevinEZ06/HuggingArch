@@ -2,13 +2,9 @@
 # it runs as one launch, and `when:` it does; and the serving choices a
 # measured kernel's key depends on that sglang, not the model, makes
 # (`kv_block_size`, and where it reads `ssm_chunk_size`); the output widths
-# the kernels it dispatches to REQUIRE of a declared role (`edge_dtypes`);
-# and which
-# all-reduce algorithm it runs on a payload inside one NVLink domain
-# (`collectives`). Nothing else lives here; the bytes and the link
-# traversals each algorithm costs are `comm_volume.ALGORITHMS`'. Which kernel a fused
-# op launches and which release measured it are the measured corpus's
-# identity, not this file's.
+# the kernels it dispatches to REQUIRE of a declared role (`edge_dtypes`).
+# Nothing else lives here. Which kernel a fused op launches and which
+# release measured it are the measured corpus's identity, not this file's.
 #
 # There is one binding per framework and it describes the latest release it
 # was checked against, named by `audited_at`. Every fact and every file:line
@@ -32,6 +28,39 @@ audited_at:
   repo: sgl-project/sglang
   tag: v0.5.22
   commit: baa9befa381511cd4d56f83980951e5a45fffc6d
+
+# The class sglang SERVES a checkpoint's declared architecture with, where
+# the two differ. sglang's V4.1 config normalizer rewrites `architectures:
+# ["DeepseekV41ForCausalLM"]` to `["DeepseekV4ForCausalLM"]`
+# (srt/configs/deepseek_v41.py:38-39, `normalize_deepseek_v41_config`), so
+# EVERY sglang dispatch that reads the model class — the fused-op entries
+# below, the AR-fusion architecture set
+# (srt/arg_groups/overrides.py:905-960, which reads
+# `hf_config.architectures[0]`) — reads that name for a V4.1 checkpoint.
+#
+# Declared once here and applied in ONE pass over the loaded binding, so an
+# `architectures:` / `excluded_architectures:` entry names the class SGLANG
+# dispatches on and the checkpoint classes resolving to it belong to that
+# entry by construction (`docs/inference_cost_model.md`, "The class a
+# framework serves a checkpoint with"). Before this, each entry had to
+# remember to spell both names, and the one that did not silently priced a
+# V4.1 deployment as another architecture's.
+#
+# Where V4.1 really is a different launch it is a GRAPH difference, not an
+# architecture one — but NOT one the patterns separate on their own: both
+# schedules flatten the copies before the mix GEMM, so `mhc_pre_gemm` and
+# `mhc_fused_post_pre` do match a V4.1 seam and are kept off it by the
+# schedule's own graph fact (`block_reads_stream: false`, the carried
+# pre-mix stream a shifted block declares). An entry may also name a
+# CHECKPOINT class where only that checkpoint spells a shape at all
+# (`mhc_pre_gemm_stream`, `mhc_post_combine_norm`): the lists are read in
+# checkpoint-class vocabulary after the resolution above, so both kinds of
+# name are answerable, and the oracle in
+# `tests/backend/inference/test_fusion_registry.py` walks every condition of
+# every binding to check that a serving class never appears without the
+# classes that resolve to it.
+architecture_served_as:
+  DeepseekV41ForCausalLM: DeepseekV4ForCausalLM
 
 # Each entry: a fused-op concept (`fusion_plans/`) sglang runs as one launch,
 # where its source says so, and `when:` it does (absent: whenever the pattern
@@ -80,97 +109,81 @@ ssm_chunk_size:
 # either width under both frameworks, so there is no requirement to declare,
 # and writing fp32 where bf16 would do is a framework inefficiency we do not
 # follow: those cells keep the width they build (`refs._moe_gate_inputs`).
+# What sglang's launch does with BOTH operands of a quantised matmul
+# (`PrecisionLaunch`; vllm.yaml states how these are read). A scheme says
+# what a checkpoint ALLOWS its activation to be; these say what the deployed
+# launch feeds the hardware.
+#
+# compressed-tensors MXFP4 (`mxfp4-pack-quantized`). Two corpus models
+# carry it — Kimi-K3's routed experts and MiMo-V2.6-Pro-RL's `plain`
+# variant — and the entries below match by SCHEME, so they state what is
+# true of both. The checkpoint's `input_activations` is null, so the scheme
+# on its own is weight-only; sglang's MoE method reads the packed weight the
+# same way on every card and the CARD decides the launch:
+#
+#   * SM100 family — both models' overrides resolve
+#     `moe_runner_backend=auto` to `flashinfer_mxfp4` there (Kimi-K3 on
+#     device SM 100 / 103 / 107, arg_groups/model_overrides/kimi_k3.py:
+#     186-205; MiMo-V2 for an FP4-expert checkpoint with no a2a backend,
+#     arg_groups/model_overrides/mimo_v2.py:33-48), `Mxfp4MoEMethod` picks
+#     its trtllm-gen entry point (layers/quantization/mxfp4.py:420-425), and
+#     that path QUANTISES THE ACTIVATION:
+#     `flashinfer_mxfp4_moe_precision` is `"default"`
+#     (arg_groups/fields/exec_.py:829-834), which runs
+#     `_prepare_flashinfer_mxfp8_activations` — FP8 E4M3 over groups of 32
+#     with UE8M0 scales (mxfp4.py:78-117, `per_token_group_quant(group_size=
+#     32, scale_ue8m0=True)`) — before `trtllm_fp4_block_scale_routed_moe`
+#     (moe_runner/flashinfer_trtllm.py:1086-1096, :1137-1180). W4A8, not the
+#     W4A16 the checkpoint alone implies. `"bf16"` is the other choice a
+#     request may state; `"fp8"` is an SM90 knob and inert here
+#     (mxfp4.py:411-414).
+#   * Below it — the activation stays the cell's own width whichever runner
+#     the model lands on: Kimi-K3's override does not fire and `auto`
+#     resolves to the Triton runner (mxfp4.py:1443-1450), MiMo-V2's SM90
+#     branch pins `marlin` (mimo_v2.py:49-57), and both dequantise the
+#     packed weight into a BF16 GEMM. Declared rather than left silent so a
+#     Hopper row says which launch it is instead of reading as an
+#     unanswered selector.
+precision_launches:
+  mxfp4_pack_quantized_trtllm_mxfp8:
+    schemes: [mxfp4-pack-quantized]
+    when:
+      device: [cuda]
+      min_compute_capability: "10.0"
+      below_compute_capability: "11.0"
+      server_flag: {name: flashinfer_mxfp4_moe_precision,
+                    default: default, value: default}
+    launch:
+      activation: fp8_token_group32_ue8m0
+      compute_dtype: F8_E4M3
+      mma_dtypes: [F8_E4M3, MXFP4]
+    source_anchor: "Kimi-K3 resolves moe_runner_backend=auto to flashinfer_mxfp4 on SM100/103/107 (python/sglang/srt/arg_groups/model_overrides/kimi_k3.py:186-205) and MiMo-V2 does the same for its FP4-expert checkpoints (python/sglang/srt/arg_groups/model_overrides/mimo_v2.py:33-48) and Mxfp4MoEMethod takes its trtllm-gen entry point there (python/sglang/srt/layers/quantization/mxfp4.py:420-425); with flashinfer_mxfp4_moe_precision at its default (python/sglang/srt/arg_groups/fields/exec_.py:829-834) that launch quantises the activation to MXFP8 (python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py:1086-1096) through _prepare_flashinfer_mxfp8_activations, FP8 E4M3 with UE8M0 scales over groups of 32 (python/sglang/srt/layers/quantization/mxfp4.py:78-117), and feeds trtllm_fp4_block_scale_routed_moe the MXFP4 weights beside it (python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py:1137-1180)"
+  mxfp4_pack_quantized_weight_only:
+    schemes: [mxfp4-pack-quantized]
+    when:
+      device: [cuda]
+      below_compute_capability: "10.0"
+    launch:
+      activation: none
+      compute_dtype: BF16
+      mma_dtypes: [BF16]
+    source_anchor: "Below SM100 the Kimi-K3 MoE override does not fire (python/sglang/srt/arg_groups/model_overrides/kimi_k3.py:195-199), so moe_runner_backend stays auto and Mxfp4MoEMethod builds the Triton runner (python/sglang/srt/layers/quantization/mxfp4.py:1443-1450), whose fused-MoE path dequantises the packed weight and multiplies at the activation's own width (python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py:808-818); MiMo-V2's SM90 branch pins marlin for the same packed weights (python/sglang/srt/arg_groups/model_overrides/mimo_v2.py:49-57), which dequantises them the same way (python/sglang/srt/layers/quantization/mxfp4.py:1460-1466)"
+
 edge_dtypes:
   deepseek_v4_router_logits_fp32:
     roles: [router]
     dtype: F32
     when: {device: [cuda],
-           architectures: [DeepseekV4ForCausalLM, DeepseekV41ForCausalLM]}
+           architectures: [DeepseekV4ForCausalLM]}
     source_anchor: "MoEGate.forward writes fp32 logits on CUDA (python/sglang/srt/models/deepseek_v2.py:550), through the tiny-token GEMM's out_dtype (python/sglang/srt/models/deepseek_v2.py:573-576) or the general cuBLAS bf16 x bf16 -> fp32 path (python/sglang/srt/models/deepseek_v2.py:584-587), the gate itself declared at python/sglang/srt/models/deepseek_v2.py:491; the hash top-k kernel takes those logits as float (python/sglang/kernels/jit/csrc/deepseek_v4/hash_topk.cuh:24-29)"
 
-# The all-reduce sglang runs on a tensor-parallel payload inside one NVLink
-# domain, by payload (vllm.yaml states how the rungs are read). One
-# representative threshold per algorithm; sglang's per-(capability, world)
-# tables, its CUDA-graph vs eager split and its environment switches are
-# billed as below, not modelled.
-#
-# The path. On CUDA the JIT custom all-reduce v2 is the default
-# (srt/distributed/device_communicators/custom_all_reduce.py:344-369,
-# `SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2` on, srt/environ.py:1388), picked
-# before NCCL (srt/distributed/parallel_state.py:957-1001). It takes one-shot
-# (push or pull), then a multicast two-shot over the payloads its table
-# names, then a two-shot (custom_all_reduce_v2.py:335-347). At TP8 under a
-# CUDA graph — a decode step — SM90 takes one-shot to 128 KiB, multicast
-# two-shot from 512 KiB (configs/custom_all_reduce_v2.py:274-277) and SM100
-# one-shot to 512 KiB, multicast two-shot from 8 MiB (:160-164). The
-# 1 MiB-over-the-group rung is SM90's 128 KiB at TP8 exactly and bills SM100's
-# 512 KiB with it; FlashInfer's MNNVL AUTO, which the architectures sglang
-# turns AR+RMSNorm fusion on for run on Blackwell
-# (srt/arg_groups/overrides.py:905-960), switches at the same 1 MiB.
-#
-# Group sizes. The v2 kernel takes the world sizes its table has: 2-8 on
-# SM90, 2-8 and 16 on SM100 (configs/custom_all_reduce_v2.py:129-170,
-# 242-277), refusing any other (custom_all_reduce_v2.py:486-488) — a 32- or
-# 72-rank NVL72 group runs NCCL. Multicast needs 4 ranks on SM90
-# (configs/custom_all_reduce_v2.py:240) and a table entry on SM100 (:118,
-# 5-8 and 16), one NVLS rung each; SM100 at 2-4 ranks runs two-shot to
-# 128 MiB (:130-144).
-#
-# FlashInfer AR fusion. For the architectures sglang auto-enables it for
-# (srt/arg_groups/overrides.py:905-960) on SM100, FlashInfer's MNNVL backend
-# (srt/layers/flashinfer_comm_fusion.py:58-68) takes the all-reduce before
-# the custom kernel (srt/distributed/parallel_state.py:788-789): AUTO's
-# one-shot to 1 MiB over the group, two-shot past it — no NVLS. The rung has
-# no cap because the source sets none: the fused norm grows the workspace to
-# the step's tokens (`max_token_num=max(x.shape[0], 2048)`,
-# srt/layers/layernorm.py:246). Its other conditions (no attention DP,
-# `moe_a2a_backend` none, one node or SM100) are billed as the default
-# deployment.
-#
-# Billed, not modelled: the eager tables of a prefill step (one-shot to
-# 128 KiB / 750 KiB, multicast two-shot from the smallest payload; at 4
-# ranks on SM100 two-shot only to 32 MiB, configs/custom_all_reduce_v2.py:
-# 140-144, billed by the graph table's 128 MiB;
-# configs/custom_all_reduce_v2.py:160-164, 274-277); FlashInfer's TRT-LLM
-# backend on SM90 for the fusion architectures, whose one-shot reaches
-# further; PCIe groups, billed as NCCL's; sequence parallelism's custom
-# all-gather and reduce-scatter, not the default serving path, billed as
-# NCCL's. Across NVLink domains sglang runs NCCL, priced as the hierarchical
-# schedule.
-collectives:
-  all_reduce:
-    - algorithm: one_shot
-      max_bytes_times_world: 1048576
-      worlds: [2, 3, 4, 5, 6, 7, 8, 16]
-      source_anchor: "group sizes of the v2 tables (python/sglang/srt/distributed/device_communicators/configs/custom_all_reduce_v2.py:129-170, python/sglang/srt/distributed/device_communicators/configs/custom_all_reduce_v2.py:242-277), others refused at python/sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py:486-488; CustomAllReduceV2 one-shot thresholds (python/sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py:335-347, python/sglang/srt/distributed/device_communicators/configs/custom_all_reduce_v2.py:274-277)"
-    - algorithm: two_shot
-      when:
-        min_compute_capability: "10.0"
-        architectures: [DeepseekV3ForCausalLM, DeepseekV32ForCausalLM, DeepseekV4ForCausalLM, GptOssForCausalLM, GlmMoeDsaForCausalLM, Glm4MoeForCausalLM, Glm4MoeLiteForCausalLM, MistralLarge3ForCausalLM, Qwen3MoeForCausalLM, Qwen3VLMoeForConditionalGeneration, Qwen3NextForCausalLM, Qwen4ExpForConditionalGeneration, KimiK25ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration, InternS2PreviewForConditionalGeneration, Qwen3_5ForConditionalGeneration, NemotronHForCausalLM, NemotronHPuzzleForCausalLM, NemotronH_Omni_Reasoning_V3]
-      worlds: [2, 3, 4, 5, 6, 7, 8, 16]
-      source_anchor: "FlashInfer AR fusion auto-enabled for these architectures on SM100 (python/sglang/srt/arg_groups/overrides.py:905-960), MNNVL backend (python/sglang/srt/layers/flashinfer_comm_fusion.py:58-68), taken before the custom all-reduce (python/sglang/srt/distributed/parallel_state.py:788-789): AUTO's two-shot past 1 MiB, the same switch as the one-shot rung's; group sizes billed as the v2 kernel's"
-    - algorithm: two_shot
-      max_bytes: 134217728
-      when: { min_compute_capability: "10.0" }
-      worlds: [2, 3, 4]
-      source_anchor: "SM100's graph tables at 2-4 ranks: no multicast, two-shot to 128 MiB (python/sglang/srt/distributed/device_communicators/configs/custom_all_reduce_v2.py:118, python/sglang/srt/distributed/device_communicators/configs/custom_all_reduce_v2.py:130-144)"
-    - algorithm: two_shot
-      max_bytes: 8388608
-      when: { min_compute_capability: "10.0" }
-      worlds: [2, 3, 4, 5, 6, 7, 8, 16]
-      source_anchor: "SM100's TP8 graph table, multicast two-shot from 8 MiB (python/sglang/srt/distributed/device_communicators/configs/custom_all_reduce_v2.py:160-164)"
-    - algorithm: two_shot
-      max_bytes: 524288
-      worlds: [2, 3, 4, 5, 6, 7, 8, 16]
-      source_anchor: "SM90's TP8 graph table, multicast two-shot from 512 KiB (python/sglang/srt/distributed/device_communicators/configs/custom_all_reduce_v2.py:274-277)"
-    - algorithm: nvls
-      when: { below_compute_capability: "10.0" }
-      worlds: [4, 5, 6, 7, 8]
-      source_anchor: "SM90 multicast from 4 ranks (python/sglang/srt/distributed/device_communicators/configs/custom_all_reduce_v2.py:240); CustomAllReduceV2's multicast two-shot (python/sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py:343-344)"
-    - algorithm: nvls
-      when: { min_compute_capability: "10.0" }
-      worlds: [5, 6, 7, 8, 16]
-      source_anchor: "CustomAllReduceV2's multicast two-shot (python/sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py:343-344), multimem.ld_reduce / multimem.st at python/sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh:123-127"
+# No collective algorithm lives here. A standalone collective is priced as
+# its envelope — the fastest algorithm the card's fabric can run
+# (`comm_cost.Envelope`, docs/inference_cost_model.md "Collective
+# pricing") — the same under every framework: which kernel sglang happens to
+# dispatch at a payload, and its workspace caps, are not the bound. A
+# communication FUSION (an all-reduce folded into a norm or a GEMM) is a
+# launch-structure fact and is declared below like any other.
 
 op_implementations:
   # The FA3 backend (srt/layers/attention/flashattention_backend.py:132), the
@@ -290,22 +303,57 @@ op_implementations:
   # classes are the corpus's two KDA spellings, and vLLM's prefill is
   # FlashKDA — one launch whose workspace writes no plan states — so this
   # entry is sglang's alone.
+  #
+  # BELOW capability 10.0 only. On SM100 / SM103 sglang's own default moves
+  # KDA prefill to FlashInfer (`flashinfer_kda_prefill_default`,
+  # srt/layers/attention/linear/kda_backend.py:74-95, taken in
+  # `attention_registry.py:452-456` whenever the checkpoint states a gate
+  # lower bound — both KDA classes do — the linear-attention backend is the
+  # default triton, deterministic inference and two-batch overlap are off,
+  # and the prefill CUDA graph is not FULL), and `recurrent_kda` folds the
+  # gate, beta and BOTH q/k l2norms into the recurrence itself
+  # (`use_qk_l2norm_in_kernel=True`, `use_gate_in_kernel=True`,
+  # `beta_is_logit=True`, kernels/kda_flashinfer_prefill.py:117-133). That
+  # whole span is the `fused_recurrent_kda{,_per_channel}` prefill entries
+  # below; this gate-only launch is what the Triton chunk path runs
+  # elsewhere.
   fused_kda_gate:
     source_anchor: "sglang.kernels.ops.attention.fla.kda.kda_gate_chunk_cumsum (python/sglang/kernels/ops/attention/fla/kda.py:1059), from python/sglang/srt/layers/attention/linear/kda_backend.py:1126 via chunk_kda python/sglang/kernels/ops/attention/fla/kda.py:1274"
     when:
       phase: [prefill]
       device: [cuda]
+      below_compute_capability: "10.0"
       architectures: [Glm5NextForConditionalGeneration, KimiK3ForConditionalGeneration]
   # KDA decode (GLM-5.3-Flash): gate + beta + q/k l2norm + recurrence in one
   # Triton launch (srt/layers/attention/linear/kernels/kda_triton.py:141 ->
   # kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py, from
   # kda_backend.py:981). Kimi-K3's per-channel gate has its own entries
   # below (`fused_kda_decode`, `fused_recurrent_kda_per_channel`).
+  #
+  # The second entry is PREFILL on SM100 / SM103, where the same span — the
+  # two l2norms, the gate, beta and the recurrence — is one FlashInfer
+  # launch (`FlashInferKDAPrefillKernel.extend` ->
+  # `flashinfer.kda.recurrent_kda`, srt/layers/attention/linear/kernels/
+  # kda_flashinfer_prefill.py:117-133, which passes
+  # `use_qk_l2norm_in_kernel`, `use_gate_in_kernel` and `beta_is_logit`).
+  # sglang takes it by its own default on those two capabilities
+  # (kda_backend.py:74-95, the kernel itself refusing any other,
+  # kda_flashinfer_prefill.py:76-78); below them the Triton chunk path runs
+  # the gate alone (`fused_kda_gate`) and the l2norms apart. Billed on the
+  # default path of the phase: a one-token extend falls back to Triton
+  # (`effective_extend_kernel`, kda_backend.py:405-412).
   fused_recurrent_kda:
-    source_anchor: "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update(is_kda=True), from python/sglang/srt/layers/attention/linear/kda_backend.py:981 via python/sglang/srt/layers/attention/linear/kernels/kda_triton.py:141"
-    when:
-      phase: [decode]
-      architectures: [Glm5NextForConditionalGeneration]
+    - source_anchor: "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update(is_kda=True), from python/sglang/srt/layers/attention/linear/kda_backend.py:981 via python/sglang/srt/layers/attention/linear/kernels/kda_triton.py:141"
+      when:
+        phase: [decode]
+        architectures: [Glm5NextForConditionalGeneration]
+    - source_anchor: "flashinfer.kda.recurrent_kda, from FlashInferKDAPrefillKernel.extend (python/sglang/srt/layers/attention/linear/kernels/kda_flashinfer_prefill.py:117-133), sglang's own prefill default on SM100/SM103 (python/sglang/srt/layers/attention/linear/kda_backend.py:74-95, selected at python/sglang/srt/layers/attention/attention_registry.py:452-456)"
+      when:
+        phase: [prefill]
+        device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "11.0"
+        architectures: [Glm5NextForConditionalGeneration]
   # Kimi-K3 KDA decode, plain (non-speculative) steps. The whole mixer is
   # one JIT launch, `kda_fused_decode` (kernels/ops/attention/
   # kda_fused_decode.py:112, `covered()` :54-109 — heads and shapes :63-86,
@@ -342,12 +390,24 @@ op_implementations:
       activation_dtype: [bf16]
       dims: { n_verify: [1], d_lin_k_head: [128], s_conv_kernel: [4] }
       world_local: { world: tp_attention, dim: n_lin_v_heads, local_in: [12] }
+  # Kimi-K3's per-channel gate: the Triton plain-decode span, and — on
+  # SM100 / SM103 — the same span in prefill as ONE FlashInfer launch, for
+  # the reason `fused_recurrent_kda` states just above (the K3 hook pins
+  # only the DECODE backend to triton, srt/arg_groups/kimi_k3_hook.py:58-78,
+  # and leaves the prefill default alone).
   fused_recurrent_kda_per_channel:
-    source_anchor: "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update(is_kda=True), from python/sglang/srt/layers/attention/linear/kda_backend.py:981 via python/sglang/srt/layers/attention/linear/kernels/kda_triton.py:141"
-    when:
-      phase: [decode]
-      architectures: [KimiK3ForConditionalGeneration]
-      dims: { n_verify: [1] }
+    - source_anchor: "sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent.fused_sigmoid_gating_delta_rule_update(is_kda=True), from python/sglang/srt/layers/attention/linear/kda_backend.py:981 via python/sglang/srt/layers/attention/linear/kernels/kda_triton.py:141"
+      when:
+        phase: [decode]
+        architectures: [KimiK3ForConditionalGeneration]
+        dims: { n_verify: [1] }
+    - source_anchor: "flashinfer.kda.recurrent_kda, from FlashInferKDAPrefillKernel.extend (python/sglang/srt/layers/attention/linear/kernels/kda_flashinfer_prefill.py:117-133), sglang's own prefill default on SM100/SM103 (python/sglang/srt/layers/attention/linear/kda_backend.py:74-95, selected at python/sglang/srt/layers/attention/attention_registry.py:452-456)"
+      when:
+        phase: [prefill]
+        device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "11.0"
+        architectures: [KimiK3ForConditionalGeneration]
   # The three KDA short convs as one causal-conv launch over the packed
   # q|k|v row. sglang's KDA backend takes the layer's one packed filter
   # (`conv_weights`) and convolves the packed row in one call whatever the
@@ -584,7 +644,7 @@ op_implementations:
   fused_qk_rope:
     source_anchor: "sglang.srt.layers.rotary_embedding.base.RotaryEmbedding.forward_cuda (python/sglang/srt/layers/rotary_embedding/base.py:390-412, apply_rope_with_cos_sin_cache_inplace at python/sglang/srt/layers/rotary_embedding/base.py:405)"
     when:
-      excluded_architectures: [DeepseekV4ForCausalLM, DeepseekV41ForCausalLM]
+      excluded_architectures: [DeepseekV4ForCausalLM]
   # Absorbed-MLA decode: the latent KV-row scatter and the [q_nope | q_rope]
   # query concat in one launch, `set_mla_kv_concat_q`
   # (kernels/ops/attention/set_mla_kv_concat_q.py:123), from
@@ -723,9 +783,9 @@ op_implementations:
   # compress_old.py:271, srt/layers/attention/dsv4/compressor.py:151). The
   # latent-KV and compressor launches have the same boundary and share the
   # `fused_norm_rope` plan; its id names the cache-writing one. CUDA paths;
-  # HIP / NPU have their own kernels. A V4.1 checkpoint's class is remapped
-  # to `DeepseekV4ForCausalLM` (srt/configs/deepseek_v41.py:38-39), so both
-  # checkpoint classes are listed: V4.1's latent KV takes the same
+  # HIP / NPU have their own kernels. sglang serves a V4.1 checkpoint with
+  # this same class (`architecture_served_as` at the head of this file), and
+  # the entry covers both: V4.1's latent KV takes the same
   # `_compute_kv_to_cache` store (srt/models/deepseek_v4.py:1421-1462), and
   # its query has no head norm (`fused_q_norm_rope(eps=None)`, :1389-1409),
   # which `fused_qnorm_rope`'s pattern does not match.
@@ -738,32 +798,106 @@ op_implementations:
   # 3086-3101 prefill, :3121-3125 decode, launch :3262) when
   # `use_fused_compress` (dsv41_sparse.py:101-134: CUDA, capability major
   # >= 10), while below SM100 the same chain runs as torch ops
-  # (:3352-3385). One plan id carries one condition, so this entry states the
-  # chain it does run — the role the spec declares for the norm it binds,
-  # `attention` / `attention_swa` for the latent and `attention_compressor`
-  # for the compressor, never the indexer's `attention_indexer`. V4.1's
-  # indexer key is therefore billed as its five nodes on every SM: more
-  # launches than sglang runs on SM100+, never a grouping it does not run.
+  # (:3352-3385). This entry is not that launch — the role the spec declares
+  # for the norm it binds is `attention` / `attention_swa` for the latent
+  # and `attention_compressor` for the compressor, never the indexer's
+  # `attention_indexer` — and the index key has its own entry below
+  # (`fused_compress_norm_rope_store`), which states that capability. Below
+  # SM100 the index key is billed as its five nodes.
   #
-  # V4.1's low-ratio compressor POOL is not fused below SM100 either, and no
-  # plan here groups it: `_low_ratio_compress_torch` (deepseek_v4_backend.py:
+  # Below SM100 the low-ratio compressor POOL is not fused either, and no
+  # plan here groups it there: `_low_ratio_compress_torch` (deepseek_v4_backend.py:
   # 3273-3309) gathers the open group's carried rows from the compress state
   # (`_low_ratio_pair_partners`, :3311-3330) and runs `pool_pairs` — softmax,
   # multiply, sum as eager ops (dsv41_sparse.py:169-171). So on an H100 the
   # spec's `weighted` multiply is a real sglang launch, and it is the
   # recurrent state's carrier: no `mul` kernel takes the state, and the cell
-  # is a counted gap (docs/known_limitations.md §4.4).
+  # is a counted gap (docs/known_limitations.md §4.4). On SM100+ that pool
+  # runs inside the one compressor launch (`fused_save_compress_norm`
+  # and its decode spelling, below).
   fused_qnorm_rope:
     source_anchor: "sglang.kernels.ops.attention.dsv4.elementwise.fused_q_norm_rope (python/sglang/kernels/ops/attention/dsv4/elementwise.py:171)"
     when:
-      architectures: [DeepseekV4ForCausalLM, DeepseekV41ForCausalLM]
+      architectures: [DeepseekV4ForCausalLM]
       device: [cuda]
   fused_norm_rope:
     source_anchor: "sglang.kernels.ops.attention.dsv4.elementwise.fused_k_norm_rope_flashmla (python/sglang/kernels/ops/attention/dsv4/elementwise.py:307)"
     when:
-      architectures: [DeepseekV4ForCausalLM, DeepseekV41ForCausalLM]
+      architectures: [DeepseekV4ForCausalLM]
       device: [cuda]
       roles: { norm: [attention, attention_swa, attention_compressor] }
+  # ---- DeepSeek-V4.1's low-ratio compressor and index key on SM100+ ----
+  # `fused_low_ratio_compress_supported()` is CUDA capability major >= 10
+  # (srt/layers/attention/dsv4/dsv41_sparse.py:100-108), and it decides the
+  # whole shape of the compressor: the ratio-2 projection loads as one
+  # `wkv_gate` GEMM (dsv41_sparse.py:131-146, `project_fused` :161) and the
+  # compressed row is written by ONE launch —
+  # `c2_prefill_norm_rope_store` in an extend step,
+  # `c2_decode_norm_rope_store` in decode, `c1_decode_norm_rope_store` at
+  # ratio 1 (kernels/ops/attention/dsv4/low_ratio_compress.py, called from
+  # `_low_ratio_compress_fused`, srt/layers/attention/deepseek_v4_backend.py
+  # :3171-3215, dispatched at :3067-3101 and :3121-3125) — pool (ratio 2),
+  # RMSNorm, RoPE and the paged store together. Below SM100 the same chain
+  # is torch ops (`_low_ratio_compress_torch` :3273-3309, `pool_pairs`
+  # dsv41_sparse.py:169-171) plus `c2_decode_pool` in decode (:3146-3169),
+  # which is what the unfused nodes bill.
+  #
+  # TWO plans for that ONE launch, and the boundary between them is real
+  # rather than a scope accident. A single pool->norm->rope->store span was
+  # tried (`crosses: component`, which does resolve the store component's
+  # `latent` input to the compressor's norm leaf) and does not match,
+  # because the NORMED LATENT HAS READERS OUTSIDE THE SPAN: the indexer's
+  # `wk` reads it, and so does a later layer that borrows this one's
+  # compressed state (`csa2_compress_borrowed`). sglang materialises it for
+  # exactly the same reason — `_low_ratio_compress_fused` keeps the launch's
+  # return value and hands it to `index_k_norm_rope_pack_store`
+  # (deepseek_v4_backend.py:3171-3262). So the BYTES these two plans bill
+  # are the bytes sglang moves; what is billed one too many of is the launch
+  # boundary between them — more launches than the framework makes, never a
+  # grouping it does not make. vLLM really does run two launches there, and
+  # its binding states the same pair.
+  #
+  # The index key is a launch of its own in the same function:
+  # `index_k_norm_rope_pack_store` (kernels/ops/attention/dsv4/
+  # fp4_indexer_rope.py:53, launched at deepseek_v4_backend.py:3262) does
+  # k_norm + RoPE + FP4 pack + store. One entry covers it and the ratio-1
+  # compressor tail, whose `c1_decode_norm_rope_store` has the same
+  # boundary; the roles tell them from DeepSeek-V4's own compressor tail,
+  # which sglang does NOT store in the same launch
+  # (`compress_fused_norm_rope_inplace` ends at RoPE, see `fused_norm_rope`
+  # above), and `compress_ratio` tells V4.1's low-ratio layers (1 / 2) from
+  # V4's (4 / 128) — the same per-layer key sglang picks its indexer class
+  # by.
+  fused_save_compress_norm:
+    source_anchor: "sglang.kernels.ops.attention.dsv4.low_ratio_compress.c2_prefill_norm_rope_store (python/sglang/srt/layers/attention/deepseek_v4_backend.py:3204-3215), from _low_ratio_compress_fused (python/sglang/srt/layers/attention/deepseek_v4_backend.py:3171), taken where fused_low_ratio_compress_supported() holds (python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py:100-108)"
+    when:
+      architectures: [DeepseekV4ForCausalLM]
+      device: [cuda]
+      min_compute_capability: "10.0"
+      dims: { compress_ratio: [1, 2] }
+  fused_save_compress_norm_decode:
+    source_anchor: "sglang.kernels.ops.attention.dsv4.low_ratio_compress.c2_decode_norm_rope_store (python/sglang/srt/layers/attention/deepseek_v4_backend.py:3196-3203), from _low_ratio_compress_decode (python/sglang/srt/layers/attention/deepseek_v4_backend.py:3121-3125), taken where fused_low_ratio_compress_supported() holds (python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py:100-108)"
+    when:
+      architectures: [DeepseekV4ForCausalLM]
+      device: [cuda]
+      min_compute_capability: "10.0"
+      dims: { compress_ratio: [1, 2] }
+  fused_compress_rope_store:
+    source_anchor: "The rope + paged-store half of sglang's one low-ratio compressor launch: c2_prefill_norm_rope_store / c2_decode_norm_rope_store (python/sglang/srt/layers/attention/deepseek_v4_backend.py:3196-3215), from _low_ratio_compress_fused (python/sglang/srt/layers/attention/deepseek_v4_backend.py:3171) under fused_low_ratio_compress_supported() (python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py:100-108)"
+    when:
+      architectures: [DeepseekV4ForCausalLM]
+      device: [cuda]
+      min_compute_capability: "10.0"
+      dims: { compress_ratio: [1, 2] }
+  fused_compress_norm_rope_store:
+    source_anchor: "sglang.kernels.ops.attention.dsv4.fp4_indexer_rope.index_k_norm_rope_pack_store (python/sglang/kernels/ops/attention/dsv4/fp4_indexer_rope.py:53), launched for the index key at python/sglang/srt/layers/attention/deepseek_v4_backend.py:3262; the ratio-1 compressor tail is c1_decode_norm_rope_store (python/sglang/srt/layers/attention/deepseek_v4_backend.py:3186-3195), both under fused_low_ratio_compress_supported() (python/sglang/srt/layers/attention/dsv4/dsv41_sparse.py:100-108)"
+    crosses: component
+    when:
+      architectures: [DeepseekV4ForCausalLM]
+      device: [cuda]
+      min_compute_capability: "10.0"
+      roles: { norm: [attention_indexer, attention_compressor] }
+      dims: { compress_ratio: [1, 2] }
   # Partial RoPE: `RotaryEmbedding.forward_cuda` views `q[..., :rotary_dim]`
   # and rotates it in place with `apply_rope_with_cos_sin_cache_inplace`
   # (srt/layers/rotary_embedding/base.py:398-412); the spec's slice / re-join
@@ -781,7 +915,7 @@ op_implementations:
   fused_qk_rope_partial_q:
     source_anchor: "sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha (python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mha.py:248-250) -> RotaryEmbedding.forward_cuda (python/sglang/srt/layers/rotary_embedding/base.py:405)"
     when:
-      excluded_architectures: [DeepseekV4ForCausalLM, DeepseekV41ForCausalLM]
+      excluded_architectures: [DeepseekV4ForCausalLM]
   # Ungrouped top-K routers on CUDA, one launch each: `select_experts`
   # (srt/layers/moe/topk.py:2545) → the Triton router `moe_fused_gate`
   # (kernels/ops/moe/moe_fused_gate.py:337) — sigmoid / sqrt-softplus with the
@@ -1050,31 +1184,89 @@ op_implementations:
   # the next collapse and the norm into ONE launch
   # (`mhc_post_combine_norm_prefill`, :625-648; at <= 384 rows on Blackwell
   # the post alone is `mhc_post_split_h`, no post+collapse fusion exists
-  # there); the H100 default billed here runs them as the two plans below.
+  # there) — that launch is `mhc_post_combine_norm` below, bound on
+  # Blackwell; SM90 keeps the two plans after it.
   # The stack exit is `hc_combine` with the last carried pre plus the model
   # RMSNorm (deepseek_v4.py:4530-4540) — the same reduce + norm shape as the
   # epilogue, but it sits on the model outside every block occurrence, so
   # the component-crossing pattern cannot reach it and it bills naive; the
   # 23rd epilogue the rewrite bills (22 seams + 1) is dspark_stage_last's
   # in-block exit, not this one.
+  # `block_reads_stream: false` on the two SAME-SUBLAYER entries. sglang
+  # serves a V4.1 checkpoint with this same class, but
+  # `hc_pre_from_prev_sublayer` (configs/deepseek_v41.py:47) sets
+  # `use_fused_mhc_post_pre = False` (deepseek_v4.py:2804-2806) and the
+  # shifted schedule runs other launches (the stats launch, the post, the
+  # collapse+norm). Both graphs flatten the copies before the mix GEMM, so
+  # the patterns alone do not separate them — but the SCHEDULE is a graph
+  # fact: a shifted block collapses with the pre-mix the previous sublayer
+  # published and declares that carried stream
+  # (`components/library/dsv41_hc_block.yaml`, `reads: [hc_pre_mix]`),
+  # while DeepSeek-V4's and GLM-5.3-Flash's blocks declare none. That is
+  # what this asks, so the entry holds for any checkpoint whose block
+  # computes its own pre-mix and for none that carries one.
   mhc_fused_post_pre:
     source_anchor: "sglang.kernels.ops.layernorm.mhc.mhc_fused_post_pre (python/sglang/kernels/ops/layernorm/mhc.py:1631), small-token path mhc_fused_post_pre_fma_tilelang (python/sglang/kernels/ops/layernorm/mhc.py:1391)"
     crosses: component
     when:
       architectures: [DeepseekV4ForCausalLM, Glm5NextForConditionalGeneration]
+      block_reads_stream: false
       phase: [decode]
       device: [cuda]
+  # DeepSeek-V4.1's seam as ONE launch on Blackwell: the post, the next
+  # sublayer's collapse of the copies by the carried pre, and that
+  # sublayer's RMSNorm — `mhc_post_combine_norm_prefill`
+  # (kernels/ops/layernorm/mhc_post_combine_norm_prefill.py:33), taken by
+  # `_post_fusion` (srt/models/deepseek_v4_mhc.py:589, branch :625-648) and
+  # reached from both sublayer posts (`run_attn_post` :653-686,
+  # `run_moe_post` :688-751). `min_compute_capability: "10.0"` is sglang's
+  # `is_blackwell` (majors 10, 11, 12 — srt/utils/common.py:290); the rest
+  # of the branch is the DEFAULT deployment this binding describes
+  # (`attn_dp_size == 1`, no context-parallel prefill) and the checkpoint's
+  # own geometry (hidden 5120, 4 copies, `hc_pre_from_prev_sublayer`,
+  # configs/deepseek_v41.py:47 — the shifted schedule only V4.1 runs, which
+  # is why this entry names the checkpoint class rather than the class
+  # sglang dispatches on).
+  #
+  # ROW COUNT, stated rather than asked: the branch serves 4096-65536 rows,
+  # and there is no token-count condition key — the plan is walked once and
+  # re-read at every batch, so a key over `y.shape[0]` would be answered by
+  # a width the walk left symbolic. `phase: [prefill]` is how that window is
+  # billed: a prefill chunk is 4096 tokens and inside it, while a decode
+  # step is billed at the small-token path of its phase
+  # (`docs/inference_cost_model.md`, the Fusion section) — under 4096 rows
+  # sglang runs the unfused pair there, and a decode batch large enough to
+  # enter the window is billed one launch more than it runs. Above 65536
+  # rows a prefill chunk is likewise billed one launch short; no served
+  # chunk size this repository describes reaches it. A seam whose next
+  # boundary is closed (the last layer, and a layer before an Engram one,
+  # `bind_next` deepseek_v4.py:2873-2878) takes the plain post too.
+  #
+  # NOT the collective form: `run_moe_post`'s
+  # `moe_finalize_all_reduce_mhc_post{,_combine_norm_quant}` (:706-751) and
+  # `run_attn_post`'s `all_reduce_mhc_post_combine_norm` (:666-686) need
+  # `_can_fuse_attn_mhc` / `_can_fuse_ffn_mhc`, both of which require a TP
+  # world of exactly 4 (deepseek_v4.py:3324-3343); at TP8 they never fire,
+  # so the all-reduce stays its own node.
+  mhc_post_combine_norm:
+    source_anchor: "sglang.kernels.ops.layernorm.mhc_post_combine_norm_prefill.mhc_post_combine_norm_prefill (python/sglang/kernels/ops/layernorm/mhc_post_combine_norm_prefill.py:33, JIT kernel python/sglang/kernels/jit/csrc/deepseek_v4/mhc_post_combine_norm_prefill.cuh), from _post_fusion (python/sglang/srt/models/deepseek_v4_mhc.py:625-648), reached from run_attn_post (python/sglang/srt/models/deepseek_v4_mhc.py:653) and run_moe_post (python/sglang/srt/models/deepseek_v4_mhc.py:688)"
+    crosses: component
+    when:
+      architectures: [DeepseekV41ForCausalLM]
+      phase: [prefill]
+      device: [cuda]
+      min_compute_capability: "10.0"
   mhc_post:
     source_anchor: "sglang.kernels.ops.layernorm.mhc.mhc_post_tilelang (python/sglang/kernels/ops/layernorm/mhc.py:1311), the large-token first launch of mhc_fused_post_pre (python/sglang/kernels/ops/layernorm/mhc.py:1759) and the stack exit; DeepSeek-V4.1: `post` (python/sglang/srt/models/deepseek_v4_mhc.py:452), TileLang mhc_post by default, mhc_post_split_h at small rows"
     crosses: component
     when:
-      architectures: [DeepseekV4ForCausalLM, DeepseekV41ForCausalLM, Glm5NextForConditionalGeneration]
+      architectures: [DeepseekV4ForCausalLM, Glm5NextForConditionalGeneration]
       device: [cuda]
   mhc_pre_big_fuse:
     source_anchor: "sglang.kernels.ops.layernorm.mhc.mhc_pre_big_fuse_with_norm_tilelang (python/sglang/kernels/ops/layernorm/mhc.py:936); DeepSeek-V4.1: hc_combine_norm (python/sglang/kernels/ops/layernorm/hc_combine_norm.py, from `_combine` python/sglang/srt/models/deepseek_v4_mhc.py:394) — the reduce + norm half of the span, its coefficient generation billed with the stats launch"
     crosses: component
     when:
-      architectures: [DeepseekV4ForCausalLM, DeepseekV41ForCausalLM, Glm5NextForConditionalGeneration]
+      architectures: [DeepseekV4ForCausalLM, Glm5NextForConditionalGeneration]
       device: [cuda]
   # DeepSeek-V4.1's mix stats over the already-flattened stream — one launch
   # for the projection AND the Sinkhorn split, billed as the pre-mix
@@ -1091,6 +1283,7 @@ op_implementations:
     crosses: component
     when:
       architectures: [DeepseekV4ForCausalLM, Glm5NextForConditionalGeneration]
+      block_reads_stream: false
       device: [cuda]
   # A bare RMSNorm whose one reader is a quantised GEMM's activation cast.
   # sglang does NOT fuse this under block FP8: its norm runs on its own

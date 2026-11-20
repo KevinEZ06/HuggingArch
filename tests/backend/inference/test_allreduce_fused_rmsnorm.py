@@ -1,5 +1,10 @@
 """Fused all-reduce + RMSNorm plan: registration, TP matching, input order.
 
+The walks here are DECODE steps: vLLM runs this launch inside the FlashInfer
+all-reduce workspace's token bound, which a prefill chunk exceeds and a decode
+batch does not, so the binding states `phase: [decode]` and a prefill walk
+bills the all-reduce and the norm apart.
+
 Covers:
   * `allreduce_fused_rmsnorm` plan is registered and bound to both
     vllm and sglang.
@@ -83,13 +88,20 @@ class TestTPSwitchesBetweenNormFusions(unittest.TestCase):
             cls.resolved_by_id[mid] = shared_loader().match(cfg, model_id=mid)
         cls.binding = get_binding("vllm")
 
-    def _matches(self, resolved, parallel: ParallelConfig) -> Counter:
+    def _matches(self, resolved, parallel: ParallelConfig,
+                 phase: str = "decode") -> Counter:
         result = analyze(
             resolved,
             parallel=parallel,
             framework_binding=self.binding,
             batch_size=1,
-            avg_input_tokens=1, avg_output_tokens=0,
+            # A decode step by default: vLLM's fused all-reduce + norm runs
+            # inside the FlashInfer workspace's token bound, which a decode
+            # batch fits and a prefill chunk does not (the binding states it
+            # as `phase: [decode]`; `test_prefill_keeps_them_apart` is the
+            # other half).
+            phase=phase,
+            avg_input_tokens=128, avg_output_tokens=1,
             breakdown=False,
         )
         # Launches within one layer: a launch across the layer seam pairs
@@ -137,6 +149,22 @@ class TestTPSwitchesBetweenNormFusions(unittest.TestCase):
                     f"at TP>1; the 3-node variant consumes the chain",
                 )
 
+    def test_prefill_keeps_them_apart(self):
+        """The other half of `phase: [decode]`: a prefill chunk is past the
+        FlashInfer all-reduce workspace's token bound at a serving TP, so
+        vLLM runs the all-reduce and the norm as separate launches and the
+        two-node `fused_add_rmsnorm` takes the residual add + norm. A walk
+        that fused it here would claim a launch vLLM does not run."""
+        pc = ParallelConfig(tp_attention=8, tp_dense_ffn=8)
+        for mid in self.MODELS:
+            with self.subTest(model=mid):
+                matches = self._matches(self.resolved_by_id[mid], pc,
+                                        phase="prefill")
+                self.assertEqual(matches.get("allreduce_fused_rmsnorm", 0), 0,
+                                 f"{mid}: a prefill chunk is past the cap")
+                self.assertGreaterEqual(
+                    matches.get("fused_add_rmsnorm", 0), 1, mid)
+
     def test_llama_tp8_one_attention_one_ffn_pattern(self):
         # Llama has a clean 2-block (attn + ffn) template; the
         # all_reduce after o_proj is followed by add+rmsnorm
@@ -150,7 +178,8 @@ class TestTPSwitchesBetweenNormFusions(unittest.TestCase):
             parallel=pc,
             framework_binding=self.binding,
             batch_size=1,
-            avg_input_tokens=1, avg_output_tokens=0,
+            phase="decode",
+            avg_input_tokens=128, avg_output_tokens=1,
             breakdown=False,
         )
         matches = Counter(m["fused_op"] for m in result.fusion_matches)
@@ -183,7 +212,8 @@ class TestTPSwitchesBetweenNormFusions(unittest.TestCase):
         result = analyze(
             self.resolved_by_id["deepseek-ai/DeepSeek-V3"],
             parallel=pc, framework_binding=self.binding,
-            batch_size=1, avg_input_tokens=1, avg_output_tokens=0,
+            batch_size=1, phase="decode",
+            avg_input_tokens=128, avg_output_tokens=1,
             breakdown=False,
         )
 

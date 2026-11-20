@@ -4,6 +4,7 @@ import { FormulaHover } from "../FormulaHover";
 import type { FormulaDef, FormulaFields } from "../tooltip";
 import type { PrecisionReport } from "../precision";
 import type { MeasuredCoverage } from "../measured";
+import type { CommChoice } from "../comm";
 import type { CitedAnchor } from "../SourceAnchor";
 
 /** The four bounds of the row roofline (`row_roofline.BOUNDS`). */
@@ -178,6 +179,12 @@ export type ModuleFoldRow = {
   comm_bw_label?: string;
   comm_bw_bytes_per_sec?: number;
   comm_phases?: CommPhase[];
+  /** The envelope this collective was priced under: which algorithms the
+   *  fabric was offered, which one won, each one's own sentence and stages,
+   *  and each feasible one's priced curve. Absent on a payload from a
+   *  backend that does not publish it yet — the Communication card then has
+   *  nothing to draw and draws nothing. */
+  comm_choice?: CommChoice;
   /** Output shapes of a multi-output leaf — a list of shape lists from
    *  per-op timing, or a port-name → shape map from the shape layer. */
   shape_outs?: unknown[] | Record<string, unknown>;
