@@ -829,13 +829,17 @@ class WhatACollectiveCellIsKeyedOn(unittest.TestCase):
         """The property the axis exists for, asserted on the real lookup
         and not on two strings being unequal.
 
-        The corpus holds intra-host collective rows and nothing else. A
-        deployment whose group leaves the chassis must come away with NO
-        measurement — falling back to the roofline — rather than being
-        handed the intra-host row because its key happens to omit an axis
-        the asking key carries. An absent axis is the DEFAULT (host), never
-        a wildcard that matches every reach, and the difference between
-        those two readings is a cross-fabric collective priced at HCCS.
+        An absent axis is the DEFAULT (host), never a wildcard matching
+        every reach. So a group that left the chassis must not be handed
+        an intra-host row just because that row's key omits the axis the
+        asking key carries — the difference between those two readings is
+        a cross-fabric collective priced on HCCS.
+
+        The corpus now holds rows of BOTH reaches, so this asks the
+        question at a reach nothing was measured at (`scaleout`) as well
+        as at one that was (`scaleup`): the first must miss every row, and
+        the second must not be answered by the chassis rows that share its
+        payload and world.
         """
         import csv
         from backend.inference.op_calibration import (
@@ -848,7 +852,7 @@ class WhatACollectiveCellIsKeyedOn(unittest.TestCase):
             CalibrationRegistry(), [dict(r) for r in rows],
             source="<test>", origin="shared")
 
-        host_keys = [BenchmarkKey.from_csv_row(r).to_physical() for r in rows]
+        import json
 
         def timing(key):
             return physical_time_for(
@@ -856,13 +860,22 @@ class WhatACollectiveCellIsKeyedOn(unittest.TestCase):
                 current_peak_tflops_at=lambda *_a, **_k: 248.4,
                 current_peak_bw_gbps=1600.0)
 
-        # The corpus answers for the reach it was taken at ...
+        def reach_of(row):
+            return json.loads(row["shape_json"]).get(COMM_DOMAIN_AXIS)
+
+        host_rows = [r for r in rows if reach_of(r) is None]
+        host_keys = [BenchmarkKey.from_csv_row(r).to_physical()
+                     for r in host_rows]
+        self.assertTrue(host_keys, "no intra-host collective rows to ask about")
+
+        # The corpus answers for the reach each row was taken at ...
         hit = [k for k in host_keys if timing(k) is not None]
         self.assertTrue(hit, "no intra-host collective row answered at all, "
                              "so a miss below would prove nothing")
 
-        # ... and for no other.
-        import json
+        # ... and a chassis row never answers for a group that left it.
+        # `scaleout` is asked too: nothing has been measured there, so
+        # every one of these must miss outright.
         for reach in (COMM_REACH_SCALEUP, COMM_REACH_SCALEOUT):
             for key in host_keys:
                 crossing = replace(key, shape_json=json.dumps(
@@ -870,25 +883,45 @@ class WhatACollectiveCellIsKeyedOn(unittest.TestCase):
                     separators=(",", ":"), sort_keys=True))
                 self.assertEqual(
                     registry.get_physical(crossing), [],
-                    f"{reach} key found an intra-host row")
+                    f"reach {reach} found a row keyed for another reach")
                 self.assertIsNone(
                     timing(crossing),
-                    f"{reach} group was handed an intra-host measurement")
+                    f"reach {reach} was handed a measurement of another")
 
-    def test_the_measured_corpus_still_keys_where_it_did(self):
-        """The 12 Ascend collective rows were all taken on one chassis
-        (the sheet row's note says every measurement on it is intra-node),
-        so not one of them may gain the axis."""
+    def test_the_measured_corpus_keys_each_row_at_its_own_reach(self):
+        """What the corpus says about where its rows were taken.
+
+        The chassis rows must key exactly as they did before the axis
+        existed -- they are the backward-compatibility claim, and not one
+        of them was re-measured to gain it. The rows taken across two
+        chassis of the supernode must carry `scaleup`, because a reader
+        that cannot tell them apart would answer a cross-fabric
+        deployment with a chassis measurement.
+        """
         import csv
+        import json
         from backend.inference.op_calibration import BenchmarkKey
         path = PROJECT_ROOT / "tests/golden/ascend_vllm_ascend.csv"
         with open(path, newline="") as handle:
-            rows = [r for r in csv.DictReader(handle)
-                    if r["op"] in COMM_OPS]
+            rows = [r for r in csv.DictReader(handle) if r["op"] in COMM_OPS]
         self.assertTrue(rows, "no collective rows to check")
+
+        chassis = crossing = 0
         for row in rows:
-            shape = BenchmarkKey.from_csv_row(row).to_physical().shape_json
-            self.assertNotIn(COMM_DOMAIN_AXIS, shape, row["op"])
+            stated = json.loads(row["shape_json"]).get(COMM_DOMAIN_AXIS)
+            keyed = BenchmarkKey.from_csv_row(row).to_physical().shape_json
+            if stated is None:
+                chassis += 1
+                self.assertNotIn(COMM_DOMAIN_AXIS, keyed, row["op"])
+            else:
+                crossing += 1
+                self.assertEqual(stated, COMM_REACH_SCALEUP, row["op"])
+                self.assertIn(f'"{COMM_DOMAIN_AXIS}":{COMM_REACH_SCALEUP}',
+                              keyed, row["op"])
+        self.assertTrue(chassis, "the chassis rows are the compatibility claim")
+        self.assertTrue(crossing, "no row records a group that crossed "
+                                  "machines, so nothing pins the axis on "
+                                  "real data")
 
 
 if __name__ == "__main__":
