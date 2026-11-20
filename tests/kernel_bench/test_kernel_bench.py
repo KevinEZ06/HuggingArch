@@ -1259,7 +1259,9 @@ class TestSwaAndAllreduceBecomeMeasurable:
         from backend.inference.op_signatures import get_signature
         from kernel_bench.providers.attention import _fa_window_size
         shape = [[1, 32, 128, 128], [1, 8, 128, 128]]
-        qk = [["q"], ["k"]]          # the operands' ports (`operand_ports`)
+        # the operands' ports (`operand_ports`): K and V are one tensor
+        # here (two operands), so the second fills both ports
+        qk = [["q"], ["k", "v"]]
         # The deployment's page, which every paged cell carries.
         page = {"kv_block_size": 16}
         windowed = json.loads(identity_shape_from_shape_in(
@@ -1315,7 +1317,9 @@ class TestSwaAndAllreduceBecomeMeasurable:
             attach_gqa_sinks, identity_shape_from_shape_in, row_invocation_dims)
         from backend.inference.op_signatures import get_signature
         shape = [[1, 32, 128, 128], [1, 8, 128, 128]]
-        qk = [["q"], ["k"]]          # the operands' ports (`operand_ports`)
+        # the operands' ports (`operand_ports`): K and V are one tensor
+        # here (two operands), so the second fills both ports
+        qk = [["q"], ["k", "v"]]
         page = {"kv_block_size": 16}
         base = identity_shape_from_shape_in("flash_attention", shape,
                                             spec_dims=page, operand_ports=qk)
