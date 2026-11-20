@@ -57,7 +57,7 @@ def _agree(dist, backend_dev):
         # The collective runs on the group's own backend, so the tensor
         # has to live where that backend sends from: HCCL and NCCL move
         # device memory, and a CPU tensor is not something they can read.
-        where = (backend_dev.tensor_device()
+        where = (backend_dev.tensor_device
                  if backend_dev is not None else "cpu")
         pair = torch.tensor([int(warmup), int(iters)], dtype=torch.int64,
                             device=where)

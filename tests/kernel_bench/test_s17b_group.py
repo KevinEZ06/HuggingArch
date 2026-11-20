@@ -220,3 +220,65 @@ class TestHcclIsAGroupKernel(unittest.TestCase):
             dtype_env={"activation": "bf16"}, phase="prefill", tp=1)
         reasons = list(p.refusals(inv, _env()))
         self.assertTrue(any(r.startswith("world:") for r in reasons), reasons)
+
+
+class TheRankWorkerAgreesOnSampleCounts(unittest.TestCase):
+    """`_agree` broadcasts rank 0's warmup/iters to the group.
+
+    It runs only inside a real process group, which is why the stub
+    children above cannot reach it — and why a plain attribute mistake in
+    it survived 842 passing tests and surfaced as `TypeError: 'str'
+    object is not callable` on sixteen dies at once. These exercise the
+    closure against fakes so the next one surfaces here instead.
+    """
+
+    class _Dev:
+        """A device backend with `tensor_device` as the PROPERTY it is."""
+        synced = False
+
+        @property
+        def tensor_device(self):
+            return "cpu"
+
+        def synchronize(self):
+            type(self).synced = True
+
+    class _Dist:
+        """A `torch.distributed` stand-in: rank 0's values win."""
+        def __init__(self, decided=(7, 11)):
+            self.decided = decided
+            self.seen = []
+
+        def broadcast(self, tensor, src=0):
+            self.seen.append((tuple(int(x) for x in tensor), src))
+            tensor[0], tensor[1] = self.decided
+
+    def test_it_takes_the_broadcast_counts(self):
+        from kernel_bench.rankworker import _agree
+        dist = self._Dist(decided=(7, 11))
+        dev = self._Dev()
+        agree = _agree(dist, dev)
+        self.assertEqual(agree(2, 60), (7, 11))
+        # What this rank proposed went in, and rank 0 is the source.
+        self.assertEqual(dist.seen, [((2, 60), 0)])
+        self.assertTrue(self._Dev.synced,
+                        "the broadcast must be synchronised before its "
+                        "values are read back off the device")
+
+    def test_without_a_group_there_is_nothing_to_agree(self):
+        from kernel_bench.rankworker import _agree
+        self.assertIsNone(_agree(None, self._Dev()))
+
+    def test_the_device_is_asked_for_a_string_not_called(self):
+        """The regression itself: `tensor_device` is a property, and
+        calling it raises rather than returning a device."""
+        from kernel_bench.rankworker import _agree
+        agree = _agree(self._Dist(), self._Dev())
+        try:
+            agree(2, 60)
+        except TypeError as exc:                      # pragma: no cover
+            self.fail(f"treated a device attribute as callable: {exc}")
+
+
+if __name__ == "__main__":
+    unittest.main()
