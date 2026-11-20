@@ -1180,3 +1180,84 @@ for _op in ("all_reduce", "all_gather", "reduce_scatter", "all_to_all"):
         serves=KernelSignature(signature=_op, activation=_ASCEND_FLOAT),
         world="n_comm_ranks",
     ))
+
+
+def _moe_token_unpermute_build(inv: Invocation, env: Env,
+                               inputs: Dict[str, Any]) -> BenchCase:
+    """vLLM-Ascend's MoE combine: `npu_moe_token_unpermute`.
+
+    With one expert rank the plugin registers AllGatherCommImpl alone, and
+    that implementation post-processes with this kernel — chosen over
+    `npu_moe_finalize_routing`, which the plugin documents as losing
+    accuracy (vllm_ascend/ops/fused_moe/moe_comm_method.py:216-226).
+
+    The cell's three operands map onto the kernel's three: the routed rows
+    it reads (`permuted_tokens`), the token each row returns to
+    (`sorted_indices`), and the weight each carries (`probs`). The kernel
+    reduces them back to token order, which is what `moe_combine` declares
+    its output to be, so `to_canonical` only widens for the comparison.
+
+    Whether that mapping is exactly right is not settled here: the
+    cross-check against the fp32 oracle is what settles it, and a provider
+    whose arithmetic differs will fail it rather than quietly contribute a
+    wrong number.
+    """
+    import torch
+    import torch_npu
+    x = inputs["x"].to(_torch_dtype(inv.dtype))
+    idx = inputs["idx"].to(torch.int32)
+    probs = inputs["w"].to(x.dtype)
+    tokens, width = int(inputs["tokens"]), int(x.shape[-1])
+    routed = int(x.shape[0])
+    # The cell states a weight PER ROUTED ROW and an index per routed row:
+    # `out[idx[r]] += x[r] * w[r]`, a scatter-add that says nothing about
+    # top-k slots (`refs._moe_combine_reference`). The kernel instead reads
+    # `probs` as `[tokens, topk]` and `sorted_indices` as the permutation
+    # into that layout, so the two are NOT the same array seen differently
+    # — the routed rows of a real cell are the expert-capacity total
+    # (8352 against 1024 tokens here), not `tokens * topk`.
+    #
+    # So the cell's routing is rebuilt in the kernel's layout: each token
+    # takes as many slots as the widest token needs, every row lands at
+    # its own slot, and the slots no row occupies carry weight zero and
+    # point at a parked row. A zero-weight slot contributes nothing to the
+    # sum, which is what makes the padding free of arithmetic consequence
+    # rather than merely small.
+    counts = torch.zeros(tokens, dtype=torch.int64, device=x.device)
+    order = torch.argsort(idx.to(torch.int64), stable=True)
+    sorted_tok = idx.to(torch.int64)[order]
+    # Position of each row within its own token's run.
+    ones = torch.ones_like(sorted_tok)
+    counts.index_add_(0, sorted_tok, ones)
+    topk = int(counts.max().item()) if routed else 1
+    starts = torch.cumsum(counts, 0) - counts
+    slot_of = torch.arange(routed, device=x.device, dtype=torch.int64) \
+        - starts[sorted_tok]
+    # `permuted_tokens` is read through `sorted_indices`, so the parked row
+    # is one past the real ones and the buffer carries a zero row for it.
+    padded = torch.cat(
+        [x, torch.zeros(1, width, dtype=x.dtype, device=x.device)], 0)
+    sorted_idx = torch.full((tokens * topk,), routed,
+                            dtype=torch.int32, device=x.device)
+    flat = sorted_tok * topk + slot_of
+    sorted_idx[flat] = order.to(torch.int32)
+    probs2d = torch.zeros(tokens * topk, dtype=x.dtype, device=x.device)
+    probs2d[flat] = probs[order]
+
+    def run():
+        return torch_npu.npu_moe_token_unpermute(
+            permuted_tokens=padded,
+            sorted_indices=sorted_idx,
+            probs=probs2d.reshape(tokens, topk),
+            restore_shape=torch.Size([tokens, width]),
+        )
+
+    return BenchCase(run=run, to_canonical=lambda o: o.float())
+
+
+register(Provider(
+    library="vllm_ascend", signature="moe_combine",
+    kernel_impl="npu_moe_token_unpermute", import_name="torch_npu",
+    serves=KernelSignature(signature="moe_combine", activation=_ASCEND_FLOAT),
+    build=_moe_token_unpermute_build,
+))
