@@ -37,6 +37,38 @@ def _align(dist, backend_dev):
     return align
 
 
+def _agree(dist, backend_dev):
+    """Rank 0's sample counts, for every rank of the group.
+
+    `time_callable` sizes warmup and samples against a budget using the
+    `per_call` IT measured, and that is a threshold test: ranks either
+    side of it choose different counts. Every sample is a barrier
+    (`_align`), so different counts deadlock the group until the reaper
+    kills it.
+
+    Broadcasting rank 0's keeps the sizing adaptive -- a slow cell still
+    has its budget cut -- while making it one decision instead of N.
+    """
+    if dist is None:
+        return None
+
+    def agree(warmup: int, iters: int):
+        import torch
+        # The collective runs on the group's own backend, so the tensor
+        # has to live where that backend sends from: HCCL and NCCL move
+        # device memory, and a CPU tensor is not something they can read.
+        where = (backend_dev.tensor_device()
+                 if backend_dev is not None else "cpu")
+        pair = torch.tensor([int(warmup), int(iters)], dtype=torch.int64,
+                            device=where)
+        dist.broadcast(pair, src=0)
+        if backend_dev is not None:
+            backend_dev.synchronize()
+        return int(pair[0].item()), int(pair[1].item())
+
+    return agree
+
+
 def _measure(cfg: Dict[str, Any], rank: int, world: int) -> Dict[str, Any]:
     from dataclasses import replace
 
@@ -46,11 +78,24 @@ def _measure(cfg: Dict[str, Any], rank: int, world: int) -> Dict[str, Any]:
 
     backend_dev = detect_backend()
     if backend_dev is not None:
-        backend_dev.set_device(rank)
+        # The die this process runs on is a LOCAL index into the dies the
+        # parent made visible, never the global rank: on the second node
+        # of a 32-rank group the global ranks are 16..31 and the visible
+        # dies are still 0..15. One node leaves the two equal, which is
+        # why this read as the rank for as long as there was one node.
+        backend_dev.set_device(int(os.environ.get("LOCAL_RANK", rank)))
 
     import torch.distributed as dist_mod
+    # A rendezvous that crosses machines can take much longer than one
+    # between siblings, and the default would give up under the group
+    # watchdog rather than beside it. One timeout, stated once.
+    timeout_s = float(cfg.get("timeout_s") or 0.0)
+    kwargs = {}
+    if timeout_s > 0:
+        from datetime import timedelta
+        kwargs["timeout"] = timedelta(seconds=timeout_s)
     dist_mod.init_process_group(
-        backend=cfg["backend"], rank=rank, world_size=world)
+        backend=cfg["backend"], rank=rank, world_size=world, **kwargs)
     dist = dist_mod
 
     env = detect_env()
@@ -76,6 +121,7 @@ def _measure(cfg: Dict[str, Any], rank: int, world: int) -> Dict[str, Any]:
         run_id=cfg.get("run_id") or "",
         box=cfg.get("box") or "",
         in_group=True, align=_align(dist, backend_dev),
+        agree=_agree(dist, backend_dev),
         on_row=rows.append)
     if dist is not None:
         try:

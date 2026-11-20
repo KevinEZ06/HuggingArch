@@ -11,7 +11,7 @@ answered "no GPU" and every row it produced was a CPU wall-clock number
 wearing an accelerator's SKU."""
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from .device import DeviceBackend, detect_backend
 from .providers import LatencyStats
@@ -39,6 +39,7 @@ def time_callable(
     budget_s: float = TIME_BUDGET_S,
     device: Optional[DeviceBackend] = None,
     align: Optional[Callable[[], None]] = None,
+    agree: Optional[Callable[[int, int], Tuple[int, int]]] = None,
 ) -> LatencyStats:
     """Time `call`, reducing per-launch samples to p50/p95/mean microseconds.
     One sample per iteration so p95 surfaces tail / clock-throttle, not just a
@@ -123,6 +124,24 @@ def time_callable(
         # Spend a fifth of what is left on warmup, the rest on samples.
         remaining = max(1, affordable // 5)
         iters = max(3, affordable - remaining)
+
+    # In a group, the counts above must be the SAME on every rank. Each
+    # decided them from its own `per_call`, and the test is a threshold --
+    # so two ranks either side of it run different numbers of samples,
+    # while `align` makes every sample a collective. Unequal counts mean
+    # the faster rank leaves the barrier the slower one is still waiting
+    # on, and the group hangs until the reaper kills it: a timeout, not an
+    # error, which is the expensive way to find out.
+    #
+    # One node hid this because sibling ranks on one card measure nearly
+    # the same `per_call`. Across a fabric the spread is an order of
+    # magnitude wider and the threshold sits inside it.
+    #
+    # So rank 0's numbers win. Not a fixed constant: a cell whose launch
+    # is genuinely slow still gets its budget cut, and the cut is simply
+    # agreed rather than computed twice.
+    if agree is not None:
+        remaining, iters = agree(remaining, iters)
 
     # Host time to issue one call: how long the CPU takes to queue its
     # kernels, read off the warmup launches (no sync inside the measurement).

@@ -43,6 +43,14 @@ def _cmd_plan(argv: List[str]) -> int:
                          "{\"n_img\": 1, \"img_h\": 672, \"img_w\": 672}}' "
                          "(processed sizes; --seq is not read)")
     ap.add_argument("--tp", type=int, default=1)
+    ap.add_argument("--mode", default=None,
+                    help="the scaling mode --tp's degree deploys under "
+                         "(`parallel_sweep.ALL_MODES`: tp_tp, tp_ep, dp_ep, "
+                         "cp_ep). Omitted is tp_tp, pure tensor parallelism "
+                         "at that degree -- which is ep=1, so a MoE "
+                         "dispatch's all-to-all is not on the graph and no "
+                         "cell for it can be planned. An EP mode is what "
+                         "puts it there")
     ap.add_argument("--framework", default="vllm")
     ap.add_argument("--gpu", default=None,
                     help="the SKU a box plan is for; omitted produces a "
@@ -58,6 +66,24 @@ def _cmd_plan(argv: List[str]) -> int:
 
     from .plan import (build_jobs_with_unplaced, unplaced_by_reason,
                        unplaced_path, write_plan)
+
+    # `--mode` names the shape of the deployment `--tp`'s degree builds,
+    # and `config_for_degree` is where those shapes are already stated —
+    # the scaling sweep's own modes, not a second table of them here. The
+    # default stays what it was: `tp_tp`, which `plan` builds from `tp`
+    # alone, so an omitted flag changes nothing about any existing plan.
+    mode_parallel = None
+    if args.mode:
+        from backend.inference.parallel_sweep import ALL_MODES, config_for_degree
+        if args.mode not in ALL_MODES:
+            print(f"\nREFUSED: --mode {args.mode!r} is not a scaling mode "
+                  f"({', '.join(ALL_MODES)})")
+            return 2
+        if args.tp < 2:
+            print(f"\nREFUSED: --mode {args.mode} needs a degree to deploy "
+                  f"at; --tp is {args.tp}")
+            return 2
+        mode_parallel = config_for_degree(args.mode, args.tp)
 
     batches = [int(x) for x in args.batch.split(",") if x.strip()]
     seqs = [int(x) for x in args.seq.split(",") if x.strip()]
@@ -88,7 +114,8 @@ def _cmd_plan(argv: List[str]) -> int:
             jobs, _drp, records = build_jobs_with_unplaced(
                 model_id=args.model_id, batch_size=b, seq_len=s,
                 phase=args.phase, avg_output_tokens=args.output_tokens,
-                tp=args.tp, framework=args.framework, media=media,
+                tp=args.tp, parallel=mode_parallel,
+                framework=args.framework, media=media,
                 gpu=args.gpu,
             )
             all_jobs.extend(jobs)
@@ -253,6 +280,35 @@ def _cmd_run(argv: List[str]) -> int:
                          "carries n_comm_stride; this is the box mapping")
     ap.add_argument("--comm-origin", type=int, default=0,
                     help="first die of a collective group (default 0)")
+    ap.add_argument("--comm-domain", choices=("host", "scaleup", "scaleout"),
+                    default=None,
+                    help="how far this run's collective groups PHYSICALLY "
+                         "reach: one chassis, the scale-up domain it "
+                         "belongs to (an Ascend supernode over Lingqu, an "
+                         "NVLink rack), or past that. It keys the rows "
+                         "(`n_comm_domain`), because a payload and a world "
+                         "size do not say where the ranks were: 16 ranks "
+                         "are one chassis or two halves of two, an order "
+                         "of magnitude apart. Defaults to host on one node "
+                         "and is REQUIRED past one")
+    ap.add_argument("--nnodes", type=int, default=1,
+                    help="machines this group spans (default 1). Each runs "
+                         "its own `run` with the same --master-addr/-port "
+                         "and its own --node-rank; nothing here logs into "
+                         "another machine")
+    ap.add_argument("--node-rank", type=int, default=0,
+                    help="which machine this one is, 0-based, of --nnodes")
+    ap.add_argument("--master-addr", default="127.0.0.1",
+                    help="rendezvous address, routable from every node "
+                         "(default loopback, which is right for one node)")
+    ap.add_argument("--master-port", type=int, default=None,
+                    help="rendezvous port. Required past one node: a port "
+                         "picked here is not one another machine can guess")
+    ap.add_argument("--group-timeout", type=float, default=120.0,
+                    help="seconds a group may take to report (default 120). "
+                         "A rendezvous across machines is slower than one "
+                         "between siblings; the same number bounds HCCL's "
+                         "own watchdog")
     ap.add_argument("--append-output", action="store_true",
                     help=argparse.SUPPRESS)
     ap.add_argument("--measured-in", action="append", default=[],
@@ -333,6 +389,34 @@ def _cmd_run(argv: List[str]) -> int:
     # the file, so what is on disk is always usable as-is.
     # One sweep per physical card. Taken BEFORE the output file is opened so a
     # refused run doesn't truncate a file it will never write.
+    # Where this run's collective groups physically sit. The harness
+    # cannot see it: it knows the dies it was told to use on THIS box and
+    # nothing about whether a peer rank is down the hall. So it is stated,
+    # and the one unsafe default is refused rather than assumed.
+    #
+    # The trap is specific. A group of 16 on a 16-die chassis derives as
+    # `host` by world size alone, and that derivation is right for one
+    # machine and wrong for 8+8 across two — the same world, the same
+    # payload, a fabric an order of magnitude slower, and under the
+    # intra-host key it would overwrite nothing and simply lose to the
+    # chassis row in the envelope. Past one node the flag is required.
+    comm_domain = args.comm_domain
+    if int(args.nnodes or 1) > 1:
+        if comm_domain is None:
+            print("\nREFUSED: --comm-domain is required with --nnodes > 1: "
+                  "a group spanning machines must say whether it stayed "
+                  "inside the scale-up domain (scaleup) or left it "
+                  "(scaleout). Keyed as host it would be indistinguishable "
+                  "from a measurement taken on one chassis.")
+            return 2
+        if comm_domain == "host":
+            print("\nREFUSED: --comm-domain host with --nnodes "
+                  f"{args.nnodes}: a group placed on several machines did "
+                  "not stay inside one host, whatever its world size says.")
+            return 2
+    elif comm_domain is None:
+        comm_domain = "host"
+
     from .group import dies_for_jobs
     from .gpulock import GpuBusy, GpuLock
     group_dies = dies_for_jobs(jobs, stride=args.comm_stride,
@@ -428,6 +512,12 @@ def _cmd_run(argv: List[str]) -> int:
                        else os.environ.get("KERNEL_BENCH_BOX", ""),
                        comm_stride=args.comm_stride,
                        comm_origin=args.comm_origin,
+                       comm_domain=comm_domain,
+                       nnodes=int(args.nnodes or 1),
+                       node_rank=int(args.node_rank or 0),
+                       master_addr=args.master_addr,
+                       master_port=args.master_port,
+                       group_timeout=float(args.group_timeout or 120.0),
                        take_lock=False,
                        cross_check=not args.no_cross_check,
                        skip_existing=args.skip_existing,
@@ -1643,6 +1733,93 @@ def _cmd_keepalive(argv: List[str]) -> int:
         idle_limit=args.idle_limit if args.idle_limit is not None else keepalive.IDLE_LIMIT,
         burst_seconds=args.burst if args.burst is not None else keepalive.BURST,
         duty=args.duty if args.duty is not None else keepalive.DUTY)
+
+
+def _cmd_bwplan(argv: List[str]) -> int:
+    """Plan collective jobs at stated payload sizes — a fabric's bandwidth.
+
+    A model's plan asks what the MODEL sends, and that is the right
+    question for the corpus: those cells are the ones an estimate looks
+    up. It is the wrong question for a link's bandwidth, because the
+    payload is whatever the graph happens to produce. GLM-5.3-Flash's TP
+    all-reduce is 8 MiB, which on 16 dies reached 25.8 GB/s against a
+    196 GB/s cell — not a slow fabric, a small message: ring startup and
+    latency dominate until the payload is tens of MiB.
+
+    So these jobs are SYNTHETIC and say so. They carry no model, and
+    `bench run` should write them to their own file: they are evidence
+    about a link, to be read beside `gpu_specs.csv`, and they are not
+    cells any estimate will ever look up.
+    """
+    import argparse
+    import json as _json
+
+    ap = argparse.ArgumentParser(prog="hbench bwplan")
+    ap.add_argument("--op", default="all_reduce",
+                    help="collective signature (default all_reduce); "
+                         "repeatable as a comma list")
+    ap.add_argument("--world", type=int, required=True,
+                    help="ranks in the group")
+    ap.add_argument("--mib", default="8,64,128",
+                    help="payload sizes in MiB (default 8,64,128)")
+    ap.add_argument("--dtype", default="bf16")
+    ap.add_argument("--stride", type=int, default=1,
+                    help="the group's mesh spacing, as the cell states it")
+    ap.add_argument("-o", "--output", default="jobs_bw.jsonl")
+    args = ap.parse_args(argv)
+
+    from backend.arch.dtypes import DTYPE_BYTES
+    width = DTYPE_BYTES.get(args.dtype.upper())
+    if not width:
+        print(f"\nREFUSED: unknown dtype {args.dtype!r}")
+        return 2
+    ops = [o.strip() for o in args.op.split(",") if o.strip()]
+    sizes = [float(m) for m in args.mib.split(",") if m.strip()]
+
+    jobs = []
+    for op in ops:
+        for mib in sizes:
+            elems = int(mib * (1 << 20) // width)
+            # A collective's cell is its payload, its group and that
+            # group's spacing — the three `_collective_identity` reads.
+            # The reach is NOT stated here: `bench run --comm-domain`
+            # knows where the ranks were and this does not.
+            dims = {"n_comm_elems": elems,
+                    "n_comm_ranks": int(args.world),
+                    "n_comm_stride": int(args.stride)}
+            shape = _json.dumps(dims, separators=(",", ":"), sort_keys=True)
+            dtype_env = {"activation": args.dtype, "output": args.dtype}
+            jobs.append({
+                "signature": op, "op": op, "variant": {},
+                "dims": dims,
+                "shape_in": [elems], "shape_out": [elems],
+                "shape_weight": None,
+                "dtype_env": dtype_env,
+                "physical_key": [
+                    op, shape,
+                    _json.dumps(dtype_env, separators=(",", ":"),
+                                sort_keys=True),
+                    "prefill"],
+                "phase": "prefill", "tp": 1, "kernel_params": {},
+                "flops_per_rank": 0.0,
+                "access_bytes_per_rank": float(elems * width),
+                "launch_rows": elems, "launch_rows_exact": str(elems),
+                "routed": None,
+                # No model produced this shape, and a row that named one
+                # would claim a provenance it does not have.
+                "model": "", "spec_hash": "",
+                "node_spec_id": f"synthetic.bandwidth.{op}.{int(mib)}MiB",
+                "count_per_step": 1,
+            })
+
+    with open(args.output, "w", encoding="utf-8") as fh:
+        for job in jobs:
+            fh.write(_json.dumps(job) + "\n")
+    print(f"wrote {len(jobs)} synthetic jobs → {args.output} "
+          f"({len(ops)} op(s) x {len(sizes)} size(s), world={args.world})")
+    print("these are LINK evidence, not corpus cells: run them to their "
+          "own results file")
+    return 0
 
 
 def _commands() -> Dict[str, Callable[[List[str]], int]]:

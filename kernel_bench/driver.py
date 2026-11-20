@@ -17,6 +17,7 @@ ends and `run-all` records the implementation in flight as a `crash`.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -40,7 +41,8 @@ from .timing import TooSlowToMeasure, time_callable
 ComparedRecord = Union[str, "_quant.ActivationCast"]
 
 
-def physical_key_for(inv: Invocation, env: Env):
+def physical_key_for(inv: Invocation, env: Env,
+                     comm_domain: str = "host"):
     """The calibration `PhysicalKey` this invocation measures — the same
     library-agnostic key an estimate looks a measurement up under — read off
     the invocation rather than assembled again.
@@ -62,11 +64,39 @@ def physical_key_for(inv: Invocation, env: Env):
     signature, shape_json, dtype_env_json, phase = inv.physical_key
     return PhysicalKey(
         signature=signature,
-        shape_json=shape_json,
+        shape_json=_with_comm_domain(shape_json, comm_domain),
         dtype_env_json=dtype_env_json,
         gpu=env.gpu_sku or (env.device_name or "unknown"),
         phase=phase,
     )
+
+
+def _with_comm_domain(shape_json: str, comm_domain: str) -> str:
+    """Stamp a collective cell with how far its group physically reached.
+
+    The plan cannot know this and does not claim to: it states the world
+    and the mesh spacing, which are the deployment's, while WHERE those
+    ranks sat is the operator's — the same run plans identically whether
+    its 16 ranks are one chassis or two halves of two. So the placement
+    joins the key here, from the flag that stated it, and `host` adds
+    nothing: an absent axis IS intra-host (`_collective_identity`), which
+    is what keeps every row measured before this byte-identical.
+    """
+    if not comm_domain or comm_domain == "host" or not shape_json:
+        return shape_json
+    from backend.inference.op_signatures import COMM_DOMAIN_AXIS
+    try:
+        dims = json.loads(shape_json)
+    except (TypeError, ValueError):
+        return shape_json
+    # Only a collective has a group to place. A non-collective cell has no
+    # `n_comm_ranks`, and stamping one would invent an axis its signature
+    # never declared — the projection drops it, but the stored shape would
+    # carry a fact nothing produced.
+    if not isinstance(dims, dict) or "n_comm_ranks" not in dims:
+        return shape_json
+    return json.dumps({**dims, COMM_DOMAIN_AXIS: comm_domain},
+                      separators=(",", ":"), sort_keys=True)
 
 
 # Leave this share of free VRAM unclaimed by the oracle. The kernel still has to
@@ -328,8 +358,15 @@ def run_jobs(
     on_disable: Optional[Callable[[str, str], None]] = None,
     in_group: bool = False,
     align: Optional[Callable[[], None]] = None,
+    agree: Optional[Callable[[int, int], Any]] = None,
     comm_stride: int = 1,
     comm_origin: int = 0,
+    comm_domain: str = "host",
+    nnodes: int = 1,
+    node_rank: int = 0,
+    master_addr: str = "127.0.0.1",
+    master_port: Optional[int] = None,
+    group_timeout: float = 120.0,
     take_lock: bool = True,
 ) -> RunResult:
     """`on_row` is called with each row as soon as it exists — a measurement
@@ -422,7 +459,7 @@ def run_jobs(
                 result.skipped.append(note)
                 log(line)
 
-        pk = physical_key_for(inv, env)
+        pk = physical_key_for(inv, env, comm_domain)
         todo = []
         for p in provs:
             # Resolve the deployment kernel parameters first: it decides the
@@ -465,7 +502,9 @@ def run_jobs(
                 rows = measure_job(
                     job, env=env, stride=comm_stride, origin=comm_origin,
                     take_lock=take_lock, date=date, contributor=contributor,
-                    run_id=run_id, box=box)
+                    run_id=run_id, box=box, timeout_s=group_timeout,
+                    master_addr=master_addr, master_port=master_port,
+                    nnodes=nnodes, node_rank=node_rank)
             except GroupFailed as e:
                 result.failures.append(
                     f"{inv.op} {inv.dims}: group failed ({e})")
@@ -811,7 +850,7 @@ def run_jobs(
                             f"rel_err={xrel:.3g} cos={xcos:.5f}")
                         continue
                 try:
-                    stats = time_callable(case.run, align=align)
+                    stats = time_callable(case.run, align=align, agree=agree)
                 except TooSlowToMeasure as e:
                     # A `timeout`: one launch costs more than the whole timing
                     # budget, so this implementation cannot be sampled here.

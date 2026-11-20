@@ -186,6 +186,34 @@ def _reap(procs, queue, world: int, timeout_s: float) -> List[dict]:
     return reports
 
 
+def _hccl_net_env(master_addr: str, *, nodes: int) -> Dict[str, str]:
+    """`HCCL_IF_IP` / `HCCL_SOCKET_IFNAME` for a group that spans nodes.
+
+    Empty on one node: HCCL picks a loopback-reachable interface on its
+    own and naming one here would override a working default with a guess.
+    Across nodes the local address of the interface that routes to the
+    rendezvous is what the peers can reach, so it is read off the routing
+    table rather than assumed to be the first interface up.
+
+    An environment that already states either keeps it: an operator who
+    pinned the control plane knows something about the fabric this does
+    not.
+    """
+    if nodes <= 1:
+        return {}
+    out: Dict[str, str] = {}
+    if not os.environ.get("HCCL_IF_IP"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                # Connectionless: this selects a route and a source address
+                # without sending anything.
+                probe.connect((master_addr, 1))
+                out["HCCL_IF_IP"] = probe.getsockname()[0]
+        except OSError:
+            pass
+    return out
+
+
 def measure_job(
     job: dict,
     *,
@@ -200,11 +228,24 @@ def measure_job(
     contributor: str = "",
     run_id: str = "",
     box: str = "",
+    master_addr: str = "127.0.0.1",
+    master_port: Optional[int] = None,
+    nnodes: int = 1,
+    node_rank: int = 0,
 ) -> List[Dict[str, str]]:
-    """Run `job` on `n_comm_ranks` processes and return aggregated rows.
+    """Run a group over `n_comm_ranks` processes and return aggregated rows.
 
     `worker` is the child entry (tests inject a stub). The live entry is
     `rankworker.entry`.
+
+    One node by default, and then every rank of the group is a child of
+    this process — the arrangement every row measured so far was taken in.
+    At `nnodes > 1` this process owns only ITS SHARE: ranks
+    `node_rank * per_node` through the next `per_node`, on its own dies,
+    talking to the others over `master_addr:master_port`. Each node runs
+    this same call and writes its own rows; nothing here reaches across a
+    machine, because the two halves of a measurement meet in the corpus
+    and not in a socket this harness owns.
     """
     dims = job.get("dims") or {}
     if isinstance(dims, str):
@@ -212,7 +253,25 @@ def measure_job(
     n_ranks = int(dims.get("n_comm_ranks") or 0)
     if n_ranks < 2:
         raise GroupFailed(f"a group needs n_comm_ranks>=2, got {n_ranks}")
-    dies = dies_for(n_ranks, stride, origin)
+    nodes = max(int(nnodes or 1), 1)
+    if nodes > 1:
+        if n_ranks % nodes:
+            raise GroupFailed(
+                f"a group of {n_ranks} does not divide over {nodes} nodes; "
+                f"this harness places an equal share on each")
+        if not 0 <= int(node_rank) < nodes:
+            raise GroupFailed(
+                f"node_rank {node_rank} is not a node of {nodes}")
+        if master_addr in ("127.0.0.1", "localhost", ""):
+            raise GroupFailed(
+                "a group spanning nodes needs a --master-addr the other "
+                "nodes can reach; loopback is this machine only")
+        if not master_port:
+            raise GroupFailed(
+                "a group spanning nodes needs a fixed --master-port: a "
+                "port picked here is not one another node can guess")
+    local_ranks = n_ranks // nodes
+    dies = dies_for(local_ranks, stride, origin)
     lock = GpuLock(devices=dies) if take_lock else None
     procs: List = []
     if lock is not None:
@@ -222,7 +281,10 @@ def measure_job(
                       timeout_s=timeout_s, worker=worker,
                       extra_child_env=extra_child_env, procs=procs,
                       date=date, contributor=contributor,
-                      run_id=run_id, box=box)
+                      run_id=run_id, box=box,
+                      local_ranks=local_ranks,
+                      rank_offset=int(node_rank) * local_ranks,
+                      master_addr=master_addr, master_port=master_port)
     finally:
         _kill_all(procs)
         if lock is not None:
@@ -233,7 +295,10 @@ def _spawn(job: dict, *, env, n_ranks: int, dies: List[int],
            timeout_s: float, worker: Optional[Callable],
            extra_child_env: Optional[Dict[str, str]],
            procs: List, date: str = "", contributor: str = "",
-           run_id: str = "", box: str = "") -> List[Dict[str, str]]:
+           run_id: str = "", box: str = "",
+           local_ranks: Optional[int] = None, rank_offset: int = 0,
+           master_addr: str = "127.0.0.1",
+           master_port: Optional[int] = None) -> List[Dict[str, str]]:
     import multiprocessing as mp
 
     from .rankworker import entry as live_entry
@@ -241,23 +306,42 @@ def _spawn(job: dict, *, env, n_ranks: int, dies: List[int],
     target = worker or live_entry
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
-    port = _free_port()
+    # This node's share. One node: every rank, and `_free_port()` on
+    # loopback is right because the only peers are siblings of this
+    # process. Several: a port the other nodes were told, on an address
+    # they can route to.
+    here = int(local_ranks or n_ranks)
+    port = int(master_port) if master_port else _free_port()
     child_env = {
         "KERNEL_BENCH_IN_GROUP": "1",
-        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_ADDR": master_addr,
         "MASTER_PORT": str(port),
         "WORLD_SIZE": str(n_ranks),
         **visible_devices_env(getattr(env, "device", None), dies),
+        # Which interface HCCL's own control plane talks over. On one node
+        # it finds a usable one by itself; across nodes it has to be told,
+        # because the address the group rendezvous on is this host's and
+        # the default pick may be a link that does not reach the peer.
+        # The deployed stack states the same two (vLLM-Ascend's run
+        # templates set HCCL_IF_IP and HCCL_SOCKET_IFNAME together).
+        **_hccl_net_env(master_addr, nodes=n_ranks // max(here, 1)),
         **(extra_child_env or {}),
     }
     backend = dist_backend(getattr(env, "device", None))
-    for rank in range(n_ranks):
+    for local in range(here):
+        # The two numbers a rank needs and which are the same only on one
+        # node: RANK places it in the GROUP (and so decides what it holds,
+        # since `Invocation.seed_for_rank` draws the payload from it), and
+        # LOCAL_RANK places it on THIS BOX's visible dies. Setting the
+        # device from the global rank puts node 1 of a 32-rank group at
+        # device 16 of 16.
+        rank = rank_offset + local
         cfg = {
             "rank": rank,
             "world": n_ranks,
             "job": job,
             "backend": backend,
-            "child_env": {**child_env, "LOCAL_RANK": str(rank),
+            "child_env": {**child_env, "LOCAL_RANK": str(local),
                           "RANK": str(rank)},
             "env_device": getattr(env, "device", None),
             "env_library": getattr(env, "library", None),
@@ -270,6 +354,9 @@ def _spawn(job: dict, *, env, n_ranks: int, dies: List[int],
             # against `peak_bw_at_test`, so without this the group measures
             # correctly and then drops every row at schema validation.
             "peak_bw_gbps": getattr(env, "peak_bw_gbps", None),
+            # The child's rendezvous deadline, so HCCL's own watchdog and
+            # the reaper below are the same number rather than two.
+            "timeout_s": timeout_s,
             "date": date,
             "contributor": contributor,
             "run_id": run_id,
@@ -280,7 +367,11 @@ def _spawn(job: dict, *, env, n_ranks: int, dies: List[int],
         procs.append(proc)
     for proc in procs:
         proc.start()
-    reports = _reap(procs, queue, n_ranks, timeout_s)
+    # This node reaps ITS OWN children. Waiting for the whole group's
+    # worth of reports would hang on a node that holds half of it, and
+    # the other half's rows are not ours to write: each node emits its
+    # share and the corpus is where they meet.
+    reports = _reap(procs, queue, here, timeout_s)
     # One aggregated row per kernel_impl the children measured.
     by_impl: Dict[str, List[dict]] = {}
     for report in reports:
