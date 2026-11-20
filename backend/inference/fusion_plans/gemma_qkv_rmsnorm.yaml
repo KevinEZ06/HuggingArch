@@ -31,6 +31,10 @@ naive_pattern:
     q_norm: { op: rmsnorm,          inputs: [external.q], feeds: q }
     k_norm: { op: rmsnorm,          inputs: [external.k], feeds: k }
     v_norm: { op: rmsnorm_unscaled, inputs: [external.v], feeds: v }
+  # Gemma-4's `attention_k_eq_v` layers hand one tensor to K and V: read
+  # as K.
+  shared_ports:
+    v: k
   io_mapping:
     q:        external.q
     k:        external.k

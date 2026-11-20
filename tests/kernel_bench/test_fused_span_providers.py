@@ -43,6 +43,14 @@ def _plan(model_id, phase, framework):
     return jobs, dropped
 
 
+def _ports(*names):
+    """A fused launch's operand ports as a row names them (`operand_ports`):
+    one port per operand, or a tuple — in plan order — where one tensor
+    fills several."""
+    return [list(name) if isinstance(name, tuple) else [name]
+            for name in names]
+
+
 def _inv(signature, dims, phase="prefill"):
     return Invocation(op=signature, signature=signature, phase=phase,
                       dims=dict(dims), dtype_env={"activation": "bf16"}, tp=1)
@@ -488,7 +496,8 @@ class TestIndexerQRopeQuant:
                  {"B": 2, "n_heads": 32, "s_query": 1})):
             got = identity_shape_from_shape_in(
                 sig, shape_in, shape_out=shape_in[0],
-                spec_dims={"d_rope": 64})
+                spec_dims={"d_rope": 64},
+                operand_ports=_ports("q", "weights"))
             assert got is not None, sig
             assert json.loads(got) == {**want, "d_head": 128, "d_rope": 64}
 
@@ -1249,19 +1258,21 @@ class TestQkRmsnormRopeGate:
             identity_shape_from_shape_in)
         want = {"B": 2, "s_query": 1024, "n_heads": 24, "n_kv_heads": 2,
                 "d_head": 256, "d_rope": 64}
-        for op, shape_in in (
+        for op, shape_in, ports in (
                 ("fused_qk_rmsnorm_rope_gate",
-                 [[2, 24, 1024, 512], [2, 2, 1024, 256]]),
+                 [[2, 24, 1024, 512], [2, 2, 1024, 256]],
+                 _ports("q_gate", "k")),
                 ("fused_qk_rmsnorm_rope_gate_split_gain",
-                 [[2, 24, 1024, 512], [256], [2, 2, 1024, 256], [256]])):
+                 [[2, 24, 1024, 512], [256], [2, 2, 1024, 256], [256]],
+                 _ports("q_gate", "q_weight", "k", "k_weight"))):
             got = identity_shape_from_shape_in(
                 op, shape_in, shape_out=[2, 24, 1024, 256],
-                spec_dims={"d_rope": 64})
+                spec_dims={"d_rope": 64}, operand_ports=ports)
             assert got is not None and json.loads(got) == want, op
             # No rotation width on the leaf: no cell, not a guessed one.
             assert identity_shape_from_shape_in(
                 op, shape_in, shape_out=[2, 24, 1024, 256],
-                spec_dims={}) is None, op
+                spec_dims={}, operand_ports=ports) is None, op
 
     def test_the_launch_facts_are_declared_not_hidden_in_build(self):
         ps = [p for p in _providers(self.SIG) if p.library != "torch"]
@@ -1803,7 +1814,11 @@ def test_a_planned_job_builds_the_operands_the_graph_emits(model, phase, fw):
         built = build_inputs(get_ref(sig.name), inv, "meta")
         operands = (job["shape_in"] if isinstance(job["shape_in"][0], list)
                     else [job["shape_in"]])
-        for pos, layout in sig.engine_inputs:
+        # Each layout at the operand that fills its port (`at_ports`); a
+        # port the launch has no operand for is no tensor to compare.
+        for pos, layout in sig.at_ports(job["operand_ports"]).engine_inputs:
+            if pos >= len(operands):
+                continue
             emitted = math.prod(int(x) for x in operands[pos])
             got = built[layout.name].numel()
             assert got == emitted, (
@@ -4132,9 +4147,15 @@ class TestFusedNormSpans:
                 [[2, 1, 3840], [2, 1, 3840], [1]],
                 {"B": 2, "s_query": 1, "d_model": 3840}),
         }
+        ports = {"fused_eh_norm": _ports("inputs_embeds", "hidden"),
+                 "fused_q_kv_rmsnorm": _ports("q", "kv"),
+                 "gemma_qkv_rmsnorm": _ports("q", "k", "v"),
+                 "gemma_rmsnorm_residual_scalar": _ports(
+                     "x", "residual", "scalar")}
         for case, (shape_in, want) in cases.items():
             op = case.split("#")[0]
-            got = identity_shape_from_shape_in(op, shape_in)
+            got = identity_shape_from_shape_in(op, shape_in,
+                                               operand_ports=ports[op])
             assert got is not None and json.loads(got) == want, (case, got)
 
     @pytest.mark.regression          # walks three models
@@ -4714,17 +4735,21 @@ class TestDsaPrologue:
         from backend.inference.benchmark_identity import (
             identity_shape_from_shape_in)
         glm = [[2, 1, 2048], [2, 1, 512], [2, 1, 64]]
-        got = identity_shape_from_shape_in("fused_dsa_qkv_norm_rope", glm)
+        got = identity_shape_from_shape_in("fused_dsa_qkv_norm_rope", glm,
+                                           operand_ports=_ports("q", "kv",
+                                                              "k_pe"))
         assert json.loads(got) == {"B": 2, "s_query": 1, "d_q_lora": 2048,
                                    "d_kv_lora": 512, "d_rope": 64}
         # The indexer layer's top-k reset is no operand: its width is the
         # spec's, and without it the cell is not stated.
         indexer = [*glm, [2, 1, 128]]
+        ports = _ports("q", "kv", "k_pe", "index_key")
         assert identity_shape_from_shape_in(
-            "fused_dsa_qkv_norm_rope_indexer", indexer) is None
+            "fused_dsa_qkv_norm_rope_indexer", indexer,
+            operand_ports=ports) is None
         got = identity_shape_from_shape_in(
             "fused_dsa_qkv_norm_rope_indexer", indexer,
-            spec_dims={"n_topk_keys": 2048})
+            spec_dims={"n_topk_keys": 2048}, operand_ports=ports)
         assert json.loads(got)["n_topk_keys"] == 2048
 
     @pytest.mark.regression          # walks two models
@@ -4878,17 +4903,20 @@ class TestSparseAttentionRoutes:
         import json
         # The row keys the latent as stored (`stored_operands` drops the
         # broadcast head axis the walk marks headless).
+        # The latent is the span's K and its V, one operand of both ports.
         stored = [[2, 4, 1, 512], [2, 1152, 512], [2, 1, 288]]
+        ports = _ports("q", ("k", "v"), "mask")
         for shape_in in (stored,):
             dims = json.loads(_dsa_identity(
-                get_signature("mla_sparse_attention"), shape_in,
-                [2, 4, 1, 512], {"n_topk_keys": 2048, "d_kv_lora": 512}))
+                get_signature("mla_sparse_attention").at_ports(ports),
+                shape_in, [2, 4, 1, 512],
+                {"n_topk_keys": 2048, "d_kv_lora": 512}))
             assert (dims["s_kv"], dims["n_topk_keys"]) == (1152, 1152)
             inv = Invocation(op="flash_dsa", signature="mla_sparse_attention",
                              phase="decode", tp=1,
                              dims={**dims, "kv_block_size": 64},
                              dtype_env={"activation": "bf16", "kv": "bf16"},
-                             shape_in=shape_in)
+                             shape_in=shape_in, operand_ports=ports)
             inputs = build_inputs(get_ref("mla_sparse_attention"), inv, "cpu")
             assert tuple(inputs["c"].shape) == (2, 1152, 512)
             assert tuple(inputs["indices"].shape) == (2, 1, 1152)
@@ -5788,7 +5816,9 @@ class TestKdaWholeMixer:
         got = identity_shape_from_shape_in(
             "fused_kda_decode", kimi,
             spec_dims={"d_lin_k_head": 128, "d_lin_v_head": 128,
-                       "s_conv_kernel": 4})
+                       "s_conv_kernel": 4},
+            operand_ports=_ports("q", "k", "v", "forget_raw", "dt_bias",
+                               "a_log", "beta_raw", "out_gate_raw"))
         assert json.loads(got) == {
             "B": 2, "s_query": 1, "n_lin_k_heads": 96, "d_lin_k_head": 128,
             "n_lin_v_heads": 96, "d_lin_v_head": 128, "s_conv_kernel": 4}
@@ -5921,7 +5951,9 @@ class TestDsv41CompressStoreSpans:
             got = identity_shape_from_shape_in(
                 op, shape_in,
                 spec_dims={"compress_ratio": 2, "d_rope": 64,
-                           "kv_block_size": 64})
+                           "kv_block_size": 64},
+                operand_ports=(_ports("kv", "score")
+                             if op == "fused_save_compress_norm" else None))
             assert got is not None and json.loads(got) == want, (op, got)
 
     @pytest.mark.regression          # walks DeepSeek-V4.1 in two phases
@@ -6086,7 +6118,11 @@ class TestDsv4CompressorSpans:
             # and the deployment state them.
             spec = {"d_rope": 64, "kv_block_size": 64,
                     "compress_ratio": 128}
-            got = identity_shape_from_shape_in(op, shape_in, spec_dims=spec)
+            got = identity_shape_from_shape_in(
+                op, shape_in, spec_dims=spec,
+                operand_ports=(_ports("kv", "score") if op ==
+                             "fused_overlap_compress_norm_rope_store"
+                             else None))
             assert got is not None and json.loads(got) == want, (op, got)
 
     @pytest.mark.regression          # walks DeepSeek-V4-Flash
@@ -6433,12 +6469,13 @@ class TestGlmKpoolCompressStore:
         import json
         from backend.inference.benchmark_identity import (
             identity_shape_from_shape_in)
-        # GLM-5.3-Flash prefill: 256 pools of 4 keys, gate first, the bias
-        # table second, the keys last.
-        shape_in = [[2, 256, 4, 128], [4, 128], [2, 256, 4, 128]]
-        got = identity_shape_from_shape_in("fused_kpool_compress_store",
-                                           shape_in,
-                                           spec_dims={"kv_block_size": 64})
+        # GLM-5.3-Flash prefill: 256 pools of 4 keys, in the plan's port
+        # order — the keys, the gate, the bias table.
+        shape_in = [[2, 256, 4, 128], [2, 256, 4, 128], [4, 128]]
+        got = identity_shape_from_shape_in(
+            "fused_kpool_compress_store", shape_in,
+            spec_dims={"kv_block_size": 64},
+            operand_ports=_ports("keys", "gate", "pos_table"))
         want = {"B": 2, "s_slots": 256, "compress_ratio": 4,
                 "d_indexer_head": 128, "kv_block_size": 64}
         assert got is not None and json.loads(got) == want, got
@@ -6652,7 +6689,9 @@ class TestQsaIndexerSpans:
             got = identity_shape_from_shape_in(
                 op, shape_in,
                 spec_dims={"d_rope": 64, "compress_ratio": 4, "s_slots": 256,
-                           "kv_block_size": 64})
+                           "kv_block_size": 64},
+                operand_ports=_ports("q" if op == "qsa_index_q_norm_rope"
+                                   else "raw_key", "weight"))
             assert got is not None and json.loads(got) == want, (op, got)
 
     @pytest.mark.regression          # walks Qwen3.8-Flash-Next in both frameworks

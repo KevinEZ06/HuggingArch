@@ -30,6 +30,8 @@ naive_pattern:
     add:      { op: add,     inputs: [external.residual, norm.out] }
     scale:    { op: mul,     inputs: [add.out, external.scalar] }
   io_mapping:
+    mlp_out:  external.mlp_out
+    moe_out:  external.moe_out
     residual: external.residual
     scalar:   external.scalar
     output:   scale.out

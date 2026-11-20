@@ -140,11 +140,12 @@ class TestFusionRegistryEndpoint(unittest.TestCase):
             sorted(fa["naive_pattern"]["nodes"].keys()),
             ["apply", "score", "softmax"],
         )
-        # external_inputs is the unique ordered set the matcher will
-        # bind — the page lifts this directly into ELK input pills.
+        # external_inputs are the plan's input ports, in io_mapping order
+        # (`NaivePattern.input_ports`) — the optional mask and sinks too —
+        # which the page lifts directly into ELK input pills.
         self.assertEqual(
-            sorted(fa["naive_pattern"]["external_inputs"]),
-            ["k", "q", "v"],
+            fa["naive_pattern"]["external_inputs"],
+            ["q", "k", "v", "mask", "sinks"],
         )
         self.assertEqual(
             fa["naive_pattern"]["io_mapping"]["output"], "apply.out",

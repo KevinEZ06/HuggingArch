@@ -405,6 +405,10 @@ class PointRow:
     launch_shape_in: Any
     launch_shape_out: Any
     shape_weight: Any
+    #: The port each `launch_shape_in` operand fills
+    #: (`RowIdentity.operand_ports`), which a port-keyed signature reads
+    #: them by; None where they are read by position.
+    operand_ports: Any
     #: One launch's work: the walk's per-step numerators over
     #: `max(launches, 1) x cadence`. None when the row carries none.
     flops_per_launch: Optional[float]
@@ -731,6 +735,7 @@ def point_row_of(row: Mapping[str, Any], identity: RowIdentity,
         placement_reason=placement_reason,
         t_sol_s=float(row.get("t_sol_s") or 0.0),
         launch_shape_in=shape_in,
+        operand_ports=identity.operand_ports(row),
         launch_shape_out=shape_out or row.get("shape_outs"),
         shape_weight=identity.launch_weight(row),
         flops_per_launch=None if flops is None else float(flops) / billed,

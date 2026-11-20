@@ -186,7 +186,7 @@ class TestShippedSchemesLoad(unittest.TestCase):
                 pattern = scheme.naive_pattern
                 labels = [
                     *pattern.expanded_nodes(),
-                    *pattern.external_input_names(),
+                    *pattern.input_ports(),
                     *pattern.io_mapping,
                 ]
                 for label in labels:
@@ -216,13 +216,12 @@ class TestShippedSchemesLoad(unittest.TestCase):
             nodes["apply"].op_choices,
             ["attention_apply", "swa_attention_apply"],
         )
-        # Required externals use the lowercase q/k/v display names. The
-        # per-head sink is optional (softmax-with-sink only) and is not a
-        # required matcher bind.
-        self.assertEqual(
-            sorted(scheme.naive_pattern.external_input_names()),
-            ["k", "q", "v"],
-        )
+        # The ports, in io_mapping order: q/k/v the span always reads, then
+        # the mask and the per-head sink, which only some graphs carry.
+        self.assertEqual(scheme.naive_pattern.input_ports(),
+                         ("q", "k", "v", "mask", "sinks"))
+        self.assertEqual(scheme.naive_pattern.required_ports(),
+                         frozenset({"q", "k", "v"}))
         self.assertEqual(
             nodes["softmax"].optional_inputs, ["external.sinks"],
         )
@@ -1107,11 +1106,19 @@ naive_pattern:
     total: {{ op: sum_reduce, inputs: [scale.out] }}
   io_mapping:
     x:      external.x
-    output: {output}
+{w_port}    output: {output}
 """
 
+    def _pass_through(self, scale_inputs, output):
+        # Every port io_mapping declares is one a node reads (the loader's
+        # port rule), so `w` is a port only where the scale step reads it.
+        w_port = ("    w:      external.w\n"
+                  if "external.w" in scale_inputs else "")
+        return self._PASS_THROUGH.format(
+            scale_inputs=scale_inputs, output=output, w_port=w_port)
+
     def test_an_optional_pass_through_loads(self):
-        self._write("through.yaml", self._PASS_THROUGH.format(
+        self._write("through.yaml", self._pass_through(
             scale_inputs="act.out, external.w", output="total.out"))
         nodes = reload_fusion_schemes(str(self.tmp))["through"].naive_pattern.nodes
         self.assertTrue(nodes["scale"].optional)
@@ -1120,7 +1127,7 @@ naive_pattern:
     def test_an_optional_node_off_two_internal_edges_is_rejected(self):
         # Two internal inputs: eliding the node leaves its reader two
         # producers and no one edge to read through.
-        self._write("through.yaml", self._PASS_THROUGH.format(
+        self._write("through.yaml", self._pass_through(
             scale_inputs="act.out, act.out", output="total.out"))
         with self.assertRaises(ValueError) as ctx:
             reload_fusion_schemes(str(self.tmp))
@@ -1130,14 +1137,14 @@ naive_pattern:
         # A step the launch folds in that stands on the pattern's own input
         # — a router's gate temperature on the logits. Absent, its reader
         # reads that operand directly, so the pattern is well formed.
-        self._write("through.yaml", self._PASS_THROUGH.format(
+        self._write("through.yaml", self._pass_through(
             scale_inputs="external.x", output="total.out"))
         nodes = reload_fusion_schemes(str(self.tmp))["through"].naive_pattern.nodes
         self.assertTrue(nodes["scale"].optional)
         self.assertEqual(nodes["scale"].read_through(), "external.x")
 
     def test_an_optional_node_naming_a_port_is_rejected(self):
-        self._write("through.yaml", self._PASS_THROUGH.format(
+        self._write("through.yaml", self._pass_through(
             scale_inputs="act.out, external.w", output="scale.out"))
         with self.assertRaises(ValueError) as ctx:
             reload_fusion_schemes(str(self.tmp))

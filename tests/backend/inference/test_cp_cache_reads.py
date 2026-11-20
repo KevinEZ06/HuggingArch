@@ -494,6 +494,10 @@ def test_a_ulysses_reader_clips_head_fanout_to_its_own_heads():
         assert uly and uly.keys() == tp.keys(), snapshot
         for key, row in uly.items():
             signature = get_signature(op_signature(row["op"]))
+            if signature is not None:
+                # Its layouts at the ports the row's operands fill.
+                signature = signature.at_ports(row.get("operand_ports"),
+                                               op=row["op"])
             for index, fanout in sorted(_fanouts(row).items()):
                 operand = row["shape_in"][index]
                 axis = (None if signature is None

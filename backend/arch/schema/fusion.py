@@ -267,6 +267,16 @@ class NaivePattern(BaseModel):
     nodes: Optional[Dict[str, "PatternNode"]] = None
     parallel: Optional["ParallelPatternForm"] = None
     io_mapping: Dict[str, str]
+    #: `{port: port it may share a tensor with}`: an input port that some
+    #: graphs fill with the very tensor another port reads, which covers its
+    #: storage — absorbed MLA's V is the leading columns of the latent its K
+    #: is, Gemma-4's `k_eq_v` layers hand one tensor to both. One tensor of
+    #: two ports is one operand, read as the port it is shared WITH
+    #: (`FusedNode.operand_ports` lists that port first); two ports sharing
+    #: a tensor without this declaration are refused at the match
+    #: (`fusion._external_inputs`), so which port an operand is read as is
+    #: always stated, never an order.
+    shared_ports: Dict[str, str] = {}
 
     @model_validator(mode="after")
     def _validate(self) -> "NaivePattern":
@@ -310,7 +320,110 @@ class NaivePattern(BaseModel):
                         )
             self._check_optional_nodes()
             self._reject_interchangeable_ports()
+        self._check_input_ports()
+        self.collective()
+        ports = set(self.input_ports())
+        for port, covering in self.shared_ports.items():
+            if port not in ports or covering not in ports or port == covering:
+                raise ValueError(
+                    f"NaivePattern.shared_ports: {port!r} -> {covering!r} "
+                    f"must name two input ports ({sorted(ports)})")
+            if covering in self.shared_ports:
+                raise ValueError(
+                    f"NaivePattern.shared_ports: {covering!r} is itself "
+                    f"shared; a tensor is read as one port")
         return self
+
+    def _referenced_externals(self) -> List[str]:
+        """Every `external.<name>` the pattern reads, in reading order."""
+        refs = (list(self.parallel.shared_inputs) if self.parallel is not None
+                else [ref for pn in (self.nodes or {}).values()
+                      for ref in (*pn.inputs, *pn.optional_inputs)])
+        return list(dict.fromkeys(ref.partition(".")[2] for ref in refs
+                                  if ref.startswith("external.")))
+
+    def _check_input_ports(self) -> None:
+        """The fused op's input ports are declared once, in `io_mapping`:
+        every `external.<name>` the pattern reads is an entry there, keyed
+        by that same name. A launch's operands are named by them
+        (`operand_ports`), and a signature reads its operands by them, so an
+        external with no entry, or one keyed by another name, would be an
+        operand that two declarations name differently."""
+        for key, target in self.io_mapping.items():
+            head, _, tail = str(target).partition(".")
+            if head == "external" and tail != key:
+                raise ValueError(
+                    f"NaivePattern.io_mapping: port {key!r} maps to "
+                    f"{target!r}; an input port is keyed by its external's "
+                    f"name ({tail!r}).")
+        missing = [name for name in self._referenced_externals()
+                   if self.io_mapping.get(name) != f"external.{name}"]
+        if missing:
+            raise ValueError(
+                f"NaivePattern.io_mapping: the pattern reads "
+                f"{['external.' + n for n in missing]!r} but io_mapping "
+                f"declares no input port for them; every external is a port "
+                f"(`<name>: external.<name>`).")
+        unread = [key for key, target in self.io_mapping.items()
+                  if str(target).startswith("external.")
+                  and key not in self._referenced_externals()]
+        if unread:
+            raise ValueError(
+                f"NaivePattern.io_mapping: input port(s) {unread!r} name an "
+                f"external no pattern node reads.")
+
+    def required_ports(self) -> FrozenSet[str]:
+        """The input ports every launch of this plan fills: those a node
+        that is always there reads among its `inputs` (not an optional
+        node's, nor an `optional_inputs` slot)."""
+        if self.parallel is not None:
+            return frozenset(ref.partition(".")[2]
+                             for ref in self.parallel.shared_inputs)
+        return frozenset(ref.partition(".")[2]
+                         for pn in (self.nodes or {}).values()
+                         if not pn.optional
+                         for ref in pn.inputs if ref.startswith("external."))
+
+    def collective(self) -> bool:
+        """Whether the launch is a collective: a node of the subgraph runs a
+        communication op (`OpSpec.is_comm_op`). Its operand is then the flow
+        the collective moves, not the ports' tensors — the one answer the
+        launch (`FusedNode.is_comm_op`) and the signatures that measure it
+        (`op_signatures._check_operand_keys`) both read. A node that may run
+        a collective or not (an op choice of both kinds, or an optional
+        collective) would make that a fact of the match, and is refused."""
+        def runs_comm(form: Any) -> Optional[bool]:
+            """Whether `form` (a pattern node or the parallel form) runs a
+            collective, None where its op choices disagree."""
+            ops = [form.op] if form.op else list(form.op_choices or ())
+            comm = {op in OP_REGISTRY and OP_REGISTRY[op].is_comm_op
+                    for op in ops}
+            return comm.pop() if len(comm) == 1 else None
+
+        if self.parallel is not None:
+            # Every sibling of a parallel form runs; no member is optional.
+            forms = [(self.parallel, False)]
+        else:
+            forms = [(node, node.optional)
+                     for node in (self.nodes or {}).values()]
+        collective = False
+        for form, optional in forms:
+            comm = runs_comm(form)
+            if comm is None or (comm and optional):
+                raise ValueError(
+                    f"NaivePattern: a node choosing "
+                    f"{[form.op] if form.op else form.op_choices} "
+                    f"(optional: {optional}) may or may not be a collective; "
+                    f"whether the launch is one would be the match's, not "
+                    f"the plan's")
+            collective = collective or comm
+        return collective
+
+    def input_ports(self) -> Tuple[str, ...]:
+        """The fused op's input ports, in `io_mapping` order: the one order
+        a launch lists its operands in (`FusedNode.operand_ports`)."""
+        return tuple(key for key, target in self.io_mapping.items()
+                     if str(target).startswith("external."))
 
     def runs(self, op: str) -> bool:
         """Whether a node of this subgraph runs `op` — the question a
@@ -545,26 +658,6 @@ class NaivePattern(BaseModel):
         if self.parallel is not None:
             return {}
         return dict(self.nodes or {})
-
-    def external_input_names(self) -> List[str]:
-        """Return the ordered set of distinct `external.<name>` refs."""
-        seen: List[str] = []
-        if self.parallel is not None:
-            for ref in self.parallel.shared_inputs:
-                if ref.startswith("external."):
-                    name = ref[len("external."):]
-                    if name not in seen:
-                        seen.append(name)
-            return seen
-        for pn in self.expanded_nodes().values():
-            for inp in pn.inputs:
-                if inp.startswith("external."):
-                    name = inp[len("external."):]
-                    if name not in seen:
-                        seen.append(name)
-        return seen
-
-
 
 class FusionOpSpec(BaseModel):
     """Spec-scoped virtual op spec for declarative operator fusion.

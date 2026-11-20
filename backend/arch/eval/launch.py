@@ -132,6 +132,13 @@ class FusedNode:
     #: and repeat scope. For a launch across a seam, the reading layer's
     #: member that reads the formal; otherwise the first origin.
     home_uid: Optional[int] = None
+    #: The plan's input ports each of `inputs_obj` fills
+    #: (`NaivePattern.input_ports`), aligned index for index, in the plan's
+    #: port order: `(k, v)` where one tensor is both (an MLA latent), its
+    #: ports in plan order too, and a port no tensor fills (an optional
+    #: mask) is absent. Which operand is which is this, not where an
+    #: operand stands.
+    operand_ports: Tuple[Tuple[str, ...], ...] = ()
     @property
     def home(self) -> int:
         """The origin this launch runs with (`home_uid`; the first origin

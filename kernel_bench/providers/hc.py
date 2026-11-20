@@ -113,13 +113,13 @@ The three vLLM Qwen4Exp entries go through the module-level wrappers
 (registered at hc.py:427-449), and that dispatch is part of the call the
 model makes.
 
-OPERAND ORDER IS DECLARED, NOT DERIVED — and nothing here reads it at run
-time. Each span's `engine_inputs` in `op_signatures_catalog.py` states the
-engine's emission of its operands as `(position, layout)` pairs, which is
-what that field is for: a permute or a pack is a declaration, and
-registration rejects a malformed one at import. The frameworks' argument
-order is a separate fact, true of the call rather than of the graph, and it
-lives here — at the call.
+OPERANDS ARE NAMED, NOT ORDERED — and nothing here reads an order at run
+time. Each span's `engine_inputs` in `op_signatures_catalog.py` names the
+engine's operands by the plan port each fills (`(port, layout)` pairs, the
+ports its plan's `io_mapping` declares), which is what that field is for: a
+permute or a pack is a declaration, and registration rejects a malformed one
+at import. The frameworks' argument order is a separate fact, true of the
+call rather than of the graph, and it lives here — at the call.
 
 Three of the five permute between the two, which is why every provider below
 takes its operands BY NAME out of `inputs`:
@@ -140,9 +140,8 @@ A positional splat would read correct and compute a different function, and
 the only thing between that and a published row is the numerical cross-check.
 Do not reorder the contract to match a framework, or a framework's call to
 match the contract: they answer different questions and each is written where
-it is true. The plan's `io_mapping` answers a third question — which nodes of
-the naive subgraph get absorbed — and is not an operand order at all, so it
-is not comparable to either.
+it is true. The plan's `io_mapping` answers a third — which tensor of the
+graph is which operand — and the engine names its operands by it.
 
 Import-guarded: library imports are lazy inside `build`.
 """

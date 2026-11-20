@@ -1773,6 +1773,25 @@ def compute_per_op_timing(
                 shape_in_val = _inputs(shape)
             elif m.get("tensor_shape"):
                 shape_in_val = [int(v) for v in m["tensor_shape"]]
+            # The ports of its plan each operand of a fused launch fills
+            # (`FusedNode.operand_ports`, in plan order per operand); None for
+            # a primitive op, read by position, and for a collective's launch
+            # (`FusedNode.is_comm_op`, its plan's `collective()`), whose
+            # operand is the flow it moves. The operands are the rewrite's
+            # boundary shapes, built from the same list as the ports
+            # (`rebase_shapes`), so the two are aligned — checked here, where
+            # a reader would otherwise pair a port with the wrong tensor.
+            operand_ports_val: Optional[List[List[str]]] = None
+            if isinstance(node, FusedNode) and node.operand_ports and not is_comm:
+                operand_ports_val = [list(ports) for ports in node.operand_ports]
+                operands = (shape_in_val if shape_in_val
+                            and isinstance(shape_in_val[0], list)
+                            else [shape_in_val] if shape_in_val else [])
+                if len(operands) != len(operand_ports_val):
+                    raise ValueError(
+                        f"{node.display_path}: {len(operands)} operands but "
+                        f"{len(operand_ports_val)} named ports; a port would "
+                        f"name another operand's tensor")
             shape_in_full_val: Optional[List[Any]] = None
             semantic_in = _inputs(full_shape)
             if semantic_in and shape_in_val and semantic_in != shape_in_val:
@@ -1993,6 +2012,9 @@ def compute_per_op_timing(
                 "is_comm": is_comm,
                 "count_per_step": cnt,
                 "shape_in": shape_in_val,
+                # The ports of its plan each `shape_in` operand fills
+                # (`FusedNode.operand_ports`), aligned with `shape_in`.
+                "operand_ports": operand_ports_val,
                 "shape_in_exact": _inputs(shape, exact=True),
                 "shape_law": shape_law,
                 # The shape columns are this walk's, at its own batch

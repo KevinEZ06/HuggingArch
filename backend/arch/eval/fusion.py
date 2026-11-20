@@ -635,29 +635,66 @@ def _writing_leaves(program: Any, node: Any) -> Iterator[Tuple[Any, str]]:
         yield (leaf.uid, written or "out")
 
 
+def _input_ports(pattern: Any, bound: Mapping[str, Any]
+                 ) -> Dict[Tuple[int, int], str]:
+    """`(member uid, input index) -> port`: the `external.<name>` the plan
+    declares at each member input (`NaivePattern.input_ports`). A chain
+    pattern names every input of a bound node (`_bind` binds a node only
+    when its inputs line up with the declared refs); a parallel form names
+    each sibling's inputs by `shared_inputs`."""
+    out: Dict[Tuple[int, int], str] = {}
+    if pattern.parallel is not None:
+        names = [ref.partition(".")[2]
+                 for ref in pattern.parallel.shared_inputs]
+        for node in bound.values():
+            for index, name in enumerate(names):
+                out[(node.uid, index)] = name
+        return out
+    for pattern_name, node in bound.items():
+        spec = pattern.nodes[pattern_name]
+        for index, ref in enumerate((*spec.inputs, *spec.optional_inputs)):
+            head, _, tail = ref.partition(".")
+            if head == "external":
+                out[(node.uid, index)] = tail
+    return out
+
+
 def _external_inputs(members: Sequence[Any],
+                     ports: Mapping[Tuple[int, int], str],
+                     order: Sequence[str],
+                     shared: Mapping[str, str],
                      edges: Optional[Mapping[int, Tuple]] = None,
                      internal: FrozenSet[int] = frozenset(),
                      crossed: FrozenSet[Tuple[int, int]] = frozenset(),
-                     ) -> List[Tuple[int, int, Any]]:
-    """`(member_uid, input_index, ref)` for every edge entering the match from
-    outside, in member order, one entry per distinct outside producer.
+                     ) -> List[Tuple[int, int, Any, Tuple[str, ...]]]:
+    """`(member_uid, input_index, ref, ports)` for every tensor entering the
+    match from outside: one entry per distinct outside producer, named by
+    the plan's input ports it fills (`ports`, `_input_ports`), in the plan's
+    port order (`order`, `NaivePattern.input_ports`).
 
     The single source for the fused boundary's input side: `Fusion.rewrite`
-    stores the refs on the `FusedNode` and `rebase_analysis` reads the dims
-    off the same list, so the two views are aligned by construction. The
-    dedup is the fusion's own semantic — three parallel projections fused
-    into one kernel read their shared activation once, which is much of why
-    the kernel exists. `internal` names further nodes inside the launch
-    that no pattern node binds — the views a quantised write was read
-    through (`ViewChains.through`) — so an edge out of them is no input.
-    `crossed` names the formal reads a match bound across a seam
-    (`_Binding.crossed`): their producer is a member of the previous
+    stores the refs and their ports on the `FusedNode` and `rebase_analysis`
+    reads the dims off the same list, so the views are aligned by
+    construction. Which operand is which is the plan's declaration, not the
+    order the members' uids happen to sort in — that order differs between
+    a layer and a seam, and between two layers' templates.
+
+    The dedup is the fusion's own semantic — three parallel projections
+    fused into one kernel read their shared activation once, and an MLA
+    kernel reads the latent that is both its K and its V once — so one
+    entry can fill several ports (`{k, v}`). A port that two tensors fill
+    is refused: an operand is one tensor. `internal` names further nodes
+    inside the launch that no pattern node binds — the views a quantised
+    write was read through (`ViewChains.through`) — so an edge out of them
+    is no input. `crossed` names the formal reads a match bound across a
+    seam (`_Binding.crossed`): their producer is a member of the previous
     iteration, so they are no input either.
     """
     inside = {n.uid for n in members} | set(internal)
-    seen: set = set()
-    out: List[Tuple[int, int, Any]] = []
+    rank = {port: position for position, port in enumerate(order)}
+    first: Dict[Any, Tuple[int, int, Any]] = {}
+    named: Dict[Any, set] = {}
+    by_port: Dict[str, Any] = {}
     for member in sorted(members, key=lambda n: n.uid):
         resolved = (edges or {}).get(member.uid)
         for index, ref in enumerate(tuple(member.inputs_obj or ())):
@@ -671,6 +708,12 @@ def _external_inputs(members: Sequence[Any],
                         else (src.uid if src is not None else None))
             if isinstance(producer, int) and producer in inside:
                 continue
+            port = ports.get((member.uid, index))
+            if port not in rank:
+                raise ValueError(
+                    f"{member.display_path or member.name}: input {index} "
+                    f"enters the launch from outside but the plan names it "
+                    f"{port!r}, not one of its input ports {list(order)!r}")
             key = (
                 src.uid if src is not None else (
                     "alias",
@@ -678,11 +721,34 @@ def _external_inputs(members: Sequence[Any],
                 ),
                 ref.port or "out",
             )
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append((member.uid, index, ref))
-    return out
+            if by_port.setdefault(port, key) != key:
+                raise ValueError(
+                    f"{member.display_path or member.name}: port {port!r} "
+                    f"is filled by two tensors in one launch; an operand "
+                    f"is one tensor")
+            first.setdefault(key, (member.uid, index, ref))
+            named.setdefault(key, set()).add(port)
+    # A tensor of several ports is read as the one the others are declared
+    # to share it with (`NaivePattern.shared_ports`) — listed first, the
+    # rest after it in the plan's order (`OpSignature.at_ports`).
+    entries = []
+    for key, names in named.items():
+        if len(names) == 1:
+            entries.append((*first[key], tuple(names)))
+            continue
+        read = [name for name in names if name not in shared]
+        if len(read) != 1 or any(shared[name] != read[0]
+                                 for name in names if name != read[0]):
+            member, index, _ref = first[key]
+            raise ValueError(
+                f"uid {member} input {index}: one tensor fills the ports "
+                f"{sorted(names, key=rank.__getitem__)}, and its plan does "
+                f"not declare which it is read as (`shared_ports`: "
+                f"{dict(shared)})")
+        (read_as,) = read
+        rest = sorted(names - {read_as}, key=rank.__getitem__)
+        entries.append((*first[key], (read_as, *rest)))
+    return sorted(entries, key=lambda entry: rank[entry[3][0]])
 
 
 def _boundary_outputs(members: Sequence[Any],
@@ -1784,13 +1850,16 @@ class Fusion:
             sink_node = (
                 program.by_uid(named) if named is not None else None
             )
-            external = _external_inputs(member_nodes, edges, chain,
-                                        match.crossed)
+            external = _external_inputs(
+                member_nodes, _input_ports(pattern, bound),
+                pattern.input_ports(), pattern.shared_ports, edges, chain,
+                match.crossed)
             inputs.update(((next_uid, position), (member, index))
-                          for position, (member, index, _ref)
+                          for position, (member, index, _ref, _ports)
                           in enumerate(external))
             previous = match.previous
-            refs = tuple(ref for _m, _i, ref in external)
+            refs = tuple(ref for _m, _i, ref, _p in external)
+            operand_ports = tuple(ports for _m, _i, _r, ports in external)
             if previous:
                 # A launch across a seam stands in the reading iteration and
                 # reads, on the graph, the formal it read there: what the
@@ -1813,7 +1882,7 @@ class Fusion:
                                   else ref.external_sid),
                               grafted=True)
                     if member in previous else ref
-                    for (member, _i, ref) in external)
+                    for (member, _i, ref, _p) in external)
             name = anchor.name
             display_path = anchor.display_path or anchor.name or ""
             if previous:
@@ -1845,9 +1914,10 @@ class Fusion:
                 sink=sink,
                 previous_iteration=previous,
                 home_uid=took.home,
-                is_comm_op=any(
-                    m.op in OP_REGISTRY and OP_REGISTRY[m.op].is_comm_op
-                    for m in member_nodes),
+                operand_ports=operand_ports,
+                # Its plan's answer (`NaivePattern.collective`): one fact,
+                # which the signatures that measure the launch read too.
+                is_comm_op=pattern.collective(),
                 in_dispatch_zone=_routed_span(program, member_nodes),
                 # The fused op's own output contract (`allocates_output` of
                 # its plan): this launch writes a buffer of its own.
@@ -2583,9 +2653,18 @@ def rebase_shapes(
         sources = []
         for member_uid, index in (rows[(fused_uid, pos)] for pos in positions):
             shape = pre.get(member_uid)
-            if shape is not None and index < len(shape.ins):
-                ins.append(shape.ins[index])
-                sources.append((member_uid, index))
+            if shape is None or index >= len(shape.ins):
+                # One operand per ref and per named port
+                # (`FusedNode.inputs_obj`, `operand_ports`): an operand
+                # dropped here would hand every later port the tensor
+                # before it.
+                raise ValueError(
+                    f"fused uid {fused_uid} ({fused.op}): operand "
+                    f"{len(ins)} reads input {index} of uid {member_uid}, "
+                    f"which has no shape row; its refs and ports would "
+                    f"name the operands after it")
+            ins.append(shape.ins[index])
+            sources.append((member_uid, index))
         output_ports = fused.output_ports
         exposed.update(output_ports)
         primary = next(

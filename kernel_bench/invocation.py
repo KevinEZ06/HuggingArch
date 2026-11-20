@@ -49,6 +49,13 @@ class Invocation:
     # the two fields above exist to remove, one operand class over. Per-rank:
     # under TP a kernel allocates its shard, not the whole tensor.
     shape_weight: Optional[Any] = None
+    # The ports of its plan each `shape_in` operand of a fused launch fills
+    # (the row's `operand_ports`, `FusedNode.operand_ports`). A signature that
+    # names a multi-port launch's operands by port reads them by these
+    # (`OpSignature.at_ports`); a job without them — planned before
+    # launches named their operands — is refused for such a signature and
+    # re-planned, since where its operands stand is no contract.
+    operand_ports: Optional[Any] = None
 
     # The measurement key this cell is, as the one key derivation stated it
     # (`calibration_overlay.point_keys` → `PointRow.key`, carried by the plan
@@ -325,6 +332,7 @@ class Invocation:
             phase=job.get("phase", "prefill"),
             tp=int(job.get("tp", 1)),
             shape_in=job.get("shape_in"),
+            operand_ports=job.get("operand_ports"),
             shape_out=job.get("shape_out"),
             shape_weight=job.get("shape_weight"),
             flops_per_rank=job.get("flops_per_rank"),

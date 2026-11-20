@@ -37,4 +37,5 @@ naive_pattern:
     k:       external.k
     v:       external.v
     sinks:   external.sinks
+    mask:    external.mask
     output:  apply.out

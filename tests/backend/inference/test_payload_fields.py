@@ -35,6 +35,19 @@ GOLDEN = Path(__file__).resolve().parents[2] / "golden" / "payload_fields.json"
 
 #: Paths the payload gained on purpose: `{path: why}`.
 ADDED = {
+    "per_op_timing[*].operand_ports":
+        "the ports of its plan each operand of a fused launch fills "
+        "(`FusedNode.operand_ports`, None for a primitive op or a collective's "
+        "flow): a signature reads a multi-port launch's operands by port, so "
+        "a row keys the same cell wherever its members' uids sort, and a "
+        "plan job carries them to the harness",
+    "per_op_timing[*].operand_ports[*][*]":
+        "the port names, one list per operand ({k, v} where one tensor is "
+        "both)",
+    "per_op_timing_decode[*].operand_ports":
+        "as for prefill",
+    "per_op_timing_decode[*].operand_ports[*][*]":
+        "as for prefill",
     "phases.decode.throughput.concurrent_requests":
         "the requests the cluster decodes at once (B per group × groups), "
         "the dimension a decode Pareto frontier is held at "

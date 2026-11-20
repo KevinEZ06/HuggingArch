@@ -80,8 +80,13 @@ naive_pattern:
       optional_inputs: [external.mask]
     softmax: { op: dsa_softmax,          inputs: [score.out] }
     apply:   { op: dsa_attention_apply,  inputs: [softmax.out, external.v] }
+  # Absorbed MLA's V is the leading columns of the latent its K is
+  # (GLM-5.3-Flash hands the one tensor to both): read as K.
+  shared_ports:
+    v: k
   io_mapping:
     q:       external.q
     k:       external.k
     v:       external.v
+    mask:    external.mask
     output:  apply.out

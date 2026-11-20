@@ -22,8 +22,8 @@ register_signature(OpSignature(
     # The engine lays attention operands head-first:
     # [B, n_heads, s_query, d_head].
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-        (1, TensorLayout("k", ("B", "n_kv_heads", "s_kv", "d_head"))),
+        ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+        ("k", TensorLayout("k", ("B", "n_kv_heads", "s_kv", "d_head"))),
     ),
     # Independent presence flags, none a tensor axis of the default cell:
     #   s_window      sliding-window FA (`window_size=(W-1, 0)`) vs full causal
@@ -158,8 +158,8 @@ register_signature(OpSignature(
     # spec declares; reading `d_kv_lora` to choose keyed a stale QSA plan's
     # per-head K as a latent and handed FlashMLA a 256-wide head.
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-        (1, TensorLayout("c", ("B", "s_kv", "d_head"))),
+        ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+        ("k", TensorLayout("c", ("B", "s_kv", "d_head"))),
     ),
     # The per-head geometry: K and V cached per KV head, each query head
     # reading its group's K and V — top-k GQA (Qwen QSA's split decode,
@@ -178,9 +178,9 @@ register_signature(OpSignature(
                      role="metadata"),
     ),
     variant_engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-        (1, TensorLayout("k", ("B", "n_kv_heads", "s_kv", "d_head"))),
-        (3, TensorLayout("v", ("B", "n_kv_heads", "s_kv", "d_v_head"))),
+        ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+        ("k", TensorLayout("k", ("B", "n_kv_heads", "s_kv", "d_head"))),
+        ("v", TensorLayout("v", ("B", "n_kv_heads", "s_kv", "d_v_head"))),
     ),
     # Each query reads min(s_kv, n_topk_keys) keys, not the whole cache.
     attends_at_most=("n_topk_keys",),
@@ -217,7 +217,7 @@ register_signature(OpSignature(
     structural_axes=("d_v_head",),
     shape_projection="dsa",
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+        ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
         # Hy4's graph broadcasts the one stored latent across the query
         # heads (`mla_dsa_gated_sink_attention`, absorbed as vLLM / sglang
         # serve it); this rank-4 layout says where that head axis is, so the
@@ -225,17 +225,17 @@ register_signature(OpSignature(
         # headless. The cell binds only the stored form, `[B, s_kv, d_head]`
         # (`_dsa_identity`): a rank-4 cache the walk did not mark is stored
         # per head, and this signature has no per-head geometry — no cell.
-        (1, TensorLayout("c", ("B", "n_heads", "s_kv", "d_head"))),
-        (1, TensorLayout("c", ("B", "s_kv", "d_head"))),
-        (3, TensorLayout("sinks", ("n_heads",))),
+        ("k", TensorLayout("c", ("B", "n_heads", "s_kv", "d_head"))),
+        ("k", TensorLayout("c", ("B", "s_kv", "d_head"))),
+        ("sinks", TensorLayout("sinks", ("n_heads",))),
         # The apply's value: the same stored latent's leading d_v_head
         # columns, broadcast across the query heads in the graph. Laid out
         # so the row's stored operands can drop that head axis as they do
         # the score's K; undeclared, the row published a per-head
         # [B, n_heads, s_kv, d_v_head] operand no launch reads and the
         # launch gate refused every decode build as measuring a part of it.
-        (4, TensorLayout("v", ("B", "n_heads", "s_kv", "d_v_head"))),
-        (4, TensorLayout("v", ("B", "s_kv", "d_v_head"))),
+        ("v", TensorLayout("v", ("B", "n_heads", "s_kv", "d_v_head"))),
+        ("v", TensorLayout("v", ("B", "s_kv", "d_v_head"))),
     ),
     attends_at_most=("n_topk_keys",),
     dtype_slots=("activation", "kv", "weight"),
@@ -268,9 +268,9 @@ register_signature(OpSignature(
     # select and the run skipped every such job.
     shape_projection="dsa",
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-        (1, TensorLayout("k", ("B", "n_kv_heads", "s_kv", "d_head"))),
-        (4, TensorLayout("gate", ("B", "n_heads", "s_query", "d_head"))),
+        ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+        ("k", TensorLayout("k", ("B", "n_kv_heads", "s_kv", "d_head"))),
+        ("gate", TensorLayout("gate", ("B", "n_heads", "s_query", "d_head"))),
     ),
     dtype_slots=("activation", "kv"),
     doc=(
@@ -556,11 +556,11 @@ register_signature(OpSignature(
     # A_log, b (the gate chain) and v last (the recurrence's own input) —
     # [B, heads, s_query, d] for q and v, [B, s_query, HV] for a and b.
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_lin_k_heads", "s_query",
+        ("q", TensorLayout("q", ("B", "n_lin_k_heads", "s_query",
                                "d_lin_k_head"))),
-        (2, TensorLayout("a", ("B", "s_query", "n_lin_v_heads"))),
-        (5, TensorLayout("b", ("B", "s_query", "n_lin_v_heads"))),
-        (6, TensorLayout("v", ("B", "n_lin_v_heads", "s_query",
+        ("dt_raw", TensorLayout("a", ("B", "s_query", "n_lin_v_heads"))),
+        ("beta_raw", TensorLayout("b", ("B", "s_query", "n_lin_v_heads"))),
+        ("v", TensorLayout("v", ("B", "n_lin_v_heads", "s_query",
                                "d_lin_v_head"))),
     ),
     dtype_slots=("activation",),
@@ -615,12 +615,12 @@ register_signature(OpSignature(
     # gate f (position 2) flat; every one checked against its rank and
     # extent when the cell is zipped.
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_lin_k_heads", "s_query",
+        ("q", TensorLayout("q", ("B", "n_lin_k_heads", "s_query",
                                "d_lin_k_head"))),
-        (2, TensorLayout("f", ("B", "s_query",
+        ("forget_raw", TensorLayout("f", ("B", "s_query",
                                ("n_lin_v_heads", "d_lin_k_head")))),
-        (5, TensorLayout("b", ("B", "s_query", "n_lin_v_heads"))),
-        (6, TensorLayout("v", ("B", "n_lin_v_heads", "s_query",
+        ("beta_raw", TensorLayout("b", ("B", "s_query", "n_lin_v_heads"))),
+        ("v", TensorLayout("v", ("B", "n_lin_v_heads", "s_query",
                                "d_lin_v_head"))),
     ),
     dtype_slots=("activation",),
@@ -672,11 +672,11 @@ register_signature(OpSignature(
                      role="metadata"),
     ),
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "s_query",
+        ("q", TensorLayout("q", ("B", "s_query",
                                ("n_lin_k_heads", "d_lin_k_head")))),
-        (2, TensorLayout("v", ("B", "s_query",
+        ("v", TensorLayout("v", ("B", "s_query",
                                ("n_lin_v_heads", "d_lin_v_head")))),
-        (6, TensorLayout("b", ("B", "s_query", "n_lin_v_heads"))),
+        ("beta_raw", TensorLayout("b", ("B", "s_query", "n_lin_v_heads"))),
     ),
     dtype_slots=("activation",),
     doc=("Kimi-K3 KDA decode mixer, one launch: silu(causal_conv1d_update) on "
@@ -703,7 +703,7 @@ register_signature(OpSignature(
     ),
     # The fused node's operands: a, dt_bias, A_log, b.
     engine_inputs=(
-        (0, TensorLayout("a", ("B", "s_query", "n_lin_v_heads"))),
+        ("dt_raw", TensorLayout("a", ("B", "s_query", "n_lin_v_heads"))),
     ),
     dtype_slots=("activation",),
     doc=("Gated DeltaNet gate prep, one launch: g = -exp(A_log)·softplus("
@@ -742,8 +742,8 @@ register_signature(OpSignature(
     # split (A_log is not a layout: Kimi-K3's checkpoint stores it per
     # channel where GLM's is per head — see `fused_recurrent_kda`).
     engine_inputs=(
-        (3, TensorLayout("b", ("B", "s_query", "n_lin_v_heads"))),
-        (0, TensorLayout("f", ("B", "s_query",
+        ("beta_raw", TensorLayout("b", ("B", "s_query", "n_lin_v_heads"))),
+        ("forget_raw", TensorLayout("f", ("B", "s_query",
                                ("n_lin_v_heads", "d_lin_k_head")))),
     ),
     dtype_slots=("activation",),
@@ -769,8 +769,8 @@ register_signature(OpSignature(
         TensorLayout("dt_bias", ("n_lin_v_heads",), role="weight"),
     ),
     engine_inputs=(
-        (1, TensorLayout("a", ("B", "s_query", "n_lin_v_heads"))),
-        (4, TensorLayout("b", ("B", "s_query", "n_lin_v_heads"))),
+        ("dt_raw", TensorLayout("a", ("B", "s_query", "n_lin_v_heads"))),
+        ("beta_raw", TensorLayout("b", ("B", "s_query", "n_lin_v_heads"))),
     ),
     dtype_slots=("activation", "weight"),
     doc=("Gated DeltaNet prefill preparation in one launch: split the "
@@ -894,9 +894,9 @@ register_signature(OpSignature(
     # the stride the kernel is handed.
     structural_axes=("n_ssm_groups", "d_ssm_state"),
     engine_inputs=(
-        (0, TensorLayout("x", ("B", "s_query",
+        ("x", TensorLayout("x", ("B", "s_query",
                                ("n_ssm_heads", "d_ssm_head")))),
-        (1, TensorLayout("gate", ("B", "s_query",
+        ("gate", TensorLayout("gate", ("B", "s_query",
                                   ("n_ssm_heads", "d_ssm_head")))),
     ),
     dtype_slots=("activation", "weight"),
@@ -937,7 +937,7 @@ register_signature(OpSignature(
         TensorLayout("w", ("d_model",), role="weight"),
     ),
     engine_inputs=(
-        (0, TensorLayout("x", ("B", "s_query", "d_model"))),
+        ("x", TensorLayout("x", ("B", "s_query", "d_model"))),
     ),
     dtype_slots=("activation",),
     shape_projection="fold_rmsnorm",
@@ -962,8 +962,8 @@ register_signature(OpSignature(
     # `_split_qkv_and_norm` splits the fused projection as qr first, kv
     # second, and hands those strided row views to the wrapper.
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "s_query", "d_q_lora"))),
-        (1, TensorLayout("kv", ("B", "s_query", "d_kv_lora"))),
+        ("q", TensorLayout("q", ("B", "s_query", "d_q_lora"))),
+        ("kv", TensorLayout("kv", ("B", "s_query", "d_kv_lora"))),
     ),
     dtype_slots=("activation", "weight", "output"),
     doc=("Two sibling RMSNorms in one launch, writing q as MXFP8 values plus "
@@ -994,7 +994,7 @@ register_signature(OpSignature(
         TensorLayout("w", ("d_model",), role="weight"),
     ),
     engine_inputs=(
-        (0, TensorLayout("x", ("B", "s_query", "d_model"))),
+        ("x", TensorLayout("x", ("B", "s_query", "d_model"))),
     ),
     dtype_slots=("activation",),
     shape_projection="fold_rmsnorm",
@@ -1021,8 +1021,8 @@ register_signature(OpSignature(
     # The fused node's operands in the concat's order: the embedding, then
     # the previous hidden state, both `[B, s_query, d_model]`.
     engine_inputs=(
-        (0, TensorLayout("inputs_embeds", ("B", "s_query", "d_model"))),
-        (1, TensorLayout("hidden", ("B", "s_query", "d_model"))),
+        ("inputs_embeds", TensorLayout("inputs_embeds", ("B", "s_query", "d_model"))),
+        ("hidden", TensorLayout("hidden", ("B", "s_query", "d_model"))),
     ),
     dtype_slots=("activation",),
     doc=("MTP entry, one launch: concat(rmsnorm(inputs_embeds)·enorm_w, "
@@ -1060,15 +1060,13 @@ register_signature(OpSignature(
         TensorLayout("q_weight", ("d_q_lora",), role="weight"),
         TensorLayout("kv_weight", ("d_kv_lora",), role="weight"),
     ),
-    # The fused node lists its inputs in member order, query first (the
-    # `feeds: q` norm) at every call site the plan binds. Both are rank 3, so
-    # rank cannot select between the orders the way it does for the V4
-    # prologue; a row that lists them the other way round with unequal token
-    # counts (no launch of this kernel: it asserts equal rows) fails to zip
-    # and is dropped, named.
+    # Each operand read at the port it fills (`q`, `kv`): both are rank 3,
+    # and which comes first in a layer's graph is no part of the contract. A
+    # row whose two have unequal token counts (no launch of this kernel: it
+    # asserts equal rows) fails to zip and is dropped, named.
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "s_query", "d_q_lora"))),
-        (1, TensorLayout("kv", ("B", "s_query", "d_kv_lora"))),
+        ("q", TensorLayout("q", ("B", "s_query", "d_q_lora"))),
+        ("kv", TensorLayout("kv", ("B", "s_query", "d_kv_lora"))),
     ),
     variant_dims=("n_heads", "n_kv_heads", "d_head"),
     # The per-head form, one row of heads per token as the kernel takes it.
@@ -1084,8 +1082,8 @@ register_signature(OpSignature(
     # The head-split q and k, head-first, as the attention leaf carries them
     # (the same operands `gemma_qkv_rmsnorm` reads).
     variant_engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-        (1, TensorLayout("kv", ("B", "n_kv_heads", "s_query", "d_head"))),
+        ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+        ("kv", TensorLayout("kv", ("B", "n_kv_heads", "s_query", "d_head"))),
     ),
     dtype_slots=("activation",),
     doc=("Two sibling RMSNorms in one launch, each written in the activation "
@@ -1116,8 +1114,8 @@ register_signature(OpSignature(
     ),
     # The head-split q and k, head-first, as the attention leaf carries them.
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-        (1, TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_head"))),
+        ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+        ("k", TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_head"))),
     ),
     dtype_slots=("activation",),
     doc=("Gemma-4 attention norms, one in-place launch: per head of d_head, "
@@ -1143,7 +1141,7 @@ register_signature(OpSignature(
         TensorLayout("scalar", (1,), role="weight"),
     ),
     engine_inputs=(
-        (0, TensorLayout("x", ("B", "s_query", "d_model"))),
+        ("x", TensorLayout("x", ("B", "s_query", "d_model"))),
     ),
     dtype_slots=("activation",),
     doc=("Gemma-4 block tail, one launch: (rmsnorm(x)·w + residual)·scalar "
@@ -1164,7 +1162,7 @@ register_signature(OpSignature(
         TensorLayout("scalar", (1,), role="weight"),
     ),
     engine_inputs=(
-        (0, TensorLayout("x1", ("B", "s_query", "d_model"))),
+        ("mlp_out", TensorLayout("x1", ("B", "s_query", "d_model"))),
     ),
     dtype_slots=("activation",),
     doc=("Gemma-4 MoE block tail, one launch: (rmsnorm(rmsnorm(x1)·w1 + "
@@ -1195,9 +1193,9 @@ def _dsa_norm_rope(name: str, indexer: bool, doc: str) -> None:
         TensorLayout("cos_sin_cache", (None, "d_rope"), role="metadata"),
     ]
     engine = [
-        (0, TensorLayout("q", ("B", "s_query", "d_q_lora"))),
-        (1, TensorLayout("kv", ("B", "s_query", "d_kv_lora"))),
-        (2, TensorLayout("k_pe", ("B", "s_query", "d_rope"))),
+        ("q", TensorLayout("q", ("B", "s_query", "d_q_lora"))),
+        ("kv", TensorLayout("kv", ("B", "s_query", "d_kv_lora"))),
+        ("k_pe", TensorLayout("k_pe", ("B", "s_query", "d_rope"))),
     ]
     if indexer:
         inputs += [
@@ -1205,7 +1203,7 @@ def _dsa_norm_rope(name: str, indexer: bool, doc: str) -> None:
             TensorLayout("ik_weight", ("d_indexer_head",), role="weight"),
             TensorLayout("ik_bias", ("d_indexer_head",), role="weight"),
         ]
-        engine.append((3, TensorLayout("ik", ("B", "s_query",
+        engine.append(("index_key", TensorLayout("ik", ("B", "s_query",
                                               "d_indexer_head"))))
     register_signature(OpSignature(
         name=name,
@@ -1323,8 +1321,8 @@ register_signature(OpSignature(
     # are rank 4); `TestDsaPrologue.test_the_plan_reaches_each_span` checks
     # the projected cell against the checkpoint config instead.
     engine_inputs=(
-        (0, TensorLayout("q_pe", ("B", "n_heads", "s_query", "d_rope"))),
-        (1, TensorLayout("index_q", ("B", "n_indexer_heads", "s_query",
+        ("q_pe", TensorLayout("q_pe", ("B", "n_heads", "s_query", "d_rope"))),
+        ("index_q", TensorLayout("index_q", ("B", "n_indexer_heads", "s_query",
                                      "d_indexer_head"))),
     ),
     structural_axes=("d_qk_nope",),
@@ -1514,7 +1512,7 @@ register_signature(OpSignature(
         TensorLayout("x", (("B", "s_query"), (2, "d_ffn"))),
     ),
     engine_inputs=(
-        (0, TensorLayout("x", ("B", "s_query", "d_ffn"))),
+        ("gate", TensorLayout("x", ("B", "s_query", "d_ffn"))),
     ),
     dtype_slots=("activation",),
     doc="SwiGLU gate: silu(gate) * up over [B·s_query, d_ffn]. Memory-bound.",
@@ -1531,7 +1529,7 @@ register_signature(OpSignature(
         TensorLayout("x", (("B", "s_query"), (2, "d_ffn"))),
     ),
     engine_inputs=(
-        (0, TensorLayout("x", ("B", "s_query", "d_ffn"))),
+        ("gate", TensorLayout("x", ("B", "s_query", "d_ffn"))),
     ),
     dtype_slots=("activation",),
     # The bound both branches are clamped to — the one the `clamp` ops this
@@ -1555,7 +1553,7 @@ register_signature(OpSignature(
         TensorLayout("x", (("B", "s_query"), (2, "d_ffn"))),
     ),
     engine_inputs=(
-        (0, TensorLayout("x", ("B", "s_query", "d_ffn"))),
+        ("gate", TensorLayout("x", ("B", "s_query", "d_ffn"))),
     ),
     dtype_slots=("activation",),
     # Both betas vLLM passes the kernel, as the `situ` op it absorbed
@@ -1578,7 +1576,7 @@ register_signature(OpSignature(
         TensorLayout("x", (("B", "s_query"), (2, "d_ffn"))),
     ),
     engine_inputs=(
-        (0, TensorLayout("x", ("B", "s_query", "d_ffn"))),
+        ("gate", TensorLayout("x", ("B", "s_query", "d_ffn"))),
     ),
     dtype_slots=("activation",),
     doc="GeGLU gate: gelu(gate) * up over [B·s_query, d_ffn]. Same packing "
@@ -1601,13 +1599,16 @@ register_signature(OpSignature(
     ),
     # Engine layouts of the same two operands, keyed by rank: 4-D keeps
     # the head axis, 3-D packs heads×width. Q and K choose independently
-    # (MLA: 4-D Q, packed K).
+    # (MLA: 4-D Q, packed K). At `fused_qk_rope`'s ports; the primitive
+    # `rope` op, measured here too under its own name, rotates one operand,
+    # read as the query (`primitive_ports`).
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_rope"))),
-        (0, TensorLayout("q", ("B", "s_query", ("n_heads", "d_rope")))),
-        (1, TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_rope"))),
-        (1, TensorLayout("k", ("B", "s_query", ("n_kv_heads", "d_rope")))),
+        ("q_pe", TensorLayout("q", ("B", "n_heads", "s_query", "d_rope"))),
+        ("q_pe", TensorLayout("q", ("B", "s_query", ("n_heads", "d_rope")))),
+        ("k_pe", TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_rope"))),
+        ("k_pe", TensorLayout("k", ("B", "s_query", ("n_kv_heads", "d_rope")))),
     ),
+    primitive_ports=("q_pe",),
     dtype_slots=("activation",),
     doc=("Rotary position embedding applied to Q and K in one launch. Q "
          "[tokens, n_heads·d_rope], K [tokens, n_kv_heads·d_rope] "
@@ -1641,8 +1642,8 @@ register_signature(OpSignature(
     # either (the tail passes through), so it is read from the spec (`d_rope`)
     # and a row whose spec does not name it there is dropped, not guessed.
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-        (1, TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_head"))),
+        ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+        ("k", TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_head"))),
     ),
     dtype_slots=("activation",),
     doc=("Partial RoPE on Q and K in one in-place launch: the first `d_rope` "
@@ -1664,8 +1665,8 @@ register_signature(OpSignature(
     # The head-split query and the rope slice of the latent; the rope key's
     # width is the rotation width, so the cell is read off the tensors alone.
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-        (1, TensorLayout("k_pe", ("B", "s_query", "d_rope"))),
+        ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+        ("k_pe", TensorLayout("k_pe", ("B", "s_query", "d_rope"))),
     ),
     dtype_slots=("activation",),
     doc=("MLA's RoPE in one in-place launch: the last `d_rope` of every "
@@ -1745,8 +1746,8 @@ register_signature(OpSignature(
         TensorLayout("cos_sin_cache", (None, "d_rope"), role="metadata"),
     ),
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-        (1, TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_head"))),
+        ("q_pe", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+        ("k_pe", TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_head"))),
     ),
     structural_axes=("d_rope", "mrope_section_t", "mrope_section_h",
                      "mrope_section_w", "mrope_interleaved"),
@@ -1771,9 +1772,9 @@ register_signature(OpSignature(
 # (one node, or unscaled × gain) are two plans on this one cell.
 # The head is `d_head` wide and only its first `d_rope` channels rotate
 # (Qwen3.5 / Qwen3.8: 256 and 64); the norm spans the whole head. The engine
-# hands q|gate head-split, `[B, n_heads, s_query, 2·d_head]`, then k: right
-# after it in the one-node writing, after the q gain (rank 1) in the
-# split-gain writing, whose operands are [q_gate, q_gain, k, k_gain].
+# hands q|gate head-split, `[B, n_heads, s_query, 2·d_head]`, and k; the
+# split-gain writing also hands the two gains as ports of their own
+# (`q_weight`, `k_weight`), which the cell does not read.
 register_signature(OpSignature(
     name="fused_qk_rmsnorm_rope_gate",
     binds_ops=('fused_qk_rmsnorm_rope_gate',
@@ -1788,11 +1789,9 @@ register_signature(OpSignature(
         TensorLayout("cos_sin_cache", (None, "d_rope"), role="metadata"),
     ),
     engine_inputs=(
-        (0, TensorLayout("q_gate", ("B", "n_heads", "s_query",
+        ("q_gate", TensorLayout("q_gate", ("B", "n_heads", "s_query",
                                     (2, "d_head")))),
-        (1, TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_head"))),
-        (1, TensorLayout("q_norm_w", ("d_head",), role="weight")),
-        (2, TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_head"))),
+        ("k", TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_head"))),
     ),
     dtype_slots=("activation",),
     doc=("Qwen's gated attention prologue in one launch: split [q|gate], "
@@ -1837,8 +1836,8 @@ def _indexer_q_rope_quant(name: str) -> None:
         # (`head_split` in both writings), beside the projection's
         # token-major weights.
         engine_inputs=(
-            (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-            (1, TensorLayout("weights", ("B", "s_query", "n_heads"))),
+            ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+            ("weights", TensorLayout("weights", ("B", "s_query", "n_heads"))),
         ),
         # d_rope is the tail width, while d_head is the axis q already carries.
         structural_axes=("d_rope",),
@@ -1877,10 +1876,15 @@ register_signature(OpSignature(
         TensorLayout("positions", (("B", "s_query"),), role="metadata"),
         TensorLayout("cos_sin_cache", (None, "d_rope"), role="metadata"),
     ),
+    # The launch's operands are the plan's ports: the head-split Q and K the
+    # norms read (`fused_qk_norm_partial_rope.yaml`: external.q / external.k
+    # off `q_split_heads` / `k_split_heads`, `[B, heads, s, d_head]`). The
+    # packed [q|k|v] row the kernels take (`inputs` above) is the
+    # frameworks' argument, which no graph tensor carries: laid on the `q`
+    # port it bound nothing, a rank-3 packing against a rank-4 query.
     engine_inputs=(
-        (0, TensorLayout("qkv", ("B", "s_query",
-                                 ("+", ("n_heads", "d_head"),
-                                  (2, "n_kv_heads", "d_head"))))),
+        ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+        ("k", TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_head"))),
     ),
     structural_axes=("d_rope",),
     # The sparse/cache-writing geometry is SELECTED, not sized: a cell
@@ -1967,14 +1971,11 @@ register_signature(OpSignature(
 # the deployment pages it, so the page is an axis of the cell
 # (`OpSignature.reads_paged_cache`).
 #
-# Both activations are declared at BOTH engine positions. A fused node lists
-# its external inputs in member order (`eval/fusion._external_inputs`), and
-# which of the query and the latent comes first is the layer's graph order:
-# four of DeepSeek-V4.1's five row classes put the query first and one puts
-# the latent first. Rank selects the layout (`zip_engine_layouts` keys on
-# `(position, rank)`) and these two differ in it — a head-shaped rank-4 query
-# beside a rank-3 latent row — so either order reads correctly and the
-# default contract projection needs no help.
+# Each activation is declared at the port it fills (`q`, `kv` in the plan's
+# `io_mapping`). A launch names the port each operand fills
+# (`FusedNode.operand_ports`), so which comes first in a layer's graph — the
+# query in four of DeepSeek-V4.1's five row classes, the latent in the
+# fifth — is no part of the contract.
 def _qnorm_rope_kv_insert(name: str, doc: str) -> None:
     register_signature(OpSignature(
         name=name,
@@ -1993,10 +1994,8 @@ def _qnorm_rope_kv_insert(name: str, doc: str) -> None:
             TensorLayout("cos_sin_cache", (None, "d_rope"), role="metadata"),
         ),
         engine_inputs=(
-            (0, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-            (0, TensorLayout("kv", ("B", "s_query", "d_head"))),
-            (1, TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
-            (1, TensorLayout("kv", ("B", "s_query", "d_head"))),
+            ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_head"))),
+            ("kv", TensorLayout("kv", ("B", "s_query", "d_head"))),
         ),
         dtype_slots=("activation", "kv"),
         doc=doc,
@@ -2075,8 +2074,8 @@ register_signature(OpSignature(
     # `d_head`-wide at every ratio); the plan's `view_split` binds it.
     structural_axes=("compress_ratio",),
     engine_inputs=(
-        (0, TensorLayout("kv", ("B", "s_query", "d_head"))),
-        (1, TensorLayout("score", ("B", "s_query", "d_head"))),
+        ("kv", TensorLayout("kv", ("B", "s_query", "d_head"))),
+        ("score", TensorLayout("score", ("B", "s_query", "d_head"))),
     ),
     dtype_slots=("activation",),
     doc=("CSA2 compressor pool + norm, one launch: per closed group of "
@@ -2107,8 +2106,8 @@ register_signature(OpSignature(
     # The group size: no tensor carries it; the plan's `view_split` binds it.
     structural_axes=("compress_ratio",),
     engine_inputs=(
-        (0, TensorLayout("kv", ("B", "s_query", "d_head"))),
-        (1, TensorLayout("score", ("B", "s_query", "d_head"))),
+        ("kv", TensorLayout("kv", ("B", "s_query", "d_head"))),
+        ("score", TensorLayout("score", ("B", "s_query", "d_head"))),
     ),
     dtype_slots=("activation",),
     doc=("DeepInfer's CSA2 compressor pool and state update, one launch "
@@ -2200,8 +2199,8 @@ register_signature(OpSignature(
         TensorLayout("cos_sin_cache", (None, "d_rope"), role="metadata"),
     ),
     engine_inputs=(
-        (0, TensorLayout("kv", ("B", "s_slots", "Cape", (2, "d_head")))),
-        (1, TensorLayout("score", ("B", "s_slots", "Cape", (2, "d_head")))),
+        ("kv", TensorLayout("kv", ("B", "s_slots", "Cape", (2, "d_head")))),
+        ("score", TensorLayout("score", ("B", "s_slots", "Cape", (2, "d_head")))),
     ),
     dtype_slots=("activation", "kv"),
     doc=("DeepSeek-V4 overlap compressor, one launch: softmax(gate) pool of "
@@ -2291,10 +2290,10 @@ register_signature(OpSignature(
         TensorLayout("slot_mapping", (("B", "s_slots"),), role="metadata"),
     ),
     engine_inputs=(
-        (0, TensorLayout("gate", ("B", "s_slots", "compress_ratio",
+        ("gate", TensorLayout("gate", ("B", "s_slots", "compress_ratio",
                                   "d_indexer_head"))),
-        (1, TensorLayout("ape", ("compress_ratio", "d_indexer_head"))),
-        (2, TensorLayout("keys", ("B", "s_slots", "compress_ratio",
+        ("pos_table", TensorLayout("ape", ("compress_ratio", "d_indexer_head"))),
+        ("keys", TensorLayout("keys", ("B", "s_slots", "compress_ratio",
                                   "d_indexer_head"))),
     ),
     dtype_slots=("activation", "kv"),
@@ -2384,7 +2383,7 @@ register_signature(OpSignature(
     ),
     # The head-split query the indexer's projection emits, head-first.
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_indexer_heads", "s_query",
+        ("q", TensorLayout("q", ("B", "n_indexer_heads", "s_query",
                                "d_indexer_head"))),
     ),
     dtype_slots=("activation",),
@@ -2414,7 +2413,7 @@ register_signature(OpSignature(
     # binds it.
     structural_axes=("compress_ratio",),
     engine_inputs=(
-        (0, TensorLayout("raw_key", ("B", "s_query", "d_indexer_head"))),
+        ("raw_key", TensorLayout("raw_key", ("B", "s_query", "d_indexer_head"))),
     ),
     dtype_slots=("activation", "kv"),
     doc=("QSA indexer key compression, one launch: per completed block of "
@@ -2443,6 +2442,15 @@ register_signature(OpSignature(
         # a cell axis.
         TensorLayout("cos_sin_cache", (None, "d_rope"), role="metadata"),
     ),
+    # The query and the key at the plan's ports, head-shaped or packed
+    # heads×width as the graph hands them; the rope projection reads each
+    # off its layout (`_rope_identity`).
+    engine_inputs=(
+        ("q", TensorLayout("q", ("B", "n_heads", "s_query", "d_rope"))),
+        ("q", TensorLayout("q", ("B", "s_query", ("n_heads", "d_rope")))),
+        ("k", TensorLayout("k", ("B", "n_kv_heads", "s_query", "d_rope"))),
+        ("k", TensorLayout("k", ("B", "s_query", ("n_kv_heads", "d_rope")))),
+    ),
     dtype_slots=("activation",),
     doc=("Per-head RMSNorm of Q and K (separate gains) followed by RoPE, "
          "fused over one packed qkv tensor "
@@ -2458,6 +2466,13 @@ register_signature(OpSignature(
     inputs=(
         TensorLayout("gating", (("B", "s_query"), "n_experts")),
         TensorLayout("bias", ("n_experts",), role="metadata"),
+    ),
+    # The router's operands at its plan's ports: the activation it scores
+    # (its width is the scorer's, no axis of this cell) and the per-expert
+    # correction bias, whose length is the experts (`_moe_gate_identity`).
+    engine_inputs=(
+        ("gating", TensorLayout("gating", ("B", "s_query", None))),
+        ("bias", TensorLayout("bias", ("n_experts",))),
     ),
     # The routing widths (top-k experts, group count, top groups) parameterize
     # the selection but are no tensor's axis.
@@ -2492,8 +2507,11 @@ def _moe_topk(name: str, biased: bool, doc: str) -> None:
         binds_ops=(name,),
         inputs=tuple(inputs),
         structural_axes=("n_experts_active",),
+        # A biased router's launch reads two ports (`gating`, `bias`) and
+        # names the one it is keyed by; an unbiased one has one operand.
         engine_inputs=(
-            (0, TensorLayout("gating", ("B", "s_query", "n_experts"))),
+            ("gating" if biased else 0,
+             TensorLayout("gating", ("B", "s_query", "n_experts"))),
         ),
         output_axes=("n_experts_active",),
         dtype_slots=("activation",),
@@ -2539,8 +2557,8 @@ register_signature(OpSignature(
     # weight is the fused node's own parameter, its extents the two axes
     # those operands already name.
     engine_inputs=(
-        (0, TensorLayout("x", ("B", "s_query", "d_model"))),
-        (1, TensorLayout("bias", ("n_experts",))),
+        ("x", TensorLayout("x", ("B", "s_query", "d_model"))),
+        ("bias", TensorLayout("bias", ("n_experts",))),
     ),
     output_axes=("n_experts_active",),
     dtype_slots=("activation", "weight"),
@@ -2567,8 +2585,8 @@ register_signature(OpSignature(
                      role="metadata"),
     ),
     engine_inputs=(
-        (0, TensorLayout("gating", ("B", "s_query", "n_experts"))),
-        (2, TensorLayout("table", ("n_vocab", "n_experts_active"),
+        ("gating", TensorLayout("gating", ("B", "s_query", "n_experts"))),
+        ("table", TensorLayout("table", ("n_vocab", "n_experts_active"),
                          role="metadata")),
     ),
     dtype_slots=("activation",),
@@ -2594,8 +2612,9 @@ register_signature(OpSignature(
                      role="weight"),
     ),
     engine_inputs=(
-        # Graph traversal emits wkv's output before the residual x.
-        (1, TensorLayout("x", ("B", "s_query",
+        # The residual stream, at its port; the wkv output beside it is the
+        # `kv` port, which the cell does not read.
+        ("x", TensorLayout("x", ("B", "s_query",
                                ("n_hidden_copies", "d_model")))),
     ),
     dtype_slots=("activation", "weight"),
@@ -2623,11 +2642,11 @@ register_signature(OpSignature(
                      role="weight"),
     ),
     engine_inputs=(
-        (0, TensorLayout("key", ("B", "s_query",
+        ("key", TensorLayout("key", ("B", "s_query",
                                  ("n_hidden_copies", "d_model")))),
-        (2, TensorLayout("x", ("B", "s_query",
+        ("query", TensorLayout("x", ("B", "s_query",
                                ("n_hidden_copies", "d_model")))),
-        (4, TensorLayout("value", ("B", "s_query", "d_model"))),
+        ("value", TensorLayout("value", ("B", "s_query", "d_model"))),
     ),
     dtype_slots=("activation", "weight"),
     doc=("Qwen PLE retrieval gate, one launch: grouped RMSNorm of key and "
@@ -2659,20 +2678,25 @@ register_signature(OpSignature(
     # is the cache, s_kv. Those two axes must not share a name — prefill
     # hides the mix because they are equal; decode is s_query=1 against
     # s_kv=cache. The head-first 4-D query is the same in both writings.
+    # At the plan's ports (q, k, w); `indexer_logits` is a primitive op as
+    # well, whose three operands are those ports in turn
+    # (`primitive_ports`). A launch without the head weights (Qwen3.8's QSA
+    # indexer) has no `w`, and its layouts are not read.
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_indexer_heads", "s_query",
+        ("q", TensorLayout("q", ("B", "n_indexer_heads", "s_query",
                                "d_indexer_head"))),
-        (1, TensorLayout("k", ("B", "s_kv", "d_indexer_head"))),
-        (2, TensorLayout("weights", ("B", "s_query", "n_indexer_heads"))),
+        ("k", TensorLayout("k", ("B", "s_kv", "d_indexer_head"))),
+        ("w", TensorLayout("weights", ("B", "s_query", "n_indexer_heads"))),
         # DSv4 CSA indexer: compressed K after the local compressor (s_kv
         # already the pooled length), broadcast over the heads.
-        (1, TensorLayout("k", ("B", "n_indexer_heads", "s_kv",
+        ("k", TensorLayout("k", ("B", "n_indexer_heads", "s_kv",
                                "d_indexer_head"))),
         # Broadcast gate weights aligned to the score tensor
         # [B, n_indexer_heads, s_query, s_kv] (DSv4 CSA indexer).
-        (2, TensorLayout("weights", ("B", "n_indexer_heads", "s_query",
+        ("w", TensorLayout("weights", ("B", "n_indexer_heads", "s_query",
                                      "s_kv"), role="metadata")),
     ),
+    primitive_ports=("q", "k", "w"),
     dtype_slots=("activation",),
     doc=("DeepSeek sparse-attention (DSA) lightning-indexer logits: per "
          "(query token, kv token) a gate-weighted sum over n_indexer_heads "
@@ -2696,9 +2720,9 @@ register_signature(OpSignature(
     # The fused node reads the head-first query and the one index key shown
     # to every index head (a zero-byte head broadcast).
     engine_inputs=(
-        (0, TensorLayout("q", ("B", "n_indexer_heads", "s_query",
+        ("q", TensorLayout("q", ("B", "n_indexer_heads", "s_query",
                                "d_indexer_head"))),
-        (1, TensorLayout("k", ("B", "n_indexer_heads", "s_kv",
+        ("k", TensorLayout("k", ("B", "n_indexer_heads", "s_kv",
                                "d_indexer_head"))),
     ),
     dtype_slots=("activation",),
@@ -2951,7 +2975,9 @@ register_signature(OpSignature(
 ))
 
 
-def _binary_act(name: str, doc: str) -> None:
+def _binary_act(name: str, doc: str, first=0) -> None:
+    """`first`: the operand `a` is — a primitive op's position 0, or the
+    port a fused launch reads it at."""
     register_signature(OpSignature(
         name=name,
         binds_ops=(name,),
@@ -2960,8 +2986,8 @@ def _binary_act(name: str, doc: str) -> None:
             TensorLayout("b", (("B", "s_query"), "d_model")),
         ),
         engine_inputs=(
-            (0, TensorLayout("a", ("B", "s_query", "d_model"))),
-            (0, TensorLayout("a", (("B", "s_query"), "d_model"))),
+            (first, TensorLayout("a", ("B", "s_query", "d_model"))),
+            (first, TensorLayout("a", (("B", "s_query"), "d_model"))),
         ),
         dtype_slots=("activation",),
         shape_projection="trailing_feature",
@@ -2974,13 +3000,13 @@ _binary_act("add", "Pointwise add of two activations, last-dim aligned.")
 # The attention output gate in one elementwise launch
 # (fusion_plans/sigmoid_gate_mul.yaml): the same two operands as `mul` and
 # the same bytes, a different function — so its own cell, as `gelu_and_mul`
-# sits beside `silu_and_mul`. `a` is the attention output, `b` the gate, in
-# the plan's io order.
+# sits beside `silu_and_mul`. `a` is the attention output, the plan's `x`
+# port; `b` the gate.
 _binary_act("sigmoid_gate_mul",
             "Attention output gate, one launch: a · sigmoid(b), last-dim "
             "aligned (a the merged attention output, b the gate projection). "
             "sglang `fused_sigmoid_mul` (Qwen3.5 / Qwen4Exp) and "
-            "`sigmoid_gate_mul` (HY V4). Memory-bound.")
+            "`sigmoid_gate_mul` (HY V4). Memory-bound.", first="x")
 # The final-logit soft-cap in one launch (fusion_plans/softcap_logits.yaml):
 # `c · tanh(x / c)` over the vocabulary, written fp32. A unary act like the
 # others here; the cap `c` moves no byte and is stated on the reference's
@@ -3254,10 +3280,10 @@ _HC_COMB_ENGINE = TensorLayout(
     "comb", ("B", "s_query", "n_hidden_copies", "n_hidden_copies"))
 _HC_POST_OPERANDS = (_HC_POST_GATE, _HC_SUBLAYER, _HC_COMB, _HC_RESIDUAL)
 _HC_POST_ENGINE = (
-    (0, _HC_POST_GATE_ENGINE),
-    (1, _HC_SUBLAYER_ENGINE),
-    (2, _HC_COMB_ENGINE),
-    (3, _HC_RESIDUAL_ENGINE),
+    ("post", _HC_POST_GATE_ENGINE),
+    ("sublayer", _HC_SUBLAYER_ENGINE),
+    ("comb", _HC_COMB_ENGINE),
+    ("residual", _HC_RESIDUAL_ENGINE),
 )
 
 
@@ -3284,10 +3310,10 @@ register_signature(OpSignature(
     # selected by rank as every multi-rank declaration is.
     binds_ops=('mhc_pre_gemm', 'mhc_pre_gemm_stream'),
     inputs=(_HC_RESIDUAL, _HC_FN),
-    engine_inputs=((0, _HC_RESIDUAL_ENGINE),
-                   (0, TensorLayout("residual",
-                                    ("B", "s_query", _HC_PACKED))),
-                   (1, _HC_FN)),
+    engine_inputs=(("residual", _HC_RESIDUAL_ENGINE),
+                   ("residual", TensorLayout("residual",
+                                             ("B", "s_query", _HC_PACKED))),
+                   ("mix_weight", _HC_FN)),
     dtype_slots=("activation",),
     doc=("Hyper-connection PRE-mix projection, one launch: the flattened "
          "multi-copy residual against the mix projection, scaled by the "
@@ -3317,7 +3343,7 @@ register_signature(OpSignature(
     ),
     # Engine operand 1 is the residual; operand 0 is the `pre` vector the
     # launch derives for itself.
-    engine_inputs=((1, _HC_RESIDUAL_ENGINE),),
+    engine_inputs=(("residual", _HC_RESIDUAL_ENGINE),),
     dtype_slots=("activation",),
     doc=("Hyper-connection PRE-mix epilogue, one launch: reduce the "
          "projection's split-K partials, apply the rsqrt, the two sigmoid "
@@ -3332,7 +3358,7 @@ register_signature(OpSignature(
     name="mhc_fused_post_pre",
     binds_ops=('mhc_fused_post_pre',),
     inputs=(*_HC_POST_OPERANDS, _HC_FN),
-    engine_inputs=(*_HC_POST_ENGINE, (4, _HC_FN)),
+    engine_inputs=(*_HC_POST_ENGINE, ("mix_weight", _HC_FN)),
     dtype_slots=("activation",),
     doc=("A sublayer boundary's post-mix and the next pre-mix projection in "
          "ONE launch — the frameworks' small-token hyper-connection path. "
@@ -3379,7 +3405,7 @@ register_signature(OpSignature(
         TensorLayout("base", (_HC_MIX,), role="metadata"),
         TensorLayout("norm_weight", ("d_model",), role="weight"),
     ),
-    engine_inputs=(*_HC_POST_ENGINE, (4, _HC_FN)),
+    engine_inputs=(*_HC_POST_ENGINE, ("mix_weight", _HC_FN)),
     dtype_slots=("activation",),
     doc=("DeepSeek-V4.1's shifted hyper-connection seam in DeepInfer's one "
          "Mega-MHC launch: the previous sublayer's post-mix, the current "
@@ -3432,8 +3458,8 @@ register_signature(OpSignature(
     # post-mix takes, minus the cross-mix: this launch spreads and adds, it
     # does not mix the copies with each other.
     inputs=(_HC_POST_GATE, _HC_SUBLAYER, _HC_RESIDUAL),
-    engine_inputs=((0, _HC_POST_GATE_ENGINE), (1, _HC_SUBLAYER_ENGINE),
-                   (2, _HC_RESIDUAL_ENGINE)),
+    engine_inputs=(("post", _HC_POST_GATE_ENGINE), ("y", _HC_SUBLAYER_ENGINE),
+                   ("residual", _HC_RESIDUAL_ENGINE)),
     dtype_slots=("activation",),
     doc=("INDEPENDENT hyper-connection post-mix, one launch: "
          "`out[c] = post[c]·sublayer + residual[c]` — a finished sublayer's "
@@ -3459,8 +3485,8 @@ register_signature(OpSignature(
             # anything the launch streams: a scalar and one bias per copy.
             TensorLayout("scale", (1,), role="metadata"),
             TensorLayout("base", ("n_hidden_copies",), role="metadata")),
-    engine_inputs=((0, TensorLayout("x", _HC_COPIES_ENGINE)),
-                   (1, _HC_HEAD_FN)),
+    engine_inputs=(("x", TensorLayout("x", _HC_COPIES_ENGINE)),
+                   ("mix_weight", _HC_HEAD_FN)),
     dtype_slots=("activation",),
     doc=("Hyper-connection EXIT reduce, one launch: the multi-copy residual "
          "flattened and RMS-normalised, projected onto `n_hidden_copies` "
@@ -3490,16 +3516,13 @@ register_signature(OpSignature(
 register_signature(OpSignature(
     name="hc_gate_mix",
     binds_ops=('hc_gate_mix',),
-    # The gate FIRST — and not because a framework takes it first (vLLM
-    # takes the stream first). The engine collects a fused node's external
-    # inputs in member order, and the pattern's `sigmoid` node, whose
-    # operand is the gate, sits above its `mul` in every component that
-    # declares this block. Both tensors have the same shape, so nothing but
-    # this declaration tells them apart.
+    # Both tensors have the same shape, so nothing but the port each fills
+    # (`gate`, `normed_x` in the plan) tells them apart; the contract lists
+    # the gate first, and vLLM takes the stream first.
     inputs=(TensorLayout("gate", _HC_PACKED_STREAM),
             TensorLayout("xn", _HC_PACKED_STREAM)),
-    engine_inputs=((0, TensorLayout("gate", _HC_PACKED_STREAM_ENGINE)),
-                   (1, TensorLayout("xn", _HC_PACKED_STREAM_ENGINE))),
+    engine_inputs=(("gate", TensorLayout("gate", _HC_PACKED_STREAM_ENGINE)),
+                   ("normed_x", TensorLayout("xn", _HC_PACKED_STREAM_ENGINE))),
     dtype_slots=("activation",),
     doc=("The hyper-connection READ, one launch: "
          "`y = (1/hc)·Σ_c sigmoid(gate_c)·xn_c` — the normed stream gated "
@@ -3515,13 +3538,14 @@ register_signature(OpSignature(
             TensorLayout("block", (_HC_TOKENS, "d_model")),
             TensorLayout("injection", (_HC_TOKENS, "n_hidden_copies")),
             TensorLayout("norm_weight", (_HC_PACKED,), role="weight")),
-    # Engine order, read off the walk: the sublayer's output, the injection
-    # logits, the residual (copies on their own axis there) and the gain.
-    engine_inputs=((0, TensorLayout("block", ("B", "s_query", "d_model"))),
-                   (1, TensorLayout("injection",
+    # Each operand at its port: the sublayer's output (`block`), the
+    # injection logits, the residual (copies on their own axis there) and
+    # the gain (`weight`).
+    engine_inputs=(("block", TensorLayout("block", ("B", "s_query", "d_model"))),
+                   ("injection", TensorLayout("injection",
                                     ("B", "s_query", "n_hidden_copies"))),
-                   (2, TensorLayout("residual", _HC_COPIES_ENGINE)),
-                   (3, TensorLayout("norm_weight", (_HC_PACKED,),
+                   ("residual", TensorLayout("residual", _HC_COPIES_ENGINE)),
+                   ("weight", TensorLayout("norm_weight", (_HC_PACKED,),
                                     role="weight"))),
     dtype_slots=("activation",),
     doc=("The hyper-connection WRITE fused with the next read's grouped "

@@ -27,6 +27,7 @@ from backend.arch.cache_formats import CACHE_FORMATS
 from backend.arch.dims import call_token_axes
 from backend.arch.eval import cache as cache_mod
 from backend.arch.eval.dim import algebra, value_of
+from backend.arch.eval.launch import FusedNode
 from backend.arch.eval.refusal import node_context
 from backend.arch.eval.routed import RoutedLaunch
 from backend.arch.eval.storage import is_expert_axis
@@ -41,7 +42,7 @@ import math
 import json
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import (Any, Dict, FrozenSet, List, Optional, Tuple,
+from typing import (Any, Dict, FrozenSet, List, Mapping, Optional, Tuple,
                     TYPE_CHECKING)
 from backend.code_trace.memo import memo_property, memoize
 
@@ -500,6 +501,7 @@ def _zip_sides(sig: OpSignature, engines: Any, shape_in: Any, shape_out: Any,
 def _contract_identity(op: str, shape_in: Any, shape_out: Any,
                        spec_dims: Optional[Dict[str, Any]] = None,
                        call_tokens: Optional[int] = None,
+                       operand_ports: Any = None,
                        ) -> Optional[str]:
     """Identity JSON from the signature's declared engine layout.
 
@@ -525,6 +527,8 @@ def _contract_identity(op: str, shape_in: Any, shape_out: Any,
     sig = get_signature(op_signature(op))
     if sig is None:
         return None
+    # A fused launch's operands, placed by the ports they fill.
+    sig = sig.at_ports(operand_ports, op=op)
     spec = spec_dims or {}
     layout_axes = sig.layout_axis_names()
     totals = frozenset(call_token_axes().get("total", ()))
@@ -925,6 +929,7 @@ def identity_shape_from_shape_in(
     shape_in_exact: Any = None,
     comm: Optional[CommLaunch] = None,
     routed_rows: Optional[int] = None,
+    operand_ports: Any = None,
 ) -> Optional[str]:
     """Derive the calibration identity shape from the engine's per-op
     `shape_in` — the single source of truth that already reflects the phase
@@ -972,8 +977,15 @@ def identity_shape_from_shape_in(
     which operand is the buffer is the walk's (`LeafAccess.routed_inputs`,
     on the row as `routed`), not something the bare extents here can say —
     a dispatch's first operand is its TOKEN side.
+
+    `operand_ports` names the ports of its plan each operand of a fused
+    launch fills (the row's `operand_ports`): a signature that reads them by
+    port is placed at them (`OpSignature.at_ports`), and refuses an
+    operand list that does not name them.
     """
     sig = get_signature(op_signature(op))
+    if sig is not None:
+        sig = sig.at_ports(operand_ports, op=op)
     projection = sig.shape_projection if sig is not None else "contract"
     if projection == "collective":
         # A collective's cell comes from what it MOVES, which its operand
@@ -990,27 +1002,35 @@ def identity_shape_from_shape_in(
     # selection mask, a router whose first operand is d_model not n_experts.
     # Packed/permuted engine tensors are declared on the signature
     # (`engine_inputs`) and inverted by `zip_engine_layouts`, not here.
+    # The projections below that read an operand by what it is read it off
+    # the signature's own layout of it (`_laid`), placed at the row's ports.
     if projection == "dsa":
-        return _cell_from_spec(sig, _dsa_identity(sig, shape_in, shape_out, spec_dims),
-                               spec_dims)
+        return _cell_from_spec(
+            sig, _dsa_identity(sig, shape_in, shape_out, spec_dims),
+            spec_dims)
     if projection == "rope":
-        return _rope_identity(shape_in, spec_dims)
+        return _rope_identity(_laid(sig, shape_in, "q"),
+                              _laid(sig, shape_in, "k"), spec_dims)
     if projection == "inv_rope":
         return _inv_rope_identity(shape_in, spec_dims)
     if projection == "moe_gate":
-        return _moe_gate_identity(shape_in, shape_out)
+        return _moe_gate_identity(_laid(sig, shape_in, "gating"),
+                                  _laid(sig, shape_in, "bias"), shape_out)
     if projection == "conv2d":
         return _conv2d_identity(shape_in, shape_out, spec_dims)
     got = _contract_identity(
         op, shape_in, shape_out, spec_dims=spec_dims,
-        call_tokens=routed_rows)
+        call_tokens=routed_rows, operand_ports=operand_ports)
+    # The operand the signature's first layout names — its activation — for
+    # the projections that read one tensor.
+    lead = _lead(sig, shape_in)
     if got is not None:
         return got
     # Per-head QK-norm is the same rmsnorm kernel over B·n_heads·s_query
     # rows: fold the head axis into the token count so it shares the
     # per-token identity.
     if projection == "fold_rmsnorm":
-        return _fold_per_head_rmsnorm(shape_in)
+        return _fold_per_head_rmsnorm(lead)
     # A shared-weight linear on a rank-4 stream (DSv4 MTP's `h_proj` over
     # the pre-reduce HC copies) is the dense GEMM over the flattened rows.
     if projection == "fold_gemm":
@@ -1018,8 +1038,51 @@ def identity_shape_from_shape_in(
     if projection == "reduce_axis":
         return _reduce_axis_identity(shape_in, shape_out)
     if projection == "trailing_feature":
-        return _trailing_feature_identity(shape_in)
+        return _trailing_feature_identity(lead)
     return None
+
+
+def operand_ports_of(row: Mapping[str, Any], node: Any,
+                     signature: Optional[OpSignature]) -> Any:
+    """The ports a row's operands fill: a fused launch's, as the walk
+    published them (`operand_ports`, `FusedNode.operand_ports`); a primitive
+    op's — no ports of its own — as the port-keyed signature it is measured
+    under names them (`OpSignature.primitive_ports`); None otherwise."""
+    ports = row.get("operand_ports")
+    if (ports is None and node is not None
+            and not isinstance(node, FusedNode)
+            and signature is not None and signature.primitive_ports):
+        return [[port] for port in signature.primitive_ports]
+    return ports
+
+
+def _laid(sig: Optional[OpSignature], shape_in: Any, name: str) -> Any:
+    """The operand the signature lays out as its tensor `name` (a layout of
+    `engine_inputs`, placed at the row's ports: `OpSignature.at_ports`), or
+    None where the row has none."""
+    operands = _operands(shape_in)
+    if sig is None or operands is None:
+        return None
+    positions = {pos for pos, layout in sig.engine_inputs
+                 if layout.name == name}
+    if len(positions) > 1:
+        raise ValueError(
+            f"signature {sig.name!r} lays {name!r} out at operands "
+            f"{sorted(positions)}")
+    (position,) = positions or (None,)
+    return (operands[position]
+            if position is not None and position < len(operands) else None)
+
+
+def _lead(sig: Optional[OpSignature], shape_in: Any) -> Any:
+    """The operand the signature's first engine layout names, as one tensor
+    (`sig` placed at the row's ports: `OpSignature.at_ports`); a signature
+    with no layout reads its first operand."""
+    operands = _operands(shape_in)
+    if sig is None or not sig.engine_inputs or operands is None:
+        return shape_in
+    position = sig.engine_inputs[0][0]
+    return operands[position] if position < len(operands) else None
 
 
 def _reduce_axis_identity(shape_in: Any, shape_out: Any) -> Optional[str]:
@@ -1820,16 +1883,26 @@ class RowIdentity:
                 "model's")
         return row["node_dims"]
 
+    def operand_ports(self, row: Dict[str, Any]) -> Any:
+        """The ports the row's launch operands fill (`operand_ports_of`)."""
+        node = self._node_of(row)
+        return operand_ports_of(
+            row, node, get_signature(op_signature(self.op_of(row, node))))
+
     def _keyed(self, row: Dict[str, Any], node: Optional[Any]
                ) -> Tuple[str, Optional[str], Tuple[Any, Any]]:
         op = self.op_of(row, node)
         leaf = self.leaf_of(row)
         walked, shape_out = self.one_event(row)
-        forms = stored_operands(get_signature(op_signature(op)), walked,
+        signature = get_signature(op_signature(op))
+        ports = operand_ports_of(row, node, signature)
+        forms = stored_operands(
+            None if signature is None
+            else signature.at_ports(ports, op=op), walked,
                                 _fanouts(row), _headless_stores(row))
         for shape_in in forms:
             shape_json = self._identity(op, row, leaf, shape_in, shape_out,
-                                        exact=shape_in is walked)
+                                        exact=shape_in is walked, ports=ports)
             if shape_json is not None:
                 break
         else:
@@ -1838,7 +1911,8 @@ class RowIdentity:
             shape_in, shape_out)
 
     def _identity(self, op: str, row: Dict[str, Any], leaf: Dict[str, Any],
-                  shape_in: Any, shape_out: Any, *, exact: bool) -> Optional[str]:
+                  shape_in: Any, shape_out: Any, *, exact: bool,
+                  ports: Any = None) -> Optional[str]:
         """The identity shape of `row` read off `shape_in` — the walk's
         shapes (`exact`: their exact extents apply) or a stored form of
         them (`stored_operands`)."""
@@ -1873,6 +1947,8 @@ class RowIdentity:
             # identity — the same count the overlay's padding reads
             # (`launch_rows`), so a key and its geometry name one launch.
             routed_rows=routed_launch_rows(row),
+            # Which port each operand fills (`operand_ports_of`).
+            operand_ports=ports,
         )
 
 
@@ -1945,7 +2021,8 @@ def _inv_rope_identity(shape_in: Any,
     return json.dumps(dims, separators=(",", ":"), sort_keys=True)
 
 
-def _rope_identity(shape_in: Any, spec_dims: Optional[Dict[str, Any]]) -> Optional[str]:
+def _rope_identity(q: Any, k: Any,
+                   spec_dims: Optional[Dict[str, Any]]) -> Optional[str]:
     """Q/K rotary identity `{B, s_query, n_heads, n_kv_heads, d_rope}`.
 
     Two engine layouts, one cell:
@@ -1960,9 +2037,6 @@ def _rope_identity(shape_in: Any, spec_dims: Optional[Dict[str, Any]]) -> Option
     The previous projector required K to be 3-D, so every GQA fused rope
     dropped as "no shape projection".
     """
-    if not (isinstance(shape_in, (list, tuple)) and len(shape_in) >= 2):
-        return None
-    q, k = shape_in[0], shape_in[1]
     if not (isinstance(q, (list, tuple)) and isinstance(k, (list, tuple))):
         return None
     if len(q) not in (3, 4) or len(k) not in (3, 4):
@@ -2002,7 +2076,7 @@ def _rope_identity(shape_in: Any, spec_dims: Optional[Dict[str, Any]]) -> Option
     return json.dumps(dims, separators=(",", ":"), sort_keys=True)
 
 
-def _moe_gate_identity(shape_in: Any, shape_out: Any) -> Optional[str]:
+def _moe_gate_identity(x: Any, bias: Any, shape_out: Any) -> Optional[str]:
     """`[x[B,s_query,d_model], bias[n_experts]]` → `{B, s_query, n_experts,
     n_experts_active}`.
 
@@ -2012,9 +2086,6 @@ def _moe_gate_identity(shape_in: Any, shape_out: Any) -> Optional[str]:
     much work it takes, and is deliberately left out of the identity so the same
     kernel measurement is shared across models that group differently.
     """
-    if not (isinstance(shape_in, (list, tuple)) and len(shape_in) >= 2):
-        return None
-    x, bias = shape_in[0], shape_in[1]
     if not (isinstance(x, (list, tuple)) and isinstance(bias, (list, tuple))):
         return None
     if len(x) != 3 or len(bias) != 1:
@@ -2117,12 +2188,17 @@ def _dsa_identity(sig: Optional[OpSignature], shape_in: Any, shape_out: Any,
     if any(pos >= len(shape_in) for pos, _layout in laid):
         return None
     # The latent is the cache stored with no head axis, on every sparse
-    # signature: a geometry without KV heads binds input 1 only in that
+    # signature: a geometry without KV heads binds the cache only in that
     # stored form. A signature may lay the broadcast out at rank 4 to say
     # where its head axis is (Hy4's sink span), and `stored_operands` drops
     # that axis where the walk marks the store headless; a rank-4 cache
     # still here was stored per head — not this geometry's.
-    if "n_kv_heads" not in bound and len(shape_in[1]) != 3:
+    # The cache is the operand of the geometry's first layout over the keys
+    # (`s_kv`): the score's K, declared before the value that reads it.
+    cache = next((pos for pos, layout in laid
+                  if "s_kv" in layout.axis_names()), None)
+    if cache is None or ("n_kv_heads" not in bound
+                         and len(shape_in[cache]) != 3):
         return None
     dims = dict(bound, n_topk_keys=bound["s_kv"])
     cell = sig.cell_dims_for(dims)

@@ -973,6 +973,7 @@ COLUMNS: Tuple[Column, ...] = (
              share=(Share.RANK if name.endswith(("_per_rank", "_per_gpu"))
                     else Share.NONE)) for name in (
         "node_dims", "shape_in_exact", "shape_in_dims", "shape_out_dims",
+        "operand_ports",
         "weight_shards", "shape_json", "dtype_env_json", "shape_weight",
         "shape_weight_dims", "weight_bytes_per_rank",
         "weight_bytes_total_per_rank",

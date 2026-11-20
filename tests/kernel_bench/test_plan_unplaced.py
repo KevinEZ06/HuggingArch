@@ -108,7 +108,10 @@ def test_the_plan_consumes_point_rows_classifier_and_its_order(monkeypatch):
     from backend.inference import benchmark_identity, calibration_overlay
     from backend.inference.benchmark_identity import RowIdentity
 
-    competing = {"view_split", "linear", "rmsnorm", "add"}
+    # Llama's residual adds all run inside seam / post-attention
+    # `fused_add_rmsnorm` launches (no standalone `add` row is left), so that
+    # launch plays the signature-but-no-projection role.
+    competing = {"view_split", "linear", "rmsnorm", "fused_add_rmsnorm"}
     real_bindings = calibration_overlay.op_bindings
 
     def bindings():
@@ -139,7 +142,7 @@ def test_the_plan_consumes_point_rows_classifier_and_its_order(monkeypatch):
     assert by_op["view_split"] == "zero_launch"
     assert by_op["linear"] == "declined"
     assert by_op["rmsnorm"] == "missing_signature"
-    assert by_op["add"] == "missing_projection"
+    assert by_op["fused_add_rmsnorm"] == "missing_projection"
 
 
 def test_one_snapshot_writes_all_three_structural_records(monkeypatch, tmp_path):

@@ -739,7 +739,8 @@ class TestShapeInIdentity:
         base["kernel_impl"] = kernel
         base["latency_us"] = latency
         base["shape_json"] = identity_shape_from_shape_in(
-            "flash_attention", shape_in, spec_dims={"kv_block_size": 16})
+            "flash_attention", shape_in, spec_dims={"kv_block_size": 16},
+            operand_ports=[["q"], ["k"], ["v"]])
         return base
 
     def test_prefill_vs_decode_distinct_physical_key(self):
@@ -769,7 +770,8 @@ class TestShapeInIdentity:
         assert dec["s_query"] == 1 and dec["d_model"] == 3072
         # silu_and_mul list-of-tensors → {B,Sq,I}
         silu = _json.loads(identity_shape_from_shape_in(
-            "silu_and_mul", [[1, 2048, 8192], [1, 2048, 8192]]))
+            "silu_and_mul", [[1, 2048, 8192], [1, 2048, 8192]],
+            operand_ports=[["gate"], ["up"]]))
         assert silu == {"B": 1, "s_query": 2048, "d_ffn": 8192}
         # non-projected op → None (fallback)
         assert identity_shape_from_shape_in("linear", [1, 2048, 3072]) is None
@@ -866,7 +868,8 @@ class TestPhysicalDedup:
         r["p95_us"] = latency
         r["samples"] = samples
         r["shape_json"] = identity_shape_from_shape_in(
-            "flash_attention", _DECODE_SHAPE_IN, spec_dims={"kv_block_size": 16})
+            "flash_attention", _DECODE_SHAPE_IN, spec_dims={"kv_block_size": 16},
+            operand_ports=[["q"], ["k"], ["v"]])
         return r
 
     def _pk(self):

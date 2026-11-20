@@ -14,8 +14,10 @@ selection, not the keys attended: GLM-5.3-Flash's k-pool indexer selects
 The same shape search took Hy4's stored latent `[B, s_kv, 576]` for the
 selection whenever `s_kv == s_query` (prefill), keying `s_kv = 576`, its
 head width. Operands are now selected by the signature's declared engine
-layouts (position and rank), the same declaration the provider's canonical
-inputs are built from (`kernel_bench.refs._carried_axes`).
+layouts (the port each fills, and rank), the same declaration the provider's
+canonical inputs are built from (`kernel_bench.refs._carried_axes`). Each
+operand list below is in its plan's port order (q, k, v, …, mask) and names
+its ports, as a row does (`operand_ports`).
 """
 from __future__ import annotations
 
@@ -33,8 +35,24 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from backend.inference.benchmark_identity import _dsa_identity
 from backend.inference.op_signatures import get_signature
 
-SPARSE = get_signature("mla_sparse_attention")
-SINK = get_signature("mla_sparse_sink_attention")
+#: The ports, as a row names them: a separate value, or one latent that is
+#: the span's K and its V.
+QKVM = [["q"], ["k"], ["v"], ["mask"]]
+Q_KV_M = [["q"], ["k", "v"], ["mask"]]
+QKVSM = [["q"], ["k"], ["v"], ["sinks"], ["mask"]]
+
+
+def _at(name, ports, op):
+    """Signature `name` placed at a row's ports (`OpSignature.at_ports`)."""
+    return get_signature(name).at_ports(ports, op=op)
+
+
+def SPARSE(ports=QKVM):
+    return _at("mla_sparse_attention", ports, "flash_dsa")
+
+
+def SINK(ports=QKVSM):
+    return _at("mla_sparse_sink_attention", ports, "flash_dsa_sink")
 #: DSv3.2 / GLM-5.x latent: 512 + 64.
 SPEC = {"n_topk_keys": 2048, "d_kv_lora": 512, "d_qk_rope": 64}
 #: GLM-5.3-Flash: NoPE latent (no rope lane), k-pool of 4.
@@ -44,8 +62,8 @@ KPOOL_SPEC = {"n_topk_keys": 2048, "d_kv_lora": 512}
 #: the attended rows as STORED (no head axis — the walk marks its broadcast
 #: headless and `stored_operands` drops it), the top-k list, the value (the
 #: latent's leading 512 columns, stored the same way).
-V32_DECODE = ([[2, 128, 1, 576], [2, 2048, 576], [2, 1, 2048],
-               [2, 2048, 512]], [2, 128, 1, 512])
+V32_DECODE = ([[2, 128, 1, 576], [2, 2048, 576], [2, 2048, 512],
+               [2, 1, 2048]], [2, 128, 1, 512])
 #: GLM-5.3-Flash decode over a 1152-key cache: 288 POOLS selected, every
 #: one of the 1152 keys attended (the stored latent's rows).
 KPOOL_DECODE = ([[2, 4, 1, 512], [2, 1152, 512], [2, 1, 288]],
@@ -56,8 +74,8 @@ KPOOL_PREFILL = ([[2, 4, 4096, 512], [2, 2051, 512], [2, 4096, 512]],
                  [2, 4, 4096, 512])
 #: Hy4 prefill of 1024 tokens: the stored latent with no head axis, the
 #: top-k list, the sink, the value.
-HY4_PREFILL = ([[1, 1, 1024, 576], [1, 1024, 576], [1, 1024, 1024], [1],
-                [1, 1, 1024, 512]], [1, 1, 1024, 512])
+HY4_PREFILL = ([[1, 1, 1024, 576], [1, 1024, 576], [1, 1, 1024, 512], [1],
+                [1, 1024, 1024]], [1, 1, 1024, 512])
 
 
 def _cell(sig, operands, spec):
@@ -68,7 +86,7 @@ def _cell(sig, operands, spec):
 class TestAttendedKeysAreTheCacheOperandRows(unittest.TestCase):
 
     def test_kpool_cell_attends_the_keys_not_the_pools(self):
-        dims = _cell(SPARSE, KPOOL_DECODE, KPOOL_SPEC)
+        dims = _cell(SPARSE(Q_KV_M), KPOOL_DECODE, KPOOL_SPEC)
         self.assertIsNotNone(dims)
         self.assertEqual((dims["s_kv"], dims["n_topk_keys"]), (1152, 1152))
 
@@ -77,20 +95,20 @@ class TestAttendedKeysAreTheCacheOperandRows(unittest.TestCase):
         # 2051 keys (vLLM `expand_pools_and_append_tail`), more than the
         # spec's 2048: the cache rows are the count, not the spec clamped to
         # them (`min(n_topk_keys, rows)` keyed 2048 and dropped the tail).
-        dims = _cell(SPARSE, KPOOL_PREFILL, KPOOL_SPEC)
+        dims = _cell(SPARSE(Q_KV_M), KPOOL_PREFILL, KPOOL_SPEC)
         self.assertIsNotNone(dims)
         self.assertEqual((dims["s_query"], dims["s_kv"], dims["n_topk_keys"]),
                          (4096, 2051, 2051))
 
     def test_plain_topk_cell_is_unchanged(self):
-        dims = _cell(SPARSE, V32_DECODE, SPEC)
+        dims = _cell(SPARSE(), V32_DECODE, SPEC)
         self.assertEqual((dims["B"], dims["n_heads"], dims["s_query"],
                           dims["d_head"], dims["d_v_head"]),
                          (2, 128, 1, 576, 512))
         self.assertEqual((dims["s_kv"], dims["n_topk_keys"]), (2048, 2048))
 
     def test_stored_latent_is_the_cache_even_when_it_is_query_long(self):
-        dims = _cell(SINK, HY4_PREFILL, SPEC)
+        dims = _cell(SINK(), HY4_PREFILL, SPEC)
         self.assertIsNotNone(dims)
         self.assertEqual((dims["s_kv"], dims["n_topk_keys"]), (1024, 1024))
 
@@ -104,9 +122,11 @@ class TestTheGatedSpanAttendsWhatItSelects(unittest.TestCase):
     with the row")."""
 
     def test_the_selection_is_the_keys_cached(self):
-        gated = [[16, 3, 1024, 256], [16, 1, 1024, 256], [16, 1024, 256],
-                 [16, 1, 1024, 256], [16, 3, 1024, 256]]
-        dims = _cell(get_signature("gqa_sparse_gated_attention"),
+        gated = [[16, 3, 1024, 256], [16, 1, 1024, 256], [16, 1, 1024, 256],
+                 [16, 3, 1024, 256], [16, 1024, 256]]
+        dims = _cell(_at("gqa_sparse_gated_attention",
+                         [["q"], ["k"], ["v"], ["gate"], ["mask"]],
+                         "flash_dsa_gated"),
                      (gated, [16, 1024, 768]), {"n_topk_keys": 2048})
         self.assertEqual(dims, {"B": 16, "n_heads": 3, "n_kv_heads": 1,
                                 "s_query": 1024, "d_head": 256,
@@ -121,8 +141,8 @@ class TestTopKIsDeclared(unittest.TestCase):
     def test_missing_or_zero_topk_is_not_this_kernel(self):
         latent = {"d_kv_lora": 512, "d_qk_rope": 64}
         for spec in (latent, {**latent, "n_topk_keys": 0}):
-            self.assertIsNone(_cell(SPARSE, V32_DECODE, spec))
-        self.assertIsNone(_dsa_identity(SPARSE, *V32_DECODE, None))
+            self.assertIsNone(_cell(SPARSE(), V32_DECODE, spec))
+        self.assertIsNone(_dsa_identity(SPARSE(), *V32_DECODE, None))
 
 
 class TestTheLatentAndThePerHeadGeometries(unittest.TestCase):
@@ -135,15 +155,15 @@ class TestTheLatentAndThePerHeadGeometries(unittest.TestCase):
 
     def test_per_head_span_keys_the_gqa_geometry(self):
         # Qwen QSA decode at one KV head a rank: Q, K, pools, a separate V.
-        qsa = [[2, 3, 1, 256], [2, 1, 1152, 256], [2, 1, 288],
-               [2, 1, 1152, 256]]
-        dims = _cell(SPARSE, (qsa, [2, 3, 1, 256]), {"n_topk_keys": 2048})
+        qsa = [[2, 3, 1, 256], [2, 1, 1152, 256], [2, 1, 1152, 256],
+               [2, 1, 288]]
+        dims = _cell(SPARSE(), (qsa, [2, 3, 1, 256]), {"n_topk_keys": 2048})
         self.assertEqual(dims, {"B": 2, "n_heads": 3, "n_kv_heads": 1,
                                 "s_query": 1, "d_head": 256, "d_v_head": 256,
                                 "s_kv": 1152, "n_topk_keys": 1152})
 
     def test_the_stored_latent_keys_no_kv_heads(self):
-        self.assertNotIn("n_kv_heads", _cell(SPARSE, V32_DECODE, SPEC))
+        self.assertNotIn("n_kv_heads", _cell(SPARSE(), V32_DECODE, SPEC))
 
     def test_a_per_head_store_at_the_latent_width_is_per_head(self):
         # How the cache is STORED decides, not what widths the spec declares:
@@ -153,30 +173,29 @@ class TestTheLatentAndThePerHeadGeometries(unittest.TestCase):
         # `d_kv_lora` keyed it as the latent — the class of the stale Qwen
         # QSA cells that reached FlashMLA ("Invalid d_qk: 256").
         q = [2, 1, 1, 512]
-        dims = _cell(SPARSE, ([q, [2, 1, 1152, 512], [2, 1, 288],
-                               [2, 1, 1152, 512]], q), KPOOL_SPEC)
+        dims = _cell(SPARSE(), ([q, [2, 1, 1152, 512], [2, 1, 1152, 512],
+                                 [2, 1, 288]], q), KPOOL_SPEC)
         self.assertEqual((dims["n_kv_heads"], dims["d_head"],
                           dims["d_v_head"]), (1, 512, 512))
 
     def test_per_head_width_under_a_latent_is_per_head(self):
         q, out = [2, 64, 4096, 192], [2, 64, 4096, 128]
-        dims = _cell(SPARSE, ([q, [2, 64, 2048, 192], [2, 4096, 2048],
-                               [2, 64, 2048, 128]], out), SPEC)
+        dims = _cell(SPARSE(), ([q, [2, 64, 2048, 192], [2, 64, 2048, 128],
+                                 [2, 4096, 2048]], out), SPEC)
         self.assertEqual((dims["n_kv_heads"], dims["d_head"],
                           dims["d_v_head"]), (64, 192, 128))
 
     def test_a_per_head_span_without_its_value_is_no_cell(self):
-        # The per-head geometry lays V out at input 3; an operand list that
-        # stops short of it would otherwise bind on Q and K alone.
-        q = [2, 3, 1, 256]
-        self.assertIsNone(_dsa_identity(
-            SPARSE, [q, [2, 1, 1152, 256], [2, 1, 288]], q,
-            {"n_topk_keys": 2048}))
+        # The span's plan requires its V (`required_ports`); an operand list
+        # that names none — neither its own nor one shared with K — would
+        # otherwise bind the per-head geometry on Q and K alone.
+        with self.assertRaisesRegex(ValueError, "requires"):
+            SPARSE([["q"], ["k"], ["mask"]])
 
     def test_ungrouped_heads_are_no_cell(self):
         q = [2, 3, 1, 256]
         self.assertIsNone(_dsa_identity(
-            SPARSE, [q, [2, 2, 1152, 256], [2, 1, 288], [2, 2, 1152, 256]],
+            SPARSE(), [q, [2, 2, 1152, 256], [2, 2, 1152, 256], [2, 1, 288]],
             q, {"n_topk_keys": 2048}))
 
 
@@ -242,11 +261,11 @@ class TestOneRuleForTheLatent(unittest.TestCase):
 
     def test_the_sink_signature_takes_no_cache_stored_per_head(self):
         # Hy4's sink signature has no per-head geometry: a rank-4 cache at
-        # input 1 is no cell, not the latent read by shape.
+        # its `k` port is no cell, not the latent read by shape.
         q, out = [1, 1, 1024, 576], [1, 1, 1024, 512]
         self.assertIsNone(_dsa_identity(
-            SINK, [q, [1, 1, 1024, 576], [1, 1024, 1024], [1],
-                   [1, 1, 1024, 512]], out, SPEC))
+            SINK(), [q, [1, 1, 1024, 576], [1, 1, 1024, 512], [1],
+                     [1, 1024, 1024]], out, SPEC))
 
     def test_a_one_head_store_keeps_its_head_axis(self):
         # A K stored per KV head and broadcast to four query heads, one KV
@@ -254,15 +273,15 @@ class TestOneRuleForTheLatent(unittest.TestCase):
         # walk's headless answer drops the axis.
         from fractions import Fraction
         from backend.inference.benchmark_identity import stored_operands
-        walked = [[2, 4, 1, 512], [2, 4, 1152, 512], [2, 1, 288],
-                  [2, 4, 1152, 512]]
-        (form,) = stored_operands(SPARSE, walked,
-                                  {1: Fraction(4), 3: Fraction(4)})
+        walked = [[2, 4, 1, 512], [2, 4, 1152, 512], [2, 4, 1152, 512],
+                  [2, 1, 288]]
+        (form,) = stored_operands(SPARSE(), walked,
+                                  {1: Fraction(4), 2: Fraction(4)})
         self.assertEqual(form[1], [2, 1, 1152, 512])
-        dims = _cell(SPARSE, (form, [2, 4, 1, 512]), KPOOL_SPEC)
+        dims = _cell(SPARSE(), (form, [2, 4, 1, 512]), KPOOL_SPEC)
         self.assertEqual(dims["n_kv_heads"], 1)
-        (latent,) = stored_operands(SPARSE, walked, {1: Fraction(4)},
-                                    frozenset({1, 3}))
+        (latent,) = stored_operands(SPARSE(), walked, {1: Fraction(4)},
+                                    frozenset({1, 2}))
         self.assertEqual(latent[1], [2, 1152, 512])
 
 

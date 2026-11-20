@@ -1259,19 +1259,22 @@ class TestSwaAndAllreduceBecomeMeasurable:
         from backend.inference.op_signatures import get_signature
         from kernel_bench.providers.attention import _fa_window_size
         shape = [[1, 32, 128, 128], [1, 8, 128, 128]]
+        qk = [["q"], ["k"]]          # the operands' ports (`operand_ports`)
         # The deployment's page, which every paged cell carries.
         page = {"kv_block_size": 16}
         windowed = json.loads(identity_shape_from_shape_in(
-            "flash_attention", shape, spec_dims={"s_window": 4096, **page}))
+            "flash_attention", shape, spec_dims={"s_window": 4096, **page},
+            operand_ports=qk))
         assert windowed["s_window"] == 4096
         dense = json.loads(identity_shape_from_shape_in(
-            "flash_attention", shape, spec_dims=page))
+            "flash_attention", shape, spec_dims=page, operand_ports=qk))
         assert "s_window" not in dense
         leaked = json.loads(identity_shape_from_shape_in(
             "flash_attention", shape,
             spec_dims=row_invocation_dims({"s_window": 4096, "n_heads": 32},
                                           signature=get_signature("gqa_attention"),
-                                          extra=page)))
+                                          extra=page),
+            operand_ports=qk))
         assert "s_window" not in leaked
         gqa = get_signature("gqa_attention")
         projected = json.loads(gqa.project(json.dumps(windowed)))
@@ -1295,14 +1298,16 @@ class TestSwaAndAllreduceBecomeMeasurable:
         s = identity_shape_from_shape_in(
             "flash_attention",
             [[1, 32, 128, 192], [1, 8, 128, 192], [1, 8, 128, 128]],
-            shape_out=[1, 32, 128, 128], spec_dims=page)
+            shape_out=[1, 32, 128, 128], spec_dims=page,
+            operand_ports=[["q"], ["k"], ["v"]])
         d = json.loads(s)
         assert d["d_head"] == 192
         assert d["d_v_head"] == 128
         sym = json.loads(identity_shape_from_shape_in(
             "flash_attention",
             [[1, 32, 128, 128], [1, 8, 128, 128], [1, 8, 128, 128]],
-            shape_out=[1, 32, 128, 128], spec_dims=page))
+            shape_out=[1, 32, 128, 128], spec_dims=page,
+            operand_ports=[["q"], ["k"], ["v"]]))
         assert "d_v_head" not in sym
 
     def test_sinks_presence_does_not_leak_from_the_model_wide_table(self):
@@ -1310,9 +1315,10 @@ class TestSwaAndAllreduceBecomeMeasurable:
             attach_gqa_sinks, identity_shape_from_shape_in, row_invocation_dims)
         from backend.inference.op_signatures import get_signature
         shape = [[1, 32, 128, 128], [1, 8, 128, 128]]
+        qk = [["q"], ["k"]]          # the operands' ports (`operand_ports`)
         page = {"kv_block_size": 16}
         base = identity_shape_from_shape_in("flash_attention", shape,
-                                            spec_dims=page)
+                                            spec_dims=page, operand_ports=qk)
         sunk = json.loads(attach_gqa_sinks(base, True))
         assert sunk["n_attn_sinks"] == 32
         assert "n_attn_sinks" not in json.loads(base)
@@ -1320,7 +1326,8 @@ class TestSwaAndAllreduceBecomeMeasurable:
             "flash_attention", shape,
             spec_dims=row_invocation_dims({"n_attn_sinks": 32, "s_window": 128},
                                           signature=get_signature("gqa_attention"),
-                                          extra=page)))
+                                          extra=page),
+            operand_ports=qk))
         assert "n_attn_sinks" not in leaked
         assert "s_window" not in leaked
 
@@ -1339,7 +1346,8 @@ class TestSwaAndAllreduceBecomeMeasurable:
         cell = json.loads(identity_shape_from_shape_in(
             "flash_attention",
             [[1, 32, 128, 128], [1, 8, 128, 128], [1, 8, 128, 128]],
-            shape_out=[1, 32, 128, 128], spec_dims=spec))
+            shape_out=[1, 32, 128, 128], spec_dims=spec,
+            operand_ports=[["q"], ["k"], ["v"]]))
         assert not set(gqa.variant_dims) & set(cell), cell
 
     def test_mimo_swa_has_sink_full_does_not(self):
@@ -3584,10 +3592,19 @@ class TestIdentityProjectionsForFusedOps:
     `refs._tokens` reads B×1 and times a ONE-token kernel under a full-sequence
     label (that produced rmsnorm rows at 977,839% of peak bandwidth)."""
 
+    #: The ports a fused launch's operands fill, as its row names them
+    #: (`operand_ports`).
+    PORTS: ClassVar[dict] = {
+        "fused_qk_rope": [["q_pe"], ["k_pe"]],
+        "moe_fused_gate": [["gating"], ["bias"]],
+        "indexer_logits": [["q"], ["k"], ["w"]],
+    }
+
     def _ident(self, op, shape_in, **kw):
         from backend.inference.benchmark_identity import identity_shape_from_shape_in
         import json
-        out = identity_shape_from_shape_in(op, shape_in, **kw)
+        out = identity_shape_from_shape_in(
+            op, shape_in, operand_ports=self.PORTS.get(op), **kw)
         return json.loads(out) if out else None
 
     def test_rope_reads_rotation_width_from_the_spec(self):
@@ -3695,11 +3712,16 @@ class TestSparseLatentAttention:
     the projection produced nothing and every DSA row was benched at the
     model-wide fallback shape — 2430 rows at d_head = seq_len."""
 
+    #: The span's operands as a row names them (`operand_ports`): the query,
+    #: the latent — its K and its V, one stored tensor — and the selection.
+    PORTS: ClassVar[list] = [["q"], ["k", "v"], ["mask"]]
+
     def _ident(self, shape_in, shape_out, **kw):
         from backend.inference.benchmark_identity import identity_shape_from_shape_in
         import json
         out = identity_shape_from_shape_in("flash_dsa", shape_in,
-                                           shape_out=shape_out, **kw)
+                                           shape_out=shape_out,
+                                           operand_ports=self.PORTS, **kw)
         return json.loads(out) if out else None
 
     def test_routes_to_its_own_signature_not_dense_attention(self):
@@ -8873,7 +8895,7 @@ class TestAJobCarriesTheShapesItsScalarsCameFrom:
                       if "kv_block_size" in j["dims"] else None)
             got = identity_shape_from_shape_in(
                 j["op"], j["shape_in"], shape_out=j.get("shape_out"),
-                spec_dims=served)
+                spec_dims=served, operand_ports=j.get("operand_ports"))
             if got is None:
                 continue          # needs context this job does not carry
             checked += 1
@@ -9058,6 +9080,7 @@ class TestTheBuilderAllocatesTheCarriedActivation:
                   "n_kv_heads": 2, "d_head": 16},
             dtype_env=self._DT, phase="prefill", tp=1,
             shape_in=[[1, 32, 8, 16], [1, 8, 8, 16], [1, 8, 8, 16]],
+            operand_ports=[["q"], ["k"], ["v"]],
         )
         ins = build_inputs(get_ref("gqa_attention"), inv, "cpu")
         assert tuple(ins["q"].shape) == (1, 8, 32, 16)

@@ -44,8 +44,14 @@ naive_pattern:
     apply:
       op_choices: [attention_apply, swa_attention_apply]
       inputs: [softmax.out, external.v]
+  # DeepSeek-V4's attention reads one latent row as its K and its V: one
+  # tensor of both ports, read as K (`NaivePattern.shared_ports`).
+  shared_ports:
+    v: k
   io_mapping:
     q:      external.q
     k:      external.k
     v:      external.v
+    mask:   external.mask
+    sinks:  external.sinks
     output: apply.out

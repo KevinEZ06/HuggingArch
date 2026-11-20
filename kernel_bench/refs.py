@@ -215,6 +215,9 @@ def _carried_axes(inv: Invocation) -> Dict[str, int]:
     operands = _operand_list(inv.shape_in)
     if sig is None or operands is None:
         return {}
+    # A multi-port launch's operands, placed by the ports the job names
+    # (refused when it names none).
+    sig = sig.at_ports(inv.operand_ports, op=inv.op)
     engines = (sig.variant_engine_inputs if sig.binds_variant(inv.dims)
                else sig.engine_inputs)
     return _zip_carried(engines, operands, spec=inv.dims)

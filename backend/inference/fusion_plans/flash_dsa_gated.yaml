@@ -49,4 +49,5 @@ naive_pattern:
     k:       external.k
     v:       external.v
     gate:    external.gate
+    mask:    external.mask
     output:  gated.out

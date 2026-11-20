@@ -48,4 +48,5 @@ naive_pattern:
   io_mapping:
     x:      external.x
     gate:   external.gate
+    weight: external.weight
     output: gated.out

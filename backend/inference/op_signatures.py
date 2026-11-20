@@ -65,11 +65,14 @@ without making the signature's default dense cell speak a page it never touches.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, Mapping, Optional, Sequence, Tuple
+from typing import (Any, Dict, FrozenSet, List, Mapping,
+                    Optional, Sequence, Tuple, Union)
 
 from backend.arch.dims import get as dim_symbol
+from backend.inference.fusion_plans import FUSION_SCHEMES
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,11 @@ class TensorLayout:
         """The physical shape this declaration implies under `dims`
         (None for a non-cell dim)."""
         return tuple(_extent(ax, dims) for ax in self.axes)
+
+    def axis_names(self) -> Tuple[str, ...]:
+        """Every named axis of this tensor (packed entries included), in
+        declaration order."""
+        return tuple(a for ax in self.axes for a in _named_axes(ax))
 
     def head_axes(self) -> Tuple[str, ...]:
         """The named axes of this tensor that `dims.yaml` classes
@@ -431,11 +439,17 @@ def zip_engine_layouts(
     if not engines:
         return None
     spec = spec or {}
-    by_key: Dict[Tuple[int, int], TensorLayout] = {}
+    if any(isinstance(pos, str) for pos, _layout in engines):
+        raise ValueError(
+            "engine layouts keyed by port are read through the row's "
+            "operand ports (`OpSignature.at_ports`), not zipped as declared")
+    # One operand can fill two ports (an MLA latent that is K and V): both
+    # layouts of its rank bind it, and must agree.
+    by_key: Dict[Tuple[int, int], List[TensorLayout]] = {}
     positions: list = []
     for pos, layout in engines:
         key = (pos, len(layout.axes))
-        by_key[key] = layout
+        by_key.setdefault(key, []).append(layout)
         if pos not in positions:
             positions.append(pos)
     dims: Dict[str, int] = {}
@@ -448,11 +462,12 @@ def zip_engine_layouts(
         t = operands[pos]
         if not isinstance(t, (list, tuple)):
             return None
-        layout = by_key.get((pos, len(t)))
-        if layout is None:
+        layouts = by_key.get((pos, len(t)))
+        if layouts is None:
             return None
-        if not bind_layout(layout, t, dims, spec):
-            return None
+        for layout in layouts:
+            if not bind_layout(layout, t, dims, spec):
+                return None
         bound = True
     if not bound:
         return None
@@ -552,7 +567,7 @@ class OpSignature:
     # Empty = the default `inputs` is the only geometry.
     variant_inputs: Tuple[TensorLayout, ...] = ()
     # Engine-order layouts for that geometry, same contract as `engine_inputs`.
-    variant_engine_inputs: Tuple[Tuple[int, TensorLayout], ...] = ()
+    variant_engine_inputs: Tuple[Tuple[Union[int, str], TensorLayout], ...] = ()
     # Axes that identify a measurement. () means "declared unprojected" — see
     # `project`. None (the default) means cell + variant, except that the page
     # joins only a contract that reads a cache. A write-only variant page is
@@ -577,14 +592,28 @@ class OpSignature:
     #: DeltaNet's `kda`. Two Triton kernels with the same dims; without the
     #: split they would share one physical key.
     decay_rank_variant: str = ""
-    # Engine-side operand layouts for identity projection: (operand position,
-    # layout of that tensor as the ENGINE emits it). Same axis language as
+    # Engine-side operand layouts for identity projection: (operand, layout
+    # of that tensor as the ENGINE emits it). The operand is a position for
+    # a primitive op, and for a fused launch of two or more input ports the
+    # PORT it fills (`NaivePattern.input_ports`, the plan's `io_mapping`):
+    # which tensor stands where in a launch's operand list depends on
+    # which ports that graph fills — an optional mask present or not, one
+    # latent that is both K and V — so a row's operands are read by the
+    # ports it names (`at_ports`), never by a position written here. Same axis language as
     # `inputs` — a name, a packed tuple, a sum — so a permute or a pack is
     # a declaration, not a second projector. An operand may have several
     # layouts only when they differ in rank; zip looks up `(position, rank)`
     # and does not search. Registration rejects two layouts of the same
     # rank at the same position.
-    engine_inputs: Tuple[Tuple[int, TensorLayout], ...] = ()
+    engine_inputs: Tuple[Tuple[Union[int, str], TensorLayout], ...] = ()
+    #: For a port-keyed signature a primitive op is also measured under: the
+    #: port each of the primitive's operands is, by position. A primitive
+    #: has no ports, and `rope` (one operand, a query or a key) and
+    #: `indexer_logits` (q, k, the head weights) share their cells with a
+    #: plan's launch; the join of the two vocabularies is stated once, here,
+    #: and checked against the primitive's arity and the plans' required
+    #: ports (`_check_operand_keys`).
+    primitive_ports: Tuple[str, ...] = ()
     # The same declaration for the engine's OUTPUT tensors, for a kernel
     # whose geometry is on the side it writes: `permute` reads token-ordered
     # rows and writes the `[n_expert_copies, M, d_model]` buffer the launch
@@ -677,6 +706,66 @@ class OpSignature:
         return any(t.role == "kv"
                    for t in (self.inputs + self.variant_inputs))
 
+    def keyed_by_port(self) -> bool:
+        """Whether this signature names its operands by port (a fused
+        launch of several input ports) rather than by position."""
+        return any(isinstance(key, str) for key, _layout in
+                   (*self.engine_inputs, *self.variant_engine_inputs))
+
+    def at_ports(self, ports: Optional[Sequence[Sequence[str]]], *,
+                 op: Optional[str] = None) -> "OpSignature":
+        """This signature with its operands placed where one row's are:
+        each port-keyed layout at the position of the operand that fills
+        that port (`ports`, the row's `operand_ports`: per operand, the
+        ports it fills in plan order). An operand that fills several ports
+        (one latent that is a span's K and its V) is read as the first: its
+        extents are that port's tensor, and a later port's layout, which
+        reads the same storage as another tensor, is not placed; nor is a
+        layout on a port no operand fills (an optional port the graph does
+        not have: Qwen3.8's indexer weighs no heads). A port the launch's
+        plan (`op`) requires that no operand fills — not even as the second
+        port of a shared tensor — is no launch of the plan, refused
+        (`NaivePattern.required_ports`): a per-head sparse span that lost
+        its V would otherwise bind its geometry on Q and K. Position-keyed
+        signatures are returned as they are.
+
+        An operand list that names no ports is refused, loudly — a job
+        written before launches named their operands would be read by where
+        its tensors happen to stand. A primitive op's row names its operands
+        by `primitive_ports` (`benchmark_identity.operand_ports_of`)."""
+        if not self.keyed_by_port():
+            return self
+        if ports is None:
+            raise ValueError(
+                f"signature {self.name!r} reads its operands by port, and "
+                f"this row or job names none (`operand_ports`); a launch's "
+                f"operand order is no contract — regenerate it from the "
+                f"current plan")
+        where: Dict[str, int] = {}
+        filled: set = set()
+        for position, names in enumerate(ports):
+            names = [str(name) for name in names]
+            if names:
+                where.setdefault(names[0], position)
+            filled.update(names)
+        scheme = FUSION_SCHEMES.get(op) if op is not None else None
+        if scheme is not None:
+            missing = sorted(scheme.naive_pattern.required_ports() - filled)
+            if missing:
+                raise ValueError(
+                    f"{op!r}: its launch names no operand for the port(s) "
+                    f"{missing} its plan requires (ports named: "
+                    f"{[list(p) for p in ports]})")
+
+        def placed(engines):
+            return tuple((key if not isinstance(key, str) else where[key],
+                          layout) for key, layout in engines
+                         if not isinstance(key, str) or key in where)
+
+        return dataclasses.replace(
+            self, engine_inputs=placed(self.engine_inputs),
+            variant_engine_inputs=placed(self.variant_engine_inputs))
+
     def head_axis(self, position: int, rank: int) -> Optional[int]:
         """Where operand `position`, a tensor of `rank` dims, carries its head
         axis in the engine's layout — the axis `dims.yaml` classes
@@ -690,6 +779,10 @@ class OpSignature:
         across a group of queries, absorbed MLA one latent across all of
         them. Derived from the layouts, not listed per signature. Two layouts
         of one operand that disagree on it are a declaration error."""
+        if self.keyed_by_port():
+            raise ValueError(
+                f"signature {self.name!r} names its operands by port; ask "
+                f"the signature placed at a row's ports (`at_ports`)")
         found = set()
         for pos, layout in (*self.engine_inputs, *self.variant_engine_inputs):
             if pos != position or len(layout.axes) != rank:
@@ -899,6 +992,62 @@ _SIGNATURES: Dict[str, OpSignature] = {}
 _OP_TO_SIGNATURE: Dict[str, str] = {}
 
 
+def _check_operand_keys(sig: OpSignature) -> None:
+    """A signature names a fused launch's operands by the ports its plan
+    declares (`NaivePattern.input_ports`). Refused:
+
+      * a port a bound plan does not declare, or one on a single-port
+        launch — its one operand is position 0, which a job of any age
+        names alike;
+      * a position on a launch of two or more ports, whose operand order is
+        no contract (a launch lists the tensors that fill its ports, in
+        port order, and which are there is the graph's);
+      * a port on a collective's launch, read by the one flow it moves
+        (`NaivePattern.collective`, which the launch carries as
+        `FusedNode.is_comm_op`);
+      * `primitive_ports` naming a port a bound plan does not declare, or
+        on a signature read by position — a primitive op has no ports, so a
+        port-keyed signature it is measured under states which port each of
+        its operands is, once, here."""
+    keys = [key for key, _layout in (*sig.engine_inputs,
+                                     *sig.variant_engine_inputs)]
+    named = sorted({key for key in keys if isinstance(key, str)})
+    positional = sorted({key for key in keys if not isinstance(key, str)})
+    if sig.primitive_ports and not named:
+        raise ValueError(
+            f"{sig.name}: `primitive_ports` names the operands of a "
+            f"signature read by position")
+    unported = [op for op in sig.binds_ops if op not in FUSION_SCHEMES]
+    if named and unported and not sig.primitive_ports:
+        raise ValueError(
+            f"{sig.name}: reads its operands by port and measures the "
+            f"primitive op(s) {unported}, which have none; state each of "
+            f"their operands' port (`primitive_ports`)")
+    for op in sig.binds_ops:
+        scheme = FUSION_SCHEMES.get(op)
+        if scheme is None:
+            continue
+        pattern = scheme.naive_pattern
+        ports_of_op = pattern.input_ports()
+        if pattern.collective() or len(ports_of_op) == 1:
+            if named:
+                raise ValueError(
+                    f"{sig.name}: {op!r} has one operand — "
+                    f"{'the flow its collective moves' if pattern.collective() else 'its one port'}"
+                    f" — which is position 0 at any age; not ports {named}")
+            continue
+        if positional:
+            raise ValueError(
+                f"{sig.name}: operand(s) {positional} of {op!r} named by "
+                f"position, but {op!r} has the input ports "
+                f"{list(ports_of_op)}; name the port")
+        for key in (*named, *sig.primitive_ports):
+            if key not in ports_of_op:
+                raise ValueError(
+                    f"{sig.name}: port {key!r} is no input port of {op!r} "
+                    f"(its ports: {list(ports_of_op)})")
+
+
 def register_signature(sig: OpSignature) -> None:
     # The engine-side layout is a permutation of the contract, or it is a
     # second layout — the failure mode this declaration exists to end.
@@ -922,6 +1071,7 @@ def register_signature(sig: OpSignature) -> None:
                     f"{sig.name}: operand {pos} has two engine layouts "
                     f"of rank {key[1]} — rank must select a unique packing")
             seen_rank[key] = layout.name
+    _check_operand_keys(sig)
     for ax in sig.output_axes:
         if ax not in cell:
             raise ValueError(

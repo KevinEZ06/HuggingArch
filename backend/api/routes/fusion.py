@@ -144,19 +144,22 @@ def _serialize_naive_pattern(pattern: Any) -> Dict[str, Any]:
             },
             "edges": [{"src": inp, "dst": "siblings"} for inp in pp.shared_inputs],
             "io_mapping": dict(pattern.io_mapping),
-            "external_inputs": pattern.external_input_names(),
+            "external_inputs": list(pattern.input_ports()),
         }
     nodes_out: Dict[str, Any] = {}
     edges_out: List[Dict[str, str]] = []
     for name, pn in pattern.expanded_nodes().items():
         nodes_out[name] = _serialize_pattern_node(pn)
-        edges_out.extend({"src": inp, "dst": name} for inp in pn.inputs)
+        # An optional slot is an edge too: its port is one of the source
+        # nodes (`input_ports`), drawn whether or not a graph fills it.
+        edges_out.extend({"src": inp, "dst": name}
+                         for inp in (*pn.inputs, *pn.optional_inputs))
     return {
         "kind": "nodes",
         "nodes": nodes_out,
         "edges": edges_out,
         "io_mapping": dict(pattern.io_mapping),
-        "external_inputs": pattern.external_input_names(),
+        "external_inputs": list(pattern.input_ports()),
     }
 
 

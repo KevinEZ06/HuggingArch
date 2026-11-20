@@ -1011,6 +1011,10 @@ def _build_jobs_over_points(
                         # rebuilding it from the scalars is how the harness came to
                         # hold a second, unreconciled statement of it.
                         "shape_in": shp_in,
+                        # Which port of its plan each operand of a fused
+                        # launch fills (the row's `operand_ports`): a signature
+                        # reads a multi-port launch's operands by them.
+                        "operand_ports": point.operand_ports,
                         "shape_out": shp_out,
                         "shape_weight": shp_w,
                         "dtype_env": row_dtype_env,
