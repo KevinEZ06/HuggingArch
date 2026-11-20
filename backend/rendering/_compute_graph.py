@@ -706,7 +706,12 @@ def serialize_post_tree(post_tree, resolved_spec, *,
             new_inputs: List[str] = []
             new_ports: List[str] = []
             for inp, port in zip(inputs, ports, strict=False):
-                pid_internal = _producer_id(inp, internal)
+                # The producer is the ref less the port the ref declares
+                # (`input_ports`), not less whatever follows its last dot:
+                # a parameter named `hc_norm.weight` is not port `weight`
+                # of a member named `hc_norm`.
+                pid_internal = (inp[:-len(port) - 1]
+                                if port and inp.endswith(f".{port}") else inp)
                 if pid_internal in internal:
                     new_inputs.append(f"{sid}/{inp}")
                     new_ports.append(port)
@@ -853,9 +858,15 @@ def serialize_post_tree(post_tree, resolved_spec, *,
     # declares, and the launch stands at that entry's place in the spine
     # (`layer_path`): a launch across the last layer's seam takes the final
     # norm and is named for the seam (`norm__seam@block`).
-    spine_names = {tuple(entry.layer_path): entry.name
-                   for entry in iter_tree(program.resolved).spine
-                   if entry.kind == "op"}
+    spine_names: Dict[tuple, str] = {}
+
+    def _spine_ops(entries) -> None:
+        for entry in entries:
+            if entry.kind == "op":
+                spine_names[tuple(entry.layer_path)] = entry.name
+            _spine_ops(entry.children or ())
+
+    _spine_ops(iter_tree(program.resolved).spine)
     for node in top_level:
         name = spine_names.get(tuple(node.layer_path or ()))
         if name is not None and name != node.display_path:
@@ -891,6 +902,12 @@ def serialize_post_tree(post_tree, resolved_spec, *,
         for child in entry.children:
             if child.kind == "op":
                 group_scope[child.name] = dict(local)
+    # A launch that replaced a group's op reads in that op's scope: it
+    # stands at the op's place in the spine (`layer_path`).
+    for node in top_level:
+        name = spine_names.get(tuple(node.layer_path or ()))
+        if name in group_scope and node.display_path != name:
+            group_scope[node.display_path] = group_scope[name]
     # A stack's INNER stream read from outside it: DeepSeek-V4.1's model-level
     # `hc_exit` reduces the backbone's final `hc_pre_mix`. Which write that
     # is, is the walk's own answer, asked once
