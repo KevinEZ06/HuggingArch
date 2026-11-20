@@ -556,8 +556,15 @@ def run_jobs(
         if (not in_group) and any(p.world for p, *_rest in todo):
             from .group import GroupFailed, measure_job
             try:
+                # The job the CHILDREN get, stamped here: a collective is
+                # measured by a second `run_jobs` inside each rank, and
+                # that one is given a job rather than this call's flags.
+                # Stamping only in the loop below reaches every row except
+                # the collectives — which are the only rows the reach
+                # applies to.
                 rows = measure_job(
-                    job, env=env, stride=comm_stride, origin=comm_origin,
+                    _job_with_comm_domain(job, comm_domain),
+                    env=env, stride=comm_stride, origin=comm_origin,
                     take_lock=take_lock, date=date, contributor=contributor,
                     run_id=run_id, box=box, timeout_s=group_timeout,
                     master_addr=master_addr, master_port=master_port,

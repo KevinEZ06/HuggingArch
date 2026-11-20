@@ -380,3 +380,50 @@ class TheReachSurvivesTheRoundTrip(unittest.TestCase):
         self.assertEqual(
             shape,
             '{"n_comm_elems":4194304,"n_comm_ranks":16,"n_comm_stride":1}')
+
+
+class TheGroupPathCarriesTheReachToo(unittest.TestCase):
+    """A collective is measured by a second `run_jobs` inside each rank.
+
+    That inner call is handed a JOB, not this call's flags, so a reach
+    stamped only on the outer loop reaches every row except the
+    collectives -- which are the only rows a reach applies to. The first
+    cross-machine run wrote three rows keyed as intra-host because of
+    exactly this, and nothing failed: the rows were valid, passed their
+    cross-check, and said the wrong thing about where they were taken.
+    """
+
+    JOB = {
+        "op": "all_reduce", "signature": "all_reduce",
+        "dims": {"n_comm_elems": 8, "n_comm_ranks": 2, "n_comm_stride": 1},
+        "dtype_env": {"activation": "bf16"}, "phase": "prefill", "tp": 1,
+    }
+
+    def test_the_job_handed_to_the_ranks_is_stamped(self):
+        from kernel_bench.driver import _job_with_comm_domain
+        from backend.inference.comm_cost import COMM_REACH_SCALEUP
+        seen = {}
+
+        def fake_measure_job(job, **_kw):
+            seen["job"] = job
+            return []
+
+        # What `run_jobs` does at the group branch, in one line: the job
+        # is stamped BEFORE it is handed over.
+        fake_measure_job(_job_with_comm_domain(self.JOB, "scaleup"))
+        self.assertEqual(seen["job"].get("comm_domain"), COMM_REACH_SCALEUP,
+                         "the ranks were handed an unstamped job, so their "
+                         "rows will say intra-host whatever the flag said")
+
+    def test_the_group_branch_stamps_before_handing_over(self):
+        """Read the call site itself: `measure_job` must be given a
+        stamped job, not the raw one."""
+        import inspect
+        from kernel_bench import driver
+        src = inspect.getsource(driver.run_jobs)
+        call = src[src.index("rows = measure_job("):]
+        call = call[:call.index(")")]
+        self.assertIn("_job_with_comm_domain", call,
+                      "the group branch hands `measure_job` an unstamped "
+                      "job; collectives are the only rows the reach "
+                      "applies to, so that is all of them")
