@@ -485,25 +485,37 @@ def _routed_source(inv: Invocation, device: str, gen: Any, tokens: int,
     moe_token_counts`, which is where a measured or declared load imbalance
     already lives): the row map is the routing, so a balanced cell and a
     skewed one are different gathers of the same width.
+
+    Every token appears the same number of times, give or take one, because
+    a router sends each token to exactly `topk` experts — the count is a
+    property of the routing rule, not a draw. Independent uniform picks
+    would instead be Poisson about that mean, and the tail is wide: at
+    8352 rows over 1024 tokens the mean is 8.16 and the fullest token
+    takes 18-22. That tail is not an abstraction a consumer can ignore —
+    a provider laying these rows out `[tokens, max_slots]`, as
+    `npu_moe_token_unpermute` requires, allocates and walks 2.7x the rows
+    the cell has, and the measurement comes back slow for a reason that
+    exists nowhere but in this generator. The sum is unchanged, so no
+    cross-check catches it.
+
+    So the counts are dealt out evenly and then shuffled: the same rows,
+    the same per-expert blocks, the same seeded generator, and the fullest
+    token now takes `ceil(routed / tokens)`.
     """
     import torch
-    counts = list(inv.moe_token_counts) or [routed]
-    out = torch.empty(routed, dtype=torch.int64, device=device)
-    at = 0
-    for count in counts:
-        if at >= routed:
-            break
-        take = min(int(count), routed - at)
-        if take:
-            out[at:at + take] = torch.randint(
-                0, max(1, tokens), (take,), device=device, dtype=torch.int64,
-                generator=gen)
-        at += take
-    if at < routed:                      # a cell whose counts under-fill the
-        out[at:] = torch.randint(        # padded buffer: the rest are padding
-            0, max(1, tokens), (routed - at,), device=device,
-            dtype=torch.int64, generator=gen)
-    return out
+    # Deal every token the same number of rows (the last few take one more
+    # when the total does not divide), then let the generator decide which
+    # row is whose. `randperm` is the one draw, so a cell's routing still
+    # varies with its seed.
+    #
+    # `moe_token_counts` is not read here any more and does not need to be:
+    # it blocks the rows BY EXPERT, and this answers which TOKEN each row
+    # came from. The per-expert blocking is a property of the row ORDER,
+    # which the shuffle leaves to the cell — the old loop walked those
+    # counts only to pick a different `randint` per block, which drew from
+    # the same distribution each time.
+    deal = torch.arange(routed, device=device, dtype=torch.int64) % max(1, tokens)
+    return deal[torch.randperm(routed, device=device, generator=gen)]
 
 
 def _moe_permute_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
