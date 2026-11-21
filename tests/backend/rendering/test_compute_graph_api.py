@@ -5,8 +5,10 @@ for the inference page's ELK visualization.
 Covers:
   * Endpoint shape: {model, framework, parallel, graph:{nodes:[...]}}.
   * Node kinds: compute / fused / comm, with fused_op on fused nodes.
-  * TP=1 vs TP=8 graph difference: comm nodes appear at TP>1, and the
-    norm fusion node switches fused_add_rmsnorm → allreduce_fused_rmsnorm.
+  * TP=1 vs TP=8 graph difference: comm nodes appear at TP>1, while the
+    norm launch is phase-bound — prefill keeps the all-reduce outside
+    `fused_add_rmsnorm`, decode takes the whole chain as
+    `allreduce_fused_rmsnorm`.
   * Error paths: missing model, bad framework, invalid parallel config.
 """
 from __future__ import annotations
@@ -109,9 +111,9 @@ class TestComputeGraphEndpoint(unittest.TestCase):
         self.assertEqual(data["model"], "meta-llama/Llama-2-7b-hf")
         top = data["graph"]["nodes"]
         ids = {n["id"] for n in top}
+        by_id = {n["id"]: n for n in top}
         # Whole-model backbone present at the top level.
         self.assertIn("embed_tokens", ids)
-        self.assertIn("norm", ids)
         self.assertIn("lm_head", ids)
         # At least one collapsed block stack.
         block_nodes = [n for n in top if n["op"] == "block_stack"]
@@ -120,8 +122,14 @@ class TestComputeGraphEndpoint(unittest.TestCase):
             self.assertTrue(b["expandable"])
             self.assertTrue(b["children"])
             self.assertIn("count", b)
-        # Backbone is wired: norm/lm_head reference upstream producers.
-        norm = next(n for n in top if n["id"] == "norm")
+        # The final norm may be replaced by the launch across the last
+        # layer seam (`norm__seam@...`), so its node is the producer the
+        # head names — not necessarily the spine's bare spelling.
+        norm_ids = {pid for pid in next(
+            n for n in top if n["id"] == "lm_head")["inputs"]
+            if pid in ids}
+        self.assertTrue(norm_ids, "lm_head names no top-level norm producer")
+        norm = next(by_id[pid] for pid in norm_ids)
         self.assertTrue(norm["inputs"], "norm has no backbone input edge")
 
     def test_emits_top_level_edges_for_renderer(self):
@@ -144,13 +152,17 @@ class TestComputeGraphEndpoint(unittest.TestCase):
         for e in edges:
             self.assertIn(e["src"], ids, f"dangling src {e['src']!r}")
             self.assertIn(e["dst"], ids, f"dangling dst {e['dst']!r}")
-        # Backbone chain present: embed_tokens → block_stack → norm → lm_head.
+        # Backbone chain present: embed_tokens → block_stack → final norm
+        # launch → lm_head.
         edge_pairs = {(e["src"], e["dst"]) for e in edges}
         block_id = next(n["id"] for n in data["graph"]["nodes"]
                         if n["op"] == "block_stack")
+        lm_head = next(n for n in data["graph"]["nodes"]
+                       if n["id"] == "lm_head")
+        norm_id = next(pid for pid in lm_head["inputs"] if pid in ids)
         self.assertIn(("embed_tokens", block_id), edge_pairs)
-        self.assertIn((block_id, "norm"), edge_pairs)
-        self.assertIn(("norm", "lm_head"), edge_pairs)
+        self.assertIn((block_id, norm_id), edge_pairs)
+        self.assertIn((norm_id, "lm_head"), edge_pairs)
 
     def test_nodes_use_inspector_format(self):
         # Reuse contract: nodes arrive in the Inspector's dag.js dict
@@ -198,9 +210,12 @@ class TestComputeGraphEndpoint(unittest.TestCase):
         # tensor nobody passes.
         # Formal 0 is that hidden state; the head's other formal is the token
         # ids it embeds (`inputs: [norm, input_ids]` on its layer), one input
-        # per formal in formal order, each bound to its own input node.
+        # per formal in formal order, each bound to its own input node. The
+        # drawn name of that final norm can be its seam launch (`norm__seam…`)
+        # when fusion replaced the model-level op.
         mtp = aux[0]
-        self.assertEqual(["norm", "input_ids"], mtp["inputs"])
+        final_norm = next(n for n in top if n["id"] == "lm_head")["inputs"][0]
+        self.assertEqual([final_norm, "input_ids"], mtp["inputs"])
         bound = {c["formal"]: c["id"].rsplit("/", 1)[-1]
                  for c in mtp["children"] if "formal" in c}
         self.assertEqual({0: "x", 1: "input_ids"}, bound)
@@ -222,23 +237,34 @@ class TestComputeGraphEndpoint(unittest.TestCase):
         self.assertNotIn("allreduce_fused_rmsnorm", fused_ops)
 
     def test_tp8_introduces_comm_and_switches_norm_fusion(self):
-        data = self._graph(tp_attention=8, tp_dense_ffn=8).json()
-        nodes = self._all_nodes(data)
+        prefill = self._graph(tp_attention=8, tp_dense_ffn=8,
+                              phase="prefill").json()
+        decode = self._graph(tp_attention=8, tp_dense_ffn=8,
+                             phase="decode").json()
+        nodes = self._all_nodes(prefill)
         styles = {n.get("style") for n in nodes}
         self.assertIn("comm", styles)
         comm_ops = {n["op"] for n in nodes if n.get("style") == "comm"}
         self.assertTrue(comm_ops <= {
             "all_reduce", "reduce_scatter", "all_gather", "all_to_all",
         })
-        fused_ops = {n["op"] for n in nodes if n.get("style") == "fused"}
-        self.assertIn("allreduce_fused_rmsnorm", fused_ops)
-        self.assertNotIn("fused_add_rmsnorm", fused_ops)
+        prefill_ops = {n["op"] for n in self._all_nodes(prefill)
+                       if n.get("style") == "fused"}
+        decode_ops = {n["op"] for n in self._all_nodes(decode)
+                      if n.get("style") == "fused"}
+        # The all-reduce fusion is phase-bound: a prefill chunk is past the
+        # workspace's token bound, while a decode batch takes the whole chain.
+        self.assertIn("fused_add_rmsnorm", prefill_ops)
+        self.assertNotIn("allreduce_fused_rmsnorm", prefill_ops)
+        self.assertIn("allreduce_fused_rmsnorm", decode_ops)
+        self.assertNotIn("fused_add_rmsnorm", decode_ops)
 
     def test_fused_ops_are_compounds_of_their_subgraph(self):
         # A fused op is modeled as a compound that REPLACED its subgraph:
         # collapsed it's the fused kernel, expanded it reveals the
         # pre-fusion nodes it absorbed. Lock the headline cases.
-        data = self._graph(tp_attention=8, tp_dense_ffn=8).json()
+        data = self._graph(tp_attention=8, tp_dense_ffn=8,
+                           phase="decode").json()
         fused = {
             n["op"]: n for n in self._all_nodes(data)
             if n.get("style") == "fused"
@@ -255,7 +281,15 @@ class TestComputeGraphEndpoint(unittest.TestCase):
         # allreduce_fused_rmsnorm expands to all_reduce → add → rmsnorm —
         # the injected all_reduce MUST appear (resolved via comm_tree,
         # not the raw spec pre_tree which lacks comm nodes).
-        ar = fused.get("allreduce_fused_rmsnorm")
+        # Several seam launches share this op; the model-final one contains
+        # only the norm it took; choose a complete chain to pin its body.
+        ar = next((
+            n for n in self._all_nodes(data)
+            if n.get("op") == "allreduce_fused_rmsnorm"
+            and {"all_reduce", "add", "rmsnorm"} <= {
+                c["op"] for c in n.get("children", ())
+            }
+        ), None)
         self.assertIsNotNone(ar)
         ar_ops = {c["op"] for c in ar["children"]}
         self.assertEqual(ar_ops, {"all_reduce", "add", "rmsnorm"})
@@ -271,7 +305,8 @@ class TestComputeGraphEndpoint(unittest.TestCase):
         # node must feed the fused post_attention_layernorm compound so the
         # frontend can fan the residual into the nested add.
         data = self._graph(model_id="deepseek-ai/DeepSeek-V3",
-                            tp_attention=8, tp_dense_ffn=8).json()
+                           tp_attention=8, tp_dense_ffn=8,
+                           phase="decode").json()
         stacks = [n for n in data["graph"]["nodes"]
                   if n.get("op") == "block_stack"]
         self.assertTrue(stacks)
@@ -293,7 +328,8 @@ class TestComputeGraphEndpoint(unittest.TestCase):
             comp = next(
                 (c for c in bs["children"]
                  if c.get("op") == "allreduce_fused_rmsnorm"), None)
-            if comp is None:
+            if comp is None or not any(c.get("op") == "add"
+                                       for c in comp.get("children", ())):
                 continue
             checked_compound = True
             srcs_into_comp = {
@@ -669,14 +705,32 @@ class TestComputeGraphEndpoint(unittest.TestCase):
         )
 
     def test_non_mla_model_unchanged_across_phases(self):
-        # Llama-style attention has no decode-time topology swap; the
-        # graph must be identical in both phases (sanity that the swap
-        # is gated on MLA presence, not applied unconditionally).
+        # Llama-style attention has no decode-time topology swap. Its graph
+        # still changes where the phase-bound all-reduce/RMSNorm launch sits;
+        # outside that launch family the two phases must have the same nodes
+        # (sanity that the MLA swap is gated on MLA presence).
         pre = self._graph(tp_attention=8, tp_dense_ffn=8, phase="prefill").json()
         dec = self._graph(tp_attention=8, tp_dense_ffn=8, phase="decode").json()
-        pre_ids = sorted(n.get("id", "") for n in self._all_nodes(pre))
-        dec_ids = sorted(n.get("id", "") for n in self._all_nodes(dec))
+        norm_launch_ops = {
+            "fused_add_rmsnorm", "allreduce_fused_rmsnorm", "all_reduce",
+        }
+
+        def structural_ids(data):
+            return sorted(
+                n.get("id", "") for n in self._all_nodes(data)
+                if n.get("op") not in norm_launch_ops
+            )
+
+        pre_ids = structural_ids(pre)
+        dec_ids = structural_ids(dec)
         self.assertEqual(pre_ids, dec_ids)
+
+        pre_ops = {n.get("op") for n in self._all_nodes(pre)}
+        dec_ops = {n.get("op") for n in self._all_nodes(dec)}
+        self.assertIn("fused_add_rmsnorm", pre_ops)
+        self.assertNotIn("allreduce_fused_rmsnorm", pre_ops)
+        self.assertIn("allreduce_fused_rmsnorm", dec_ops)
+        self.assertNotIn("fused_add_rmsnorm", dec_ops)
 
     def test_nodes_carry_tensor_shapes_for_edge_labels(self):
         # The frontend ELK renderer derives each edge's `dim:` label from

@@ -896,19 +896,20 @@ async def inference_compute_graph(
     primitives (all_reduce / reduce_scatter / all_gather / all_to_all)
     grafted in where the parallelism policy requires them, and matched
     subgraphs collapsed into fused-op leaves. Flipping the TP / EP
-    knobs changes the graph — comm appears, and norm fusions switch
-    between fused_add_rmsnorm (TP=1) and allreduce_fused_rmsnorm (TP>1).
+    knobs changes the graph — comm appears, and a decode norm launch can
+    take the collective into allreduce_fused_rmsnorm.
     `sequence_parallel=true` selects Megatron-SP: the 2 all_reduce per
     block become 2 all_gather + 2 reduce_scatter (norm/residual region
     runs Sharded(S)).
 
     `phase` (prefill / decode) picks the topology the serving stack
-    actually runs at that phase. The only structural difference today
-    is MLA: prefill runs the decompressed form (kv_b_proj as an
-    explicit linear); decode swaps to the absorbed form (kv_b_proj is
-    folded into q_absorbed_nope + v_absorbed per-head matmuls and the
-    QKᵀ contracts the latent R+P dim). Non-MLA models render the same
-    topology in either phase.
+    actually runs at that phase. MLA changes its attention form: prefill
+    runs the decompressed form (kv_b_proj as an explicit linear); decode
+    swaps to the absorbed form (kv_b_proj is folded into q_absorbed_nope +
+    v_absorbed per-head matmuls and the QKᵀ contracts the latent R+P dim).
+    Separately, vLLM's all-reduce/RMSNorm launch is decode-bound: prefill
+    keeps the collective outside `fused_add_rmsnorm`, while decode takes
+    `allreduce_fused_rmsnorm`.
 
     The workload is the estimate's own: `avg_input_tokens`,
     `avg_output_tokens`, `prefix_cached_tokens` and `speculative_draft_tokens`
