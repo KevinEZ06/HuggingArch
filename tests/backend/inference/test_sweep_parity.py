@@ -308,21 +308,6 @@ def test_rows_read_at_a_point_equal_the_walk_there(dep):
                 assert not diffs, f"{card} B={batch}:\n{report(diffs)}"
 
 
-def test_rows_read_at_a_point_are_the_walk_there_whole():
-    """Every field of a row read at another batch — formula text, wire dims,
-    node dims, per-tensor byte splits — is the walk's there (identity
-    aside, `_without_identity`)."""
-    dep = Deployment(LLAMA)
-    anchor = dep.direct(avg_input_tokens=CTX, prefill_batch=1, decode_batch=1)
-    walked = dep.direct(avg_input_tokens=CTX, prefill_batch=64, decode_batch=64)
-    read = rows_at(anchor["per_op_timing_decode"], 64, card=dep.gpu_sku,
-                   breakdown=True)
-    assert not any(k in r for r in read for k in IDENTITY), (
-        "a row read at another batch carries no measurement identity")
-    diffs = diff(read, _without_identity(walked["per_op_timing_decode"]))
-    assert not diffs, report(diffs)
-
-
 def _class_walks(dep: Deployment, cards) -> dict:
     """Per card of `cards`, the walk a sweep prices it off: that walk's
     anchor estimate at B=1, and the preparation the point is read on.
@@ -481,6 +466,11 @@ def test_a_point_is_the_walk_there_whole(dep):
             for lst in ROW_LISTS:
                 if lst in anchor:
                     read = rows_at(anchor[lst], batch, card=card, breakdown=True)
+                    if batch != 1:
+                        assert not any(
+                            k in r for r in read for k in IDENTITY), (
+                            f"{lst} at B={batch} on {card}: a row read at "
+                            "another point carries no measurement identity")
                     diffs += diff(_row_shape(read), _row_shape(walked[lst]),
                                   path=f"{lst}.rows")
                     diffs += diff(_without_identity(read), walked[lst], path=lst)
@@ -501,44 +491,20 @@ def _context_batch(dep: Deployment) -> dict:
     return estimate_capacity_sweep(seq_lens=list(_SEQS), batch_grid=_GRID, **dep.env())
 
 
-def test_context_batch_points_equal_direct(monkeypatch):
-    """One walk for the whole sweep; each (context, batch) point of it is
-    the direct estimate there: every capacity field, every phase number, and
-    every per-op row on the columns its laws state. The fusion delta
-    (`vs_naive_delta`, a step time at the walk's point) is not carried to a
-    point."""
-    from backend.inference import capacity
-    walks = []
-    real = capacity._capacity_pending
-    monkeypatch.setattr(capacity, "_capacity_pending",
-                        lambda *a, **k: walks.append(k["avg_input_tokens"]) or real(*a, **k))
-    dep = Deployment(LLAMA)
-    swept = _context_batch(dep)
-    assert walks == [_SEQS[0]]
-    for bp in _GRID:
-        for i, seq in enumerate(_SEQS):
-            direct = dep.direct(avg_input_tokens=seq, prefill_batch=bp["prefill_batch_size"],
-                                decode_batch=bp["decode_batch_size"])
-            point = swept[bp["key"]][i]
-            rest = lambda e: {k: v for k, v in e.items()
-                              if k not in (*ROW_LISTS, "phases", "vs_naive_delta")}
-            diffs = diff(rest(point), rest(direct))
-            diffs += _phase_diffs(point, direct, phase_scalars)
-            for lst in ROW_LISTS:
-                if lst in direct:
-                    diffs += diff(law_view(point[lst]), law_view(direct[lst]), path=lst)
-            assert "vs_naive_delta" not in point
-            assert not diffs, f"{bp['key']} seq={seq}:\n{report(diffs)}"
-
-
-def test_context_batch_point_is_the_walk_there_whole():
+def test_context_batch_point_is_the_walk_there_whole(monkeypatch):
     """Every field of a Context x Batch point — the whole phases, the per-op
     rows with their measurement identity (`point_keys`, asked for by a
     request that looks measurements up), the capacity fields — is the direct
     estimate's there, as a point read with no breakdown shows it
     (`without_breakdown`; the anchor's fusion delta not carried)."""
+    from backend.inference import capacity
+    walks = []
+    real = capacity._capacity_pending
+    monkeypatch.setattr(capacity, "_capacity_pending",
+                        lambda *a, **k: walks.append(k["avg_input_tokens"]) or real(*a, **k))
     dep = Deployment(LLAMA, selection_mode="latest")
     swept = _context_batch(dep)
+    assert walks == [_SEQS[0]], "the whole Context × Batch sweep used one walk"
     for bp in _GRID:
         for i, seq in enumerate(_SEQS):
             direct = dep.direct(avg_input_tokens=seq, prefill_batch=bp["prefill_batch_size"],

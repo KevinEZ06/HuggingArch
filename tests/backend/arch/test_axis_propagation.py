@@ -358,11 +358,15 @@ class TestIRCarriesPermutation(unittest.TestCase):
     # whose correspondence is still unwritten, not a missing field.
     COVERAGE_FLOOR = 0.88
 
+    #: Three structural representatives, not a census: a plain dense model,
+    #: an MLA/DSA + MoE model with many call-site permutations, and a
+    #: vision/language model with a different transpose inventory. Together
+    #: they still exercise 55 transpose call sites and over 400 primitive rows;
+    #: the omitted models repeat those geometries at greater walk cost.
     MODELS = (
-        "meta-llama__Llama-3.2-3B", "Qwen__Qwen3-30B-A3B",
-        "deepseek-ai__DeepSeek-V3", "deepseek-ai__DeepSeek-V3.2",
-        "XiaomiMiMo__MiMo-V2.5", "openai__gpt-oss-20b",
-        "google__gemma-4-12B-it", "deepseek-ai__DeepSeek-V4-Pro",
+        "meta-llama__Llama-3.2-3B",
+        "deepseek-ai__DeepSeek-V3.2",
+        "XiaomiMiMo__MiMo-V2.5",
     )
 
     @staticmethod
