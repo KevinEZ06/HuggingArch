@@ -1,9 +1,11 @@
 """Corpus gates of the whole-model editor.
 
-1. No edit = the Inspector, on every snapshot: the five totals against their
+1. No edit = the Inspector, on the structural cohort: the five totals against
+   their
    independent sources (`project_model`, the weight ledger `capacity.weights`,
    `cache_view`), and every numeric field of every `block_results` row.
-2. Identity swap, on every snapshot: every slot of every backbone / MTP group
+2. Identity swap, on the structural cohort: every slot of every backbone / MTP
+   group
    swapped to the component it already holds, through the real swap (repoint
    by declaration, params synced, synthesis or fork as the slot dictates) —
    the numbers do not move by a byte.
@@ -26,10 +28,10 @@ from backend.arch.structure import iter_reachable_components
 from backend.arch.validate._cross_layer_channels import run_cross_layer_checks
 from backend.playground import compose as cm
 from backend.arch.eval.precision import AS_SHIPPED
-from tests.snapshots import SNAPSHOT_DIR, resolve_snapshot
+from tests.snapshots import STRUCTURAL_SNAPSHOT_IDS, resolve_snapshot
 
 L = 2048
-_SNAPSHOTS = sorted(p.stem for p in SNAPSHOT_DIR.glob("*.json"))
+_SNAPSHOTS = STRUCTURAL_SNAPSHOT_IDS
 _ROW_FACTS = ("count", "total_params", "total_active_params", "total_flops",
               "attention_params", "attention_flops", "ffn_params", "ffn_flops",
               "quant_metadata_params", "total_storage_bytes", "kv_bytes_at_L")
@@ -102,7 +104,7 @@ def _facts(cost):
         cost["aux_params"], cost["model_level"])
 
 
-@pytest.mark.regression  # every snapshot
+@pytest.mark.regression
 @pytest.mark.parametrize("stem", _SNAPSHOTS)
 def test_no_edit_equals_the_inspector(loader, stem):
     base = resolve_snapshot(stem, loader)
@@ -144,18 +146,25 @@ def test_no_edit_equals_the_inspector(loader, stem):
                 + got["model_level_totals"][key]) == got[whole], key
 
 
-@pytest.mark.regression  # every snapshot
+@pytest.mark.regression
 @pytest.mark.parametrize("stem", _SNAPSHOTS)
-def test_identity_swap_is_byte_identical(loader, stem):
-    """Also: no dim is missing (the static scan from each group's template
-    finds nothing on an identity swap), no stream reads out of reach, and an
-    empty per-group dims edit writes nothing and is applied on every group,
-    a bare `template:` one included."""
+def test_identity_edits_are_byte_identical(loader, stem):
+    """Identity swaps and both no-op dimension edits, in one composition.
+
+    No dim is missing, no stream reads out of reach, every editable group has
+    its residual-width interface and readable own dims, an empty dims edit
+    writes nothing, and one dim bound to itself writes its declaration without
+    moving a number.  The two former no-op tests walked the same models again;
+    their independent assertions are folded into this pass."""
     before = _composition(stem, loader)
     composition = _composition(stem, loader)
+    edited = []
     for group in composition.groups():
         if not group.editable:
             continue
+        assert "d_model" in composition.interface_dims(group.group_id)
+        assert composition.local_dims(group.group_id)["d_model"].get(
+            "interface") is True
         for slot in group.slots():
             assert composition.swap(group.group_id, slot.path, slot.component), \
                 composition.refusals()
@@ -170,49 +179,17 @@ def test_identity_swap_is_byte_identical(loader, stem):
             before_dims = written(group.group_id)
             composition.set_group_dims(group.group_id, {})
             assert written(group.group_id) == before_dims
+            own = {name: row["value"] for name, row
+                   in composition.local_dims(group.group_id).items()
+                   if not row.get("interface") and "global" not in row}
+            if own:
+                name = sorted(own)[0]
+                if composition.set_group_dims(group.group_id, {name: name}):
+                    edited.append(group.group_id)
+                    assert composition.declaration(group.group_id).dims
     assert composition.refusals() == []
+    assert edited
     assert _facts(_cost(composition)) == _facts(_cost(before))
-
-
-@pytest.mark.regression  # every snapshot
-@pytest.mark.parametrize("stem", _SNAPSHOTS)
-def test_a_group_dim_set_to_its_own_value_is_byte_identical(loader, stem):
-    """Every editable group takes a per-group dims edit. One that binds a
-    dim to itself (`n_heads: n_heads`) writes a `dims:` — on a bare
-    `template:` stack by declaring it as the one `rest:` assignment it is
-    equivalent to — and no number moves."""
-    before = _composition(stem, loader)
-    composition = _composition(stem, loader)
-    edited = []
-    for group in composition.groups():
-        if not group.editable:
-            continue
-        own = {name: row["value"] for name, row
-               in composition.local_dims(group.group_id).items()
-               if not row.get("interface") and "global" not in row}
-        if not own:
-            continue
-        name = sorted(own)[0]
-        if composition.set_group_dims(group.group_id, {name: name}):
-            edited.append(group.group_id)
-    assert composition.refusals() == []
-    for group_id in edited:
-        assert composition.declaration(group_id).dims, group_id
-    assert _facts(_cost(composition)) == _facts(_cost(before))
-
-
-@pytest.mark.regression  # every snapshot
-@pytest.mark.parametrize("stem", _SNAPSHOTS)
-def test_every_group_has_an_interface_and_its_own_dims(loader, stem):
-    """Every editable group's boundary is an expression in the residual
-    width, and its own dims — read off the model's walk — carry it, marked."""
-    composition = _composition(stem, loader)
-    for group in composition.groups():
-        if not group.editable:
-            continue
-        assert "d_model" in composition.interface_dims(group.group_id)
-        dims = composition.local_dims(group.group_id)
-        assert dims["d_model"].get("interface") is True, group.template
 
 
 def test_identity_swap_dispatches_by_slot(loader):

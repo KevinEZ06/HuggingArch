@@ -190,6 +190,21 @@ def render_manifest(rows: List[Dict[str, object]]) -> bytes:
 #: reason it does not grow with the corpus. A new model does not join them.
 #: Their container literals are exactly the manifest's rows.
 CURATED_OUT_OF_SCOPE: Tuple[CuratedSet, ...] = (
+    CuratedSet('tests/snapshots.py', 'STRUCTURAL_SNAPSHOT_IDS',
+               'one model per structural cache/attention family; regression '
+               'sweeps this cohort rather than repeating family geometries'),
+    CuratedSet('tests/backend/arch/eval/test_no_per_head_cache_copy.py',
+               'MLA_SNAPSHOTS',
+               'the absorbed-MLA members of the structural cohort'),
+    CuratedSet('tests/backend/arch/test_mtp_entry.py', 'MTP_SNAPSHOTS',
+               'the MTP-bearing members of the structural cohort'),
+    CuratedSet('tests/backend/arch/layout/test_expert_weight_checkpoint.py',
+               'STRUCTURAL_CHECKPOINTS',
+               'one checkpoint encoding per structural expert-bank family'),
+    CuratedSet('tests/backend/inference/test_dashboard_is_the_breakdown.py',
+               'DASHBOARD_SNAPSHOTS',
+               'one fitting role-graph representative for the unsharded '
+               'dashboard/breakdown estimate'),
     CuratedSet('tests/backend/arch/layout/test_layout_physical.py', 'LANE_COHORT',
                'the chosen lane cohort, read from its golden',
                artifact='tests/golden/shardv3_lane_snapshots.json'),
@@ -621,7 +636,6 @@ PIN_DATA: Tuple[Tuple[str, str, str], ...] = (
 #: or a check claims the module) or "constant" (a curated set's own list).
 DYNAMIC_KEY_SOURCES: Dict[str, str] = {
     'tests/backend/arch/eval/test_borrowed_weight_reads.py': 'constant',
-    'tests/backend/arch/test_arch_view_aux_inputs.py': 'corpus',
     'tests/backend/arch/eval/test_eval_capacity.py': 'corpus',
     'tests/backend/arch/eval/test_eval_instances.py': 'constant',
     'tests/backend/arch/test_moe_unbound_defaults.py': 'constant',
@@ -654,7 +668,6 @@ DYNAMIC_KEY_SOURCES: Dict[str, str] = {
     'tests/backend/inference/test_pipeline_parallel_compute.py': 'constant',
     'tests/backend/inference/test_pp_stage_coherence.py': 'constant',
     'tests/backend/inference/test_row_roofline.py': 'corpus',
-    'tests/backend/playground/test_compose_corpus.py': 'constant',
     'tests/backend/rendering/test_compute_graph_renderable.py': 'constant',
     'tests/backend/rendering/test_rendering.py': 'corpus',
     'tests/frontend/test_model_id_literals.py': 'corpus',

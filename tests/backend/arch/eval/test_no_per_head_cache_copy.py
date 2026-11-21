@@ -32,10 +32,18 @@ from backend.arch.eval.cache import (
     Edges, cached_node_uids, context_sources, is_view)
 from backend.arch.eval.program import Program
 from backend.arch.eval.transforms import DECODE, PREFILL, Deployment
-from backend.arch.snapshots import iter_snapshot_ids
 from tests.snapshots import resolve_snapshot, shared_loader
 
-pytestmark = pytest.mark.regression  # walks every snapshot with an absorbed form
+pytestmark = pytest.mark.regression
+
+# Every absorbed-MLA geometry in the corpus: ordinary MLA, compressed MLA,
+# KDA, and DSA.  The other snapshots with an absorbed form repeat one of these;
+# snapshots without one otherwise pay a resolution only to skip.
+MLA_SNAPSHOTS = (
+    "deepseek-ai/DeepSeek-V4-Flash",
+    "moonshotai/Kimi-K3",
+    "zai-org/GLM-5.3-Flash",
+)
 
 
 
@@ -61,9 +69,8 @@ def per_head_cache_copies(resolved, phase: str):
 
 
 @pytest.mark.parametrize("phase", (PREFILL, DECODE))
-# Every snapshot, by file name only; which ones the test applies to is
-# asked of the resolved spec in the test, so collection resolves nothing.
-@pytest.mark.parametrize("model_id", sorted(iter_snapshot_ids()))
+# The applicable structural representatives; collection resolves nothing.
+@pytest.mark.parametrize("model_id", MLA_SNAPSHOTS)
 def test_absorbed_mla_joins_its_cache_once(model_id, phase) -> None:
     resolved = resolve_snapshot(model_id, shared_loader())
     spec = resolved.spec

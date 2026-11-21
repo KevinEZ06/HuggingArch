@@ -234,6 +234,16 @@
   },
   {
     "identifiers": [
+      "deepseek-ai/DeepSeek-V4-Flash",
+      "moonshotai/Kimi-K3",
+      "zai-org/GLM-5.3-Flash"
+    ],
+    "kind": "curated",
+    "module": "tests/backend/arch/eval/test_no_per_head_cache_copy.py",
+    "name": "MLA_SNAPSHOTS"
+  },
+  {
+    "identifiers": [
       "Qwen/Qwen3.8-Flash-Next",
       "zai-org/GLM-5.3-Flash"
     ],
@@ -317,6 +327,16 @@
     "kind": "curated",
     "module": "tests/backend/arch/layout/test_eval_placement_diff.py",
     "name": "PINNED"
+  },
+  {
+    "identifiers": [
+      "deepseek-ai__DeepSeek-V4-Flash.json",
+      "deepseek-ai__DeepSeek-V4.1-Flash.json",
+      "openai__gpt-oss-20b.json"
+    ],
+    "kind": "curated",
+    "module": "tests/backend/arch/layout/test_expert_weight_checkpoint.py",
+    "name": "STRUCTURAL_CHECKPOINTS"
   },
   {
     "identifiers": [
@@ -432,6 +452,17 @@
     "kind": "curated",
     "module": "tests/backend/arch/test_moe_unbound_defaults.py",
     "name": "SHARED_WIDTH"
+  },
+  {
+    "identifiers": [
+      "Qwen/Qwen3.8-Flash-Next",
+      "deepseek-ai/DeepSeek-V4-Flash",
+      "stepfun-ai/Step-3.7-Flash",
+      "zai-org/GLM-5.3-Flash"
+    ],
+    "kind": "curated",
+    "module": "tests/backend/arch/test_mtp_entry.py",
+    "name": "MTP_SNAPSHOTS"
   },
   {
     "identifiers": [
@@ -616,6 +647,18 @@
     "kind": "curated",
     "module": "tests/backend/inference/test_consistency_invariants.py",
     "name": "_CASES"
+  },
+  {
+    "identifiers": [
+      "Qwen/Qwen3-30B-A3B",
+      "Qwen/Qwen3-8B",
+      "Qwen/Qwen3.5-35B-A3B",
+      "deepseek-ai/DeepSeek-V4-Flash",
+      "openai/gpt-oss-20b"
+    ],
+    "kind": "curated",
+    "module": "tests/backend/inference/test_dashboard_is_the_breakdown.py",
+    "name": "DASHBOARD_SNAPSHOTS"
   },
   {
     "identifiers": [
@@ -804,7 +847,7 @@
     "identifiers": [
       "XiaomiMiMo__MiMo-V2.5",
       "deepseek-ai__DeepSeek-V3",
-      "meta-llama__Llama-3.2-3B",
+      "meta-llama__Llama-3.2-1B",
       "openai__gpt-oss-20b",
       "zai-org__GLM-5.1"
     ],
@@ -1256,5 +1299,19 @@
     "kind": "curated",
     "module": "tests/kernel_bench/test_rekey_lake.py",
     "name": "H100_MASKED_ROWS"
+  },
+  {
+    "identifiers": [
+      "Qwen/Qwen3.8-Flash-Next",
+      "deepseek-ai/DeepSeek-V4-Flash",
+      "deepseek-ai/DeepSeek-V4.1-Flash",
+      "moonshotai/Kimi-K3",
+      "openai/gpt-oss-20b",
+      "stepfun-ai/Step-3.7-Flash",
+      "zai-org/GLM-5.3-Flash"
+    ],
+    "kind": "curated",
+    "module": "tests/snapshots.py",
+    "name": "STRUCTURAL_SNAPSHOT_IDS"
   }
 ]

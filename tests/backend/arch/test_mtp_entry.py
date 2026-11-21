@@ -33,10 +33,18 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.arch.eval.program import Program
 from backend.arch.eval.transforms import DECODE, PREFILL, Deployment
-from backend.arch.snapshots import iter_snapshot_ids
 from tests.snapshots import resolve_snapshot, shared_loader
 
-pytestmark = pytest.mark.regression  # walks every snapshot with an MTP stack
+pytestmark = pytest.mark.regression
+
+# One representative for each MTP family in the structural corpus; snapshots
+# without an MTP stack otherwise pay a resolution only to skip.
+MTP_SNAPSHOTS = (
+    "deepseek-ai/DeepSeek-V4-Flash",
+    "Qwen/Qwen3.8-Flash-Next",
+    "zai-org/GLM-5.3-Flash",
+    "stepfun-ai/Step-3.7-Flash",
+)
 
 
 
@@ -71,9 +79,8 @@ def mtp_token_readers(program, phase: str = PREFILL) -> list:
                   if _reads_tokens(program, program.by_uid(uid)))
 
 
-# Every snapshot, by file name only; which ones the test applies to is
-# asked of the resolved spec in the test, so collection resolves nothing.
-@pytest.mark.parametrize("model_id", sorted(iter_snapshot_ids()))
+# The applicable structural representatives; collection resolves nothing.
+@pytest.mark.parametrize("model_id", MTP_SNAPSHOTS)
 def test_every_mtp_stack_reads_the_next_token_embedding(model_id):
     resolved = resolve_snapshot(model_id, shared_loader())
     if not any(layer.aux_kind == "mtp" for layer in resolved.spec.model):

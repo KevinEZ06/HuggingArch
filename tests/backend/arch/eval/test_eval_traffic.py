@@ -18,7 +18,6 @@ Falsification targets:
 """
 from __future__ import annotations
 
-import json
 import sys
 import unittest
 import pytest
@@ -37,7 +36,8 @@ from backend.arch.eval.traffic import (
 from backend.arch.eval.transforms import (
     DECODE, Deployment,
 )
-from tests.snapshots import shared_program, shared_walk
+from tests.snapshots import (
+    STRUCTURAL_SNAPSHOT_IDS, shared_program, shared_walk)
 from backend.inference.framework_bindings import get_binding
 from backend.inference.fusion_plans import FUSION_SCHEMES
 from backend.arch.eval.precision import PrecisionProfile
@@ -58,9 +58,6 @@ def _single_rank_rule():
     from backend.arch.layout.propagation import LayoutPropagation
 
     return LayoutPropagation.of(ParallelConfig(), "prefill")
-
-SNAPSHOTS = PROJECT_ROOT / "backend" / "arch" / "snapshots"
-
 
 def _program(name: str) -> Program:
     return shared_program(name.replace('__', '/', 1))
@@ -848,10 +845,9 @@ class TestEveryStreamsLawIsPaidByAName(unittest.TestCase):
                    for node, law in _kv_reads(analysis).items())
         return laws - billed
 
-    def test_the_corpus_conserves(self):
-        names = sorted(p.stem for p in SNAPSHOTS.glob("*.json")
-                       if "config" in json.loads(p.read_text()))
-        self.assertGreater(len(names), 30, "the sweep found no corpus")
+    def test_the_structural_cohort_conserves(self):
+        names = list(STRUCTURAL_SNAPSHOT_IDS)
+        self.assertGreater(len(names), 0, "the sweep found no cohort")
         for name in names:
             with self.subTest(name):
                 short = self._shortfall(name)

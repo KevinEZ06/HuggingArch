@@ -7,14 +7,14 @@ same step module by module (`phases.*.flops_by_module`). Both are the
 backbone's — no aux stack, no MTP draft — so summed by the one role rule
 (the outermost node of an attention or FFN role holds its subtree; a
 wrapper's children are looked through), the breakdown is the dashboard,
-for every model — up to the rows the SERVED graph adds: the grafted
+for every structural family — up to the rows the SERVED graph adds: the grafted
 activation casts and cache transforms (`materialize_cast`, each marked
 `provenance="cast"` on the pre-fusion program), whether a graft stands as
 its own row or a fused launch absorbed it and bills it (`Rewrite.origins`,
 the closure law of `test_phase_flops_closure`). The two sides share no
 arithmetic: the dashboard walks the logical program, the graft FLOPs are
 read off the served walk's own layers, and the law is that their
-difference is the breakdown. A model whose served graph grafts nothing
+difference is the breakdown. A representative whose served graph grafts nothing
 (Qwen3-30B-A3B, DeepSeek-V2-Lite) is held to plain equality without
 paying for the second walk. The dashboard states the prefill step; the
 decode step's breakdown is held to the same role sums over the decode
@@ -30,7 +30,6 @@ from backend.arch.eval.projection.formulas import display_formulas
 from backend.arch.eval.projection.result import (_ATTN_ROLES, _FFN_ROLES,
                                                  _WRAPPER_ROLES)
 from backend.arch.eval.transforms import DECODE, Deployment
-from backend.arch.snapshots import iter_snapshot_ids
 from backend.inference.capacity import estimate_pending
 from backend.inference.framework_bindings import (DEFAULT_FRAMEWORK,
                                                   ServingDeployment,
@@ -40,6 +39,18 @@ from backend.inference.parallel_config import ParallelConfig
 from backend.inference.pipeline import analyze
 from backend.inference.step_eval import evaluate_step
 from tests.snapshots import resolve_snapshot, snapshot_config
+
+# This invariant needs the role graph, not every heavy family: the estimate is
+# deliberately unsharded so its module table is the whole model's.  These
+# representatives cover dense GQA, MoE GQA, recurrent state, SWA and compressed
+# MLA while still fitting one B200.
+DASHBOARD_SNAPSHOTS = (
+    "Qwen/Qwen3-8B",
+    "Qwen/Qwen3-30B-A3B",
+    "Qwen/Qwen3.5-35B-A3B",
+    "openai/gpt-oss-20b",
+    "deepseek-ai/DeepSeek-V4-Flash",
+)
 
 BATCH, PROMPT = 2, 1024
 
@@ -149,8 +160,8 @@ def _serving_graft_flops(resolved, phase: str, rows) -> dict:
     }
 
 
-@pytest.mark.regression  # the whole corpus, an estimate each
-@pytest.mark.parametrize("model_id", sorted(iter_snapshot_ids()))
+@pytest.mark.regression  # one estimate per structural family
+@pytest.mark.parametrize("model_id", DASHBOARD_SNAPSHOTS)
 def test_the_dashboard_is_the_breakdown_summed_by_role(model_id):
     resolved = resolve_snapshot(model_id)
     estimate = estimate_pending(

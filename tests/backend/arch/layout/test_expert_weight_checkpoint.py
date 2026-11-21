@@ -17,7 +17,7 @@ What this file pins:
   safetensors header — unrolled per expert, packed as one tensor, scales and
   biases included;
 * a weight led by the expert axis whose encoding nobody declared is refused;
-* over the corpus, at `ep_moe=8 dp_attention=8`, the ledger's rows are the
+* over the structural cohort, at `ep_moe=8 dp_attention=8`, the ledger's rows are the
   ones the P5 pin records (`tests/golden/pins/ep8_checkpoint.json`).
 """
 from __future__ import annotations
@@ -34,7 +34,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.arch.layout import copy_checkpoint as ckpt
 from backend.arch.layout.persistent import SAVED_METADATA, STORED
-from tests.snapshots import SNAPSHOT_DIR, any_snapshot, snapshot_header
+from tests.snapshots import (
+    SNAPSHOT_DIR, any_snapshot, snapshot_header)
 from tools.corpus_pins.decisions import copy_contracts
 from tools.corpus_pins.pins import ep8_checkpoint
 
@@ -42,6 +43,15 @@ from tools.corpus_pins.pins import ep8_checkpoint
 EXPECTED_CHECKPOINT_CORPUS = json.loads(
     (PROJECT_ROOT / ep8_checkpoint.EP8_CHECKPOINT.artifact)
     .read_text(encoding="utf-8"))
+STRUCTURAL_CHECKPOINTS = (
+    "Qwen/Qwen3.8-Flash-Next.json",
+    "deepseek-ai__DeepSeek-V4-Flash.json",
+    "deepseek-ai__DeepSeek-V4.1-Flash.json",
+    "moonshotai/Kimi-K3.json",
+    "openai__gpt-oss-20b.json",
+    "stepfun-ai/Step-3.7-Flash.json",
+    "zai-org/GLM-5.3-Flash.json",
+)
 
 
 def _rows(stem: str):
@@ -136,7 +146,7 @@ class TestAnUndeclaredEncodingIsRefused:
 
 @pytest.mark.regression
 @pytest.mark.parametrize(
-    "snapshot", sorted(EXPECTED_CHECKPOINT_CORPUS["corpus"]))
+    "snapshot", STRUCTURAL_CHECKPOINTS)
 def test_ep8_snapshot_corpus_matches_the_checkpoint_pin(snapshot):
     any_snapshot()
     if not (SNAPSHOT_DIR / snapshot).exists():

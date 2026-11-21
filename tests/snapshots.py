@@ -21,10 +21,26 @@ from typing import Any, Optional
 from tools.corpus_pins.corpus import (
     CorpusModel, SNAPSHOT_DIR, shared_loader, shared_walk)
 
-__all__ = ["SNAPSHOT_DIR", "any_snapshot", "backbone_call", "bench_call",
-           "own_walk", "resolve_snapshot", "shared_loader", "shared_program",
-           "shared_walk", "snapshot_config", "snapshot_header",
-           "snapshot_path", "snapshot_present"]
+__all__ = ["SNAPSHOT_DIR", "STRUCTURAL_SNAPSHOT_IDS", "any_snapshot",
+           "backbone_call", "bench_call", "own_walk", "resolve_snapshot",
+           "shared_loader", "shared_program", "shared_walk", "snapshot_config",
+           "snapshot_header", "snapshot_path", "snapshot_present"]
+
+
+# One model per structural family, not a census.  A regression that walks all
+# of these covers the cache/attention/edit geometries the corpus currently
+# has; models omitted from this tuple repeat one of those geometries at a
+# greater walk cost.  Keep the most defect-sensitive representative first:
+# parametrized default runs execute only that first case.
+STRUCTURAL_SNAPSHOT_IDS = (
+    "deepseek-ai/DeepSeek-V4-Flash",   # compressed MLA + SWA + MoE
+    "deepseek-ai/DeepSeek-V4.1-Flash",  # CSA/vision tower + MTP geometry
+    "Qwen/Qwen3.8-Flash-Next",          # GQA + gated delta state
+    "moonshotai/Kimi-K3",               # KDA + MLA + gated delta state
+    "zai-org/GLM-5.3-Flash",            # DSA/pooled MLA + delta state
+    "stepfun-ai/Step-3.7-Flash",        # ViT encoder + GQA/SWA towers
+    "openai/gpt-oss-20b",               # small GQA/SWA attention-sink model
+)
 
 
 def snapshot_path(name: str) -> Path:

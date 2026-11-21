@@ -23,11 +23,11 @@ from backend.arch.axis_propagation import signature_for
 from backend.arch.eval.dim import value_of
 from backend.arch.eval.transforms import Deployment
 from backend.arch.ops import OpSpec
-from tests.snapshots import shared_program, shared_walk
-from tools.corpus_pins.corpus import Corpus
+from tests.snapshots import (
+    STRUCTURAL_SNAPSHOT_IDS, shared_program, shared_walk)
 
 FIRST = "zai-org__GLM-5.3-Flash"
-STEMS = [FIRST, *(s for s in Corpus.stems() if s != FIRST)]
+STEMS = [FIRST, *(model for model in STRUCTURAL_SNAPSHOT_IDS if model != FIRST)]
 
 
 def _head_labels(node):

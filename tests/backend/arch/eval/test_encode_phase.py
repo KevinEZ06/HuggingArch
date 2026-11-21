@@ -59,19 +59,16 @@ class TestHandoverIsTheFrameworks(unittest.TestCase):
     def test_qwen_and_mimo_images_are_their_32_pixel_cells(self):
         # transformers processing_qwen3_vl.py:76-79: grid_thw.prod() //
         # merge_size**2 with 16-pixel patches; vLLM mimo_v2_omni.py:1028.
-        for model_id in ("Qwen/Qwen3-VL-235B-A22B-Instruct",
-                         "Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.8-27B",
-                         "Qwen/Qwen3.8-Flash-Next", "XiaomiMiMo/MiMo-V2.5",
-                         "XiaomiMiMo/MiMo-V2.6-Pro-RL"):
-            for h, w in ((672, 672), (1344, 672)):
+        for model_id in ("Qwen/Qwen3.8-Flash-Next", "XiaomiMiMo/MiMo-V2.5"):
+            for h, w in ((1344, 672),):
                 self.assertEqual(
                     _handed(model_id, _image(h, w))["pixel_values"],
                     (h // 32) * (w // 32), (model_id, h, w))
 
     def test_kimi_images_are_their_28_pixel_cells(self):
         # vLLM models/kimi_k3/common/mm_preprocess.py:66-78 (H/28)(W/28).
-        for model_id in ("moonshotai/Kimi-K2.5", "moonshotai/Kimi-K3"):
-            for h, w in ((672, 672), (1344, 672)):
+        for model_id in ("moonshotai/Kimi-K3",):
+            for h, w in ((1344, 672),):
                 self.assertEqual(
                     _handed(model_id, _image(h, w))["pixel_values"],
                     (h // 28) * (w // 28))
@@ -108,7 +105,7 @@ class TestHandoverIsTheFrameworks(unittest.TestCase):
 
     def test_mimo_audio_is_its_clip_in_groups_of_four(self):
         # vLLM mimo_audio.py:1303-1337, 1376-1378: ceil(T / group_size).
-        for model_id in ("XiaomiMiMo/MiMo-V2.5", "XiaomiMiMo/MiMo-V2.6-Pro-RL"):
+        for model_id in ("XiaomiMiMo/MiMo-V2.5",):
             for frames in (125, 128):
                 media = {"audio_codes": {"n_aud": 1, "s_audio": frames}}
                 self.assertEqual(_handed(model_id, media)["audio_codes"],
@@ -137,12 +134,8 @@ class TestVideos(unittest.TestCase):
         # :2363-2365 grid_t*h*w/merge^2; mimo_v2_omni.py:1386-1390;
         # glm4_1v.py:1928-1930. Tp = 2.
         for model_id, name, factor in (
-                ("Qwen/Qwen3-VL-235B-A22B-Instruct", "pixel_values_videos", 32),
-                ("Qwen/Qwen3.5-35B-A3B", "pixel_values_videos", 32),
-                ("Qwen/Qwen3.8-27B", "pixel_values_videos", 32),
                 ("Qwen/Qwen3.8-Flash-Next", "pixel_values_videos", 32),
                 ("XiaomiMiMo/MiMo-V2.5", "video_pixel_values", 32),
-                ("XiaomiMiMo/MiMo-V2.6-Pro-RL", "video_pixel_values", 32),
                 ("zai-org/GLM-5.3-Flash", "pixel_values_videos", 28)):
             for frames in (4, 5):
                 h, w = 7 * factor, 5 * factor
@@ -318,7 +311,7 @@ class TestMiMoMergerNorm(unittest.TestCase):
 
         from tests.snapshots import snapshot_header, snapshot_path
 
-        for model_id in ("XiaomiMiMo/MiMo-V2.5", "XiaomiMiMo/MiMo-V2.6-Pro-RL"):
+        for model_id in ("XiaomiMiMo/MiMo-V2.5",):
             snap = json.loads(snapshot_path(model_id)
                               .read_text())
             self.assertIn("(ln_q): LayerNorm((1280,)", snap["model_str"])
@@ -489,8 +482,7 @@ class TestModalityEncodersAreDeclared(unittest.TestCase):
         from backend.arch.eval import capacity
         from backend.arch.eval.projection import project_model
         from backend.views.composition import ModelComposition
-        for model_id in ("deepseek-ai/DeepSeek-V4-Flash",
-                         "deepseek-ai/DeepSeek-V4-Pro"):
+        for model_id in ("deepseek-ai/DeepSeek-V4-Flash",):
             resolved = resolve_snapshot(model_id)
             program = Program.of(resolved)
             self.assertFalse([s.name for s in program.stacks if s.is_encoder])

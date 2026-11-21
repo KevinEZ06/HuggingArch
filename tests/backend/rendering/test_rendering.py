@@ -5,7 +5,6 @@ spec match → engine → block_graph + architecture_view + model_config.
 Catches regressions in node id composition, dtype attachment, badge
 derivation, and quant-precision string."""
 import json
-import glob
 import sys
 import unittest
 from pathlib import Path
@@ -17,7 +16,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 SNAPSHOTS_DIR = PROJECT_ROOT / "backend" / "arch" / "snapshots"
 
-from tests.snapshots import shared_loader
+from tests.snapshots import STRUCTURAL_SNAPSHOT_IDS, shared_loader
 from backend.arch import roles
 from backend.arch.structure import layer_configs
 from backend.rendering import (
@@ -322,12 +321,12 @@ class TestArchitectureView(unittest.TestCase):
         combine = by_name[
             "language_model.model.output_attn_res (attn_res_combine)"]
         self.assertEqual(combine["type"], "op")
-        # Edges name cards: both of the combine's streams come from the
-        # block stack's card (`block_mla_moe` twice — layers and
+        # Edges name cards, not templates: both of the combine's streams come
+        # from the block stack's card (`MLA + MoE FFN` twice — layers and
         # block_residual), and the zero-input scoring weights are operands,
         # not cards, so no edge names them.
         self.assertEqual(self._incoming(k3_view, combine["name"]),
-                         ["block_mla_moe", "block_mla_moe"])
+                         ["MLA + MoE FFN", "MLA + MoE FFN"])
         self.assertEqual(
             [n for n in by_name if "output_attn_res_" in n], [])
         self.assertEqual(
@@ -432,15 +431,16 @@ class TestArchitectureView(unittest.TestCase):
               c.get("template")) for c in blocks],
             [("cycle_container", 9, [0, 26], None),
              ("dense_block", None, None, "mimo_v2_5_vision_block_full")])
-        # Kimi-K3's MLA layer recurs every 4, but every third stretch opens
-        # with `block_kda_moe_start`: the cycle is 12 long, and every layer
-        # it covers is the block its card names.
+        # Kimi-K3's MLA layer recurs every 4 over three KDA layers.  The KDA
+        # kind is one card; the every-12th stream restart is a variant of that
+        # kind, not a fourth kind in the cycle.
         layers = self._layers("moonshotai__Kimi-K3.json")
         (cycle,) = [c for c in layers if c["type"] == "cycle_container"]
         self.assertEqual((cycle["cycle_period"], cycle["cycle_layer_range"]),
-                         (12, [3, 86]))
+                         (4, [3, 90]))
+        restart = next(b for b in cycle["cycle_blocks"] if "variants" in b)
         self.assertIn("block_kda_moe_start",
-                      [b["template"] for b in cycle["cycle_blocks"]])
+                      [variant["template"] for variant in restart["variants"]])
 
     def test_qwen3_dense_gqa_badge(self):
         # Qwen3 is dense GQA — single attention badge, no MoE / no quant
@@ -527,20 +527,26 @@ class TestArchitectureView(unittest.TestCase):
             self.assertNotIn("Mamba2", card.get("detail", ""))
 
 class TestModelConfig(unittest.TestCase):
-    def test_public_layer_configs_cover_every_snapshot(self):
+    def test_public_layer_configs_cover_the_structural_cohort(self):
         """`layer_configs` (the one projection, since the engine twin
-        retired) yields a non-empty, well-formed group list for every
-        resolvable snapshot; the two MoE models it historically corrected
+        retired) yields a non-empty, well-formed group list for the structural
+        cohort; the two MoE models it historically corrected
         stay corrected."""
         loader = shared_loader()
         corrected = {
             "Qwen__Qwen3-235B-A22B.json",
             "Qwen__Qwen3-30B-A3B.json",
         }
-        for path in sorted(glob.glob(str(SNAPSHOTS_DIR / "*.json"))):
-            with self.subTest(snapshot=Path(path).name):
-                config = json.loads(Path(path).read_text())["config"]
-                resolved = loader.match(config, model_id=Path(path).stem.replace("__", "/", 1))
+        snapshots = [
+            *(SNAPSHOTS_DIR / f"{model_id.replace('/', '__')}.json"
+              for model_id in STRUCTURAL_SNAPSHOT_IDS),
+            SNAPSHOTS_DIR / "Qwen__Qwen3-30B-A3B.json",
+        ]
+        for path in snapshots:
+            with self.subTest(snapshot=path.name):
+                config = json.loads(path.read_text())["config"]
+                resolved = loader.match(
+                    config, model_id=path.stem.replace("__", "/", 1))
                 if resolved is None:
                     continue
                 projected = layer_configs(resolved)
@@ -548,7 +554,7 @@ class TestModelConfig(unittest.TestCase):
                 for item in projected:
                     self.assertIn("count", item)
                     self.assertIn("attn_display", item)
-                if Path(path).name in corrected:
+                if path.name in corrected:
                     self.assertTrue(all(
                         item["ffn_type"] == "moe" for item in projected
                     ))

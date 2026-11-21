@@ -29,8 +29,7 @@ import pytest
 import sympy as sp
 from sympy.parsing.sympy_parser import parse_expr
 
-from backend.arch.snapshots import iter_snapshot_ids
-from tests.snapshots import resolve_snapshot
+from tests.snapshots import STRUCTURAL_SNAPSHOT_IDS, resolve_snapshot
 
 COMPONENTS = Path(__file__).resolve().parents[4] / "backend" / "arch" / "components"
 CONFIG = {
@@ -145,9 +144,9 @@ def test_tied_weights_copies_are_in_the_weights_formula():
     assert _mismatches(got) == []
 
 
-@pytest.mark.regression  # the whole corpus, a dashboard each
-@pytest.mark.parametrize("model_id", sorted(iter_snapshot_ids()))
-def test_every_models_formulas_add_up(model_id):
+@pytest.mark.regression  # one dashboard per structural family
+@pytest.mark.parametrize("model_id", STRUCTURAL_SNAPSHOT_IDS)
+def test_structural_families_formulas_add_up(model_id):
     from backend.arch.eval.projection import display_formulas
     assert _mismatches(display_formulas(resolve_snapshot(model_id),
                                         batch_size=2, seq_len=1024)) == []

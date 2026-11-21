@@ -1,12 +1,13 @@
 """KV cache marks on the rendered graphs, against the cache layer.
 
-The inference page's serving graph is checked over every snapshot, both
-phases, and three meshes: the writers' stored bytes per request, counted per
-layer, must add up to the per-rank stored cache the capacity page budgets
-with (`CacheView.storage_bytes_at` — each tensor at its own law, so a window
-stops at its window and a compressed pool grows at its ratio), and every
-node the cache layer names must be drawn. The Inspector graph is checked on
-the layers worked through by hand.
+The inference page's serving graph is checked over one structural
+representative per cache family, with phase and mesh rotated across that
+cohort instead of walked as a product: the writers' stored bytes per request,
+counted per layer, must add up to the per-rank stored cache the capacity page
+budgets with (`CacheView.storage_bytes_at` — each tensor at its own law, so a
+window stops at its window and a compressed pool grows at its ratio), and
+every node the cache layer names must be drawn. The Inspector graph is checked
+on the layers worked through by hand.
 """
 from __future__ import annotations
 
@@ -22,17 +23,15 @@ from backend.arch.eval import cache as cache_mod
 from backend.arch.eval.formats import known_dtype_bytes
 from backend.arch.layout.physical_cache import (
     cache_geometry, physical_cache_view)
-from backend.arch.snapshots import iter_snapshot_ids
 from backend.inference.framework_bindings import get_binding
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.pipeline import analyze
 from backend.rendering._compute_graph import serialize_post_tree
 from backend.rendering.builders import build_block_graph_data
 from backend.rendering.kv_marks import KVMarks
-from tests.snapshots import resolve_snapshot, shared_loader
+from tests.snapshots import (
+    STRUCTURAL_SNAPSHOT_IDS, resolve_snapshot, shared_loader)
 
-SNAPSHOTS = sorted(iter_snapshot_ids())
-PHASES = ("prefill", "decode")
 #: DCP is the mesh the engine may refuse for a layer (a head shard it
 #: crosses, sparse top-k); TP never.
 MESHES = {
@@ -40,6 +39,19 @@ MESHES = {
     "tp8": {"tp_attention": 8, "tp_dense_ffn": 8},
     "tp4_dcp2": {"tp_attention": 4, "tp_dense_ffn": 4, "dcp": 2},
 }
+
+# The graph invariant is the same for every cell; the cells differ only in
+# which storage law and parallel rewrite they exercise.  One structural model
+# per law therefore carries one framework/mesh/phase cell, rather than every
+# model carrying the full product.
+_PHASES = ("decode", "prefill", "decode", "prefill", "decode", "prefill",
+           "decode")
+_MESH_NAMES = ("tp8", "tp1", "tp8", "tp1", "tp4_dcp2", "tp1", "tp4_dcp2")
+CASES = tuple(
+    (model, phase, mesh)
+    for model, phase, mesh in zip(
+        STRUCTURAL_SNAPSHOT_IDS, _PHASES, _MESH_NAMES, strict=True)
+)
 
 
 def _serving(model_id: str, phase: str, mesh: str):
@@ -91,10 +103,7 @@ def _edge_scopes(nodes, edges):
                                     node.get("child_edges") or [])
 
 
-@pytest.mark.regression  # every snapshot × phase × mesh
-@pytest.mark.parametrize("model_id", SNAPSHOTS)
-@pytest.mark.parametrize("phase", PHASES)
-@pytest.mark.parametrize("mesh", sorted(MESHES))
+@pytest.mark.parametrize("model_id,phase,mesh", CASES)
 def test_serving_graph_marks_add_up_to_the_cache(model_id, phase, mesh):
     result, graph = _serving(model_id, phase, mesh)
 

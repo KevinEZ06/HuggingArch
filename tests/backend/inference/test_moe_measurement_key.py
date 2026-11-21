@@ -30,7 +30,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
 
-from tests.snapshots import resolve_snapshot
+from tests.snapshots import STRUCTURAL_SNAPSHOT_IDS, resolve_snapshot
 
 from backend.inference.benchmark_identity import (
     RowIdentity,
@@ -418,24 +418,15 @@ def test_a_body_with_two_dispatches_is_refused():
         Program.dispatch_of(graph, member)
 
 
-def _corpus_stems():
-    from tests.snapshots import SNAPSHOT_DIR
-    first = "deepseek-ai__DeepSeek-V3"
-    rest = sorted(path.stem for path in SNAPSHOT_DIR.glob("*.json")
-                  if path.stem != first)
-    return [first, *rest]
-
-
 @pytest.mark.regression
-@pytest.mark.parametrize("stem", _corpus_stems())
-def test_every_moe_models_routed_launch_is_one_cell(stem):
-    """Every MoE model in the corpus: a small decode (fewer routed rows than
+@pytest.mark.parametrize("stem", STRUCTURAL_SNAPSHOT_IDS)
+def test_structural_moe_models_routed_launch_is_one_cell(stem):
+    """Every structural MoE family: a small decode (fewer routed rows than
     experts, the path that launches only the experts the rows reach) keys
     each routed launch off its `RoutedLaunch` without refusal — its routed
     buffers lead with the experts and their rows, its banks' expert axes are
-    found — and every launch of the zone names one expert load whose total
-    is its experts times its rows. DeepSeek-V3 first: its B=1 decode routes
-    8 rows over 256 experts."""
+        found — and every launch of the zone names one expert load whose total
+        is its experts times its rows."""
     from tests.snapshots import shared_program
     if not shared_program(stem).has_dispatch_zone:
         pytest.skip("no dispatch zone")

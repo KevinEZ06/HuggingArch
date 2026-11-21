@@ -31,17 +31,29 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.arch.eval.fusion import OperandRoles
 from backend.arch.eval.launch import FusedNode
-from backend.arch.snapshots import iter_snapshot_ids
 from backend.inference.framework_bindings import get_binding
 from backend.inference.fusion_plans import FUSION_SCHEMES
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.pipeline import analyze
-from tests.snapshots import resolve_snapshot, shared_loader
+from tests.snapshots import (
+    STRUCTURAL_SNAPSHOT_IDS, resolve_snapshot, shared_loader)
 
-SNAPSHOTS = sorted(iter_snapshot_ids())
-FRAMEWORKS = ("vllm", "sglang")
 MESHES = {"tp1": {}, "tp8": {"tp_attention": 8, "tp_dense_ffn": 8}}
-PHASES = ("prefill", "decode")
+
+# Port identity is invariant across framework, mesh and phase; the old product
+# re-walked the same resolver for every model.  Rotate the axes across
+# structural representatives instead, and keep the fused-MLA path in the
+# default run.
+_FRAMEWORKS = ("sglang", "vllm", "vllm", "sglang", "vllm", "vllm", "sglang")
+_MESH_NAMES = ("tp8", "tp1", "tp8", "tp1", "tp8", "tp1", "tp8")
+_PHASES = ("decode", "prefill", "decode", "prefill", "decode", "prefill",
+           "decode")
+CASES = tuple(
+    (model, framework, mesh, phase)
+    for model, framework, mesh, phase in zip(
+        STRUCTURAL_SNAPSHOT_IDS, _FRAMEWORKS, _MESH_NAMES, _PHASES,
+        strict=True)
+)
 
 
 def _port_name(io_name: str) -> str:
@@ -98,21 +110,17 @@ def _violations(result, framework: str) -> list:
     return out
 
 
-@pytest.mark.regression  # every snapshot
-@pytest.mark.parametrize("model_id", SNAPSHOTS)
-def test_every_fused_port_sits_on_the_member_its_name_declares(model_id):
+@pytest.mark.parametrize("model_id,framework,mesh,phase", CASES)
+def test_every_fused_port_sits_on_the_member_its_name_declares(
+        model_id, framework, mesh, phase):
     resolved = resolve_snapshot(model_id, shared_loader())
     problems = []
-    for framework in FRAMEWORKS:
-        binding = get_binding(framework)
-        for mesh, parallel in MESHES.items():
-            for phase in PHASES:
-                result = analyze(
-                    resolved, parallel=ParallelConfig.from_dict(parallel),
-                    framework_binding=binding, batch_size=1, avg_input_tokens=16, avg_output_tokens=0,
-                    phase=phase, breakdown=False)
-                problems += [f"{mesh} {phase} {p}"
-                             for p in _violations(result, framework)]
+    result = analyze(
+        resolved, parallel=ParallelConfig.from_dict(MESHES[mesh]),
+        framework_binding=get_binding(framework), batch_size=1,
+        avg_input_tokens=16, avg_output_tokens=0, phase=phase,
+        breakdown=False)
+    problems += [f"{mesh} {phase} {p}" for p in _violations(result, framework)]
     assert not problems, "\n".join(sorted(set(problems)))
 
 

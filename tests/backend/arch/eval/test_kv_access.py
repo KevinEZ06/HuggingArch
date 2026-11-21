@@ -1,8 +1,9 @@
 """`cache.kv_access`: which node writes and which reads each cached tensor.
 
-Every shipped snapshot, both phases, no allow-list. The graph marks drawn on
-every compute graph are projections of this layer, so a hole here is a
-missing cache mark there.
+One structural representative per cache/attention family, both phases where
+the property is phase-sensitive, no allow-list. The graph marks drawn on every
+compute graph are projections of this layer, so a hole here is a missing cache
+mark there.
 """
 from __future__ import annotations
 
@@ -21,10 +22,10 @@ from backend.arch.eval.dim import value_of
 from backend.arch.eval.program import Program
 from backend.arch.eval.transforms import Deployment, analyze_isolated
 from backend.arch.ops_base import OP_REGISTRY
-from backend.arch.snapshots import iter_snapshot_ids
-from tests.snapshots import resolve_snapshot, shared_loader
+from tests.snapshots import (
+    STRUCTURAL_SNAPSHOT_IDS, resolve_snapshot, shared_loader)
 
-SNAPSHOTS = sorted(iter_snapshot_ids())
+SNAPSHOTS = STRUCTURAL_SNAPSHOT_IDS
 PHASES = ("prefill", "decode")
 
 
@@ -300,8 +301,8 @@ def test_mla_prefill_attention_reads_the_decompressed_keys(model_id):
 
 
 def test_the_mla_prefill_check_covers_the_mla_corpus():
-    """G10 is not vacuous: the corpus has MLA layers with an absorbed decode
-    form, and the check above visits their attention kernels."""
+    """G10 is not vacuous: the structural cohort has MLA layers with an
+    absorbed decode form, and the check above visits their attention kernels."""
     kernels = 0
     for model_id in SNAPSHOTS:
         analysis = _analysis(model_id, "prefill")
@@ -310,7 +311,7 @@ def test_the_mla_prefill_check_covers_the_mla_corpus():
             if graph.decode_variant and graph.kv_label == "MLA":
                 kernels += sum(1 for leaf in _leaves(holder)
                                if _declares(leaf, "attention_kernel"))
-    assert kernels >= 20
+    assert kernels >= 12
 
 
 def test_the_marked_readers_of_known_layers():

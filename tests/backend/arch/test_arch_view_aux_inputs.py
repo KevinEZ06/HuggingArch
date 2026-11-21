@@ -14,10 +14,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 SNAPSHOTS_DIR = PROJECT_ROOT / "backend" / "arch" / "snapshots"
 
-from tests.snapshots import shared_loader
+from tests.snapshots import STRUCTURAL_SNAPSHOT_IDS, shared_loader
 from backend.rendering import build_architecture_view
 from tools.corpus_pins.checks.arch_view_graph import ARCH_VIEW_GRAPH
-from tools.corpus_pins.corpus import Corpus
+from tools.corpus_pins.corpus import CorpusModel
+
+STRUCTURAL_MODELS = [
+    CorpusModel(model_id.replace("/", "__"))
+    for model_id in STRUCTURAL_SNAPSHOT_IDS
+]
 
 
 def _format_params(n):
@@ -220,10 +225,10 @@ class TestViewTopology(unittest.TestCase):
             self.assertIn(edge["to"], ids)
 
 
-@pytest.mark.regression  # every snapshot
-@pytest.mark.parametrize("model", Corpus.models(), ids=lambda m: m.stem)
+@pytest.mark.regression  # one structural representative per family
+@pytest.mark.parametrize("model", STRUCTURAL_MODELS, ids=lambda m: m.stem)
 def test_every_view_is_a_connected_graph(model):
-    """On every snapshot (C7, `tools/corpus_pins/checks/arch_view_graph`):
+    """On the structural cohort (C7, `tools/corpus_pins/checks/arch_view_graph`):
     each edge joins two boxes the view draws, and every card and section is
     read into by something — a box with no incoming edge would be a layer
     the view lost the reads of."""

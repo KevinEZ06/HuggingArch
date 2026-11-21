@@ -30,6 +30,7 @@ from backend.arch.spec_tree import (
 )
 from backend.arch.eval.program import Program
 from backend.arch.eval.transforms import Deployment
+from tests.snapshots import STRUCTURAL_SNAPSHOT_IDS
 
 pytestmark = pytest.mark.regression  # walks every snapshot
 
@@ -351,14 +352,17 @@ class TestCustomOpAsLinear(unittest.TestCase):
             self.assertEqual(lt.multiplicity, 12)
 
 
-class TestEveryCommittedSpecMaterializes(unittest.TestCase):
-    """Smoke test: every snapshot under backend/arch/snapshots/
-    must walk + materialize without crashing. Catches regressions in
-    the Program/Analysis walk across the full template space.
+class TestStructuralSpecsMaterialize(unittest.TestCase):
+    """Smoke test: one structural representative per family must walk +
+    materialize without crashing. Catches regressions in the Program/Analysis
+    walk across the template families the corpus currently has.
     """
 
-    def test_all_snapshots(self):
-        snapshots = sorted(SNAPSHOT_DIR.glob("*.json"))
+    def test_structural_snapshots(self):
+        snapshots = [
+            SNAPSHOT_DIR / f"{model_id.replace('/', '__')}.json"
+            for model_id in STRUCTURAL_SNAPSHOT_IDS
+        ]
         self.assertGreater(len(snapshots), 0)
 
         loader = SpecLoader()
@@ -389,9 +393,10 @@ class TestEveryCommittedSpecMaterializes(unittest.TestCase):
                 mat = _checkpoint(resolved)
                 self.assertGreaterEqual(len(mat), len(logical))
             walked += 1
-        self.assertGreater(
-            walked, 10,
-            f"Only walked {walked} specs; expected >10. Skipped: {skipped[:5]}",
+        self.assertGreaterEqual(
+            walked, len(STRUCTURAL_SNAPSHOT_IDS),
+            f"A structural representative failed to materialize. Skipped: "
+            f"{skipped[:5]}",
         )
 
 

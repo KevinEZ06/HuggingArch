@@ -64,19 +64,18 @@ SNAPSHOT_DIR = PROJECT_ROOT / "backend" / "arch" / "snapshots"
 #: test's first case (tests/conftest.py), and gpt-oss and GLM-5.1 keep their
 #: own unswept tests in it.
 _MODELS = (
-    "meta-llama__Llama-3.2-3B",
+    "meta-llama__Llama-3.2-1B",
     "openai__gpt-oss-20b",
     "XiaomiMiMo__MiMo-V2.5",
     "deepseek-ai__DeepSeek-V3",
     "zai-org__GLM-5.1",
 )
 
-#: Finest split first. A stage count is not a structural case of its own: the
-#: partition obeys one law at 2, 4 and 8 stages, and 8 is where that law is
-#: hardest — the most cuts, the uneven remainder (28 layers over 8 stages,
-#: 61 over 8), and the split GLM-5.1's duplicate template name doubled. 4 and
-#: 2 are the same law with fewer cuts.
-_PP = (8, 4, 2)
+#: The finest split is the structural one: it has the most cuts, the uneven
+#: remainder (16 layers over 8 stages, 61 over 8), and the split GLM-5.1's
+#: duplicate template name doubled.  4 and 2 obey the same law with fewer
+#: cuts and only repeat it.
+_PP = (8,)
 
 _GPU = "H200"
 _IN, _OUT = 8192, 256

@@ -353,6 +353,16 @@ ENV_SORT = {"latency": lambda e: e["_w"]["latency_us"], "gain": lambda e: e["gai
             "gbps": lambda e: e["_rates"]["gbps"], "mfu": lambda e: e["_rates"]["mfu"],
             "mbu": lambda e: e["_rates"]["mbu"]}
 
+# Scope and sort are independent dimensions: cover every scope at one sort,
+# every sort at one scope, and both directions, rather than their product.
+ENVELOPE_CASES = (
+    ("union", "latency", False),
+    *((scope, "latency", desc)
+      for scope in SCOPES for desc in (False, True)),
+    *(("union", sort, index % 2 == 0)
+      for index, sort in enumerate(ENV_SORT) if sort != "latency"),
+)
+
 
 def public(e):
     return {k: v for k, v in e.items() if not k.startswith("_")}
@@ -387,6 +397,15 @@ ROW_SORT = {
     "ai": lambda r: rates(r)["ai"],
 }
 
+# Every key selects through the same comparator; alternate direction, then
+# pin both directions once on the primary latency key.
+ROW_SORT_CASES = (
+    ("latency", False),
+    *((sort, index % 2 == 0)
+      for index, sort in enumerate(ROW_SORT) if sort != "latency"),
+    ("latency", True),
+)
+
 
 def strip(out: dict) -> dict:
     """The answer without its facets; a curve's lines as a set."""
@@ -399,9 +418,7 @@ def strip(out: dict) -> dict:
 
 # ---------------------------------------------------------------------- tests
 
-@pytest.mark.parametrize("scope", list(SCOPES))
-@pytest.mark.parametrize("sort", list(ENV_SORT))
-@pytest.mark.parametrize("desc", [False, True])
+@pytest.mark.parametrize("scope,sort,desc", ENVELOPE_CASES)
 def test_envelope_every_sort_and_scope(corpus, scope, sort, desc):
     lk, rows = corpus
     got = browse(lk, query(scope, sort=sort, desc=desc, page_size=200))
@@ -424,9 +441,16 @@ FILTERS = [
     {"signature": "sig:moe", "dtype": "bf16", "framework": "vllm"},
 ]
 
+# Filtering is scope-independent; rotate scopes so each filter meets a reader
+# boundary without multiplying the whole filter corpus by every scope.
+_FILTER_SCOPES = tuple(SCOPES)
+FILTER_CASES = tuple(
+    (_FILTER_SCOPES[index % len(_FILTER_SCOPES)], f)
+    for index, f in enumerate(FILTERS)
+)
 
-@pytest.mark.parametrize("scope", ["shared", "union", "run"])
-@pytest.mark.parametrize("f", FILTERS, ids=lambda f: "-".join(f"{k}={v}" for k, v in f.items()))
+
+@pytest.mark.parametrize("scope,f", FILTER_CASES)
 def test_envelope_filters_and_facets(corpus, scope, f):
     lk, rows = corpus
     got = browse(lk, query(scope, filters=f, sort="mfu", desc=True, page_size=200))
@@ -511,17 +535,19 @@ def ref_rows(rows, scope, f, sort, desc, page, size, key=None):
             "items": [ref_row(r, reader) for r in sel[page * size:(page + 1) * size]]}
 
 
-@pytest.mark.parametrize("sort", list(ROW_SORT))
-@pytest.mark.parametrize("desc", [False, True])
+@pytest.mark.parametrize("sort,desc", ROW_SORT_CASES)
 def test_rows_of_a_set_every_sort(corpus, sort, desc):
     lk, rows = corpus
     got = browse(lk, query("run", view="rows", sort=sort, desc=desc, page_size=50, page=1))
     assert strip(got) == ref_rows(rows, "run", {}, sort, desc, 1, 50)
 
 
-@pytest.mark.parametrize("scope", ["shared", "union", "mine"])
-@pytest.mark.parametrize("f", [{}, {"check": "over"}, {"kernel": "KB", "dtype": "fp8"},
-                               {"signature": "sig:attn", "gpu": "H100", "framework": "vllm"}])
+@pytest.mark.parametrize("scope,f", (
+    ("union", {}),
+    ("shared", {"check": "over"}),
+    ("mine", {"kernel": "KB", "dtype": "fp8"}),
+    ("union", {"signature": "sig:attn", "gpu": "H100", "framework": "vllm"}),
+))
 def test_rows_of_a_model_and_phase(corpus, scope, f):
     lk, rows = corpus
     f = {"model": "m1", "phase": "decode", **f}
@@ -531,8 +557,11 @@ def test_rows_of_a_model_and_phase(corpus, scope, f):
         assert got["facets"] == ref_facets(in_scope(rows, scope), f)
 
 
-@pytest.mark.parametrize("scope", ["shared", "union", "anonymous"])
-@pytest.mark.parametrize("f", [{}, {"gpu": "A100", "check": "ok"}])
+@pytest.mark.parametrize("scope,f", (
+    ("union", {}),
+    ("anonymous", {"gpu": "A100", "check": "ok"}),
+    ("shared", {"gpu": "A100", "check": "ok"}),
+))
 def test_rows_unscoped(corpus, scope, f):
     """The rows view takes the envelope view's scope and filters: no batch,
     model or op shape needed, one page of the whole scope."""
@@ -571,6 +600,13 @@ def test_rows_of_a_set_include_placeholders(corpus):
 
 WORKLOAD_SORTS = ["latency", "layer", "op", "kernel", "framework", "shape", "samples",
                   "tflops", "gbps", "mfu", "mbu"]
+WORKLOAD_SORT_CASES = (
+    ("latency", None),
+    ("latency", False),
+    ("latency", True),
+    *((sort, (None, False, True)[index % 3])
+      for index, sort in enumerate(WORKLOAD_SORTS) if sort != "latency"),
+)
 
 
 def ref_workload(rows, scope, f, batch, context, sort, desc, page, size):
@@ -598,10 +634,14 @@ def ref_workload(rows, scope, f, batch, context, sort, desc, page, size):
             "items": [ref_row(r, reader) for r in p[page * size:(page + 1) * size]]}
 
 
-@pytest.mark.parametrize("scope", ["shared", "union", "run"])
-@pytest.mark.parametrize("phase,batch,context", [
-    ("prefill", None, None), ("prefill", 2, None), ("prefill", 2, 128), ("prefill", 1, 0),
-    ("decode", 4, 256), ("decode", 1, 0)])
+@pytest.mark.parametrize("scope,phase,batch,context", (
+    ("union", "prefill", None, None),
+    ("shared", "prefill", 2, None),
+    ("mine", "prefill", 2, 128),
+    ("run", "prefill", 1, 0),
+    ("anonymous", "decode", 4, 256),
+    ("admin-run", "decode", 1, 0),
+))
 def test_workload(corpus, scope, phase, batch, context):
     lk, rows = corpus
     f = {"model": "m2", "phase": phase, "batch": batch, "context": context}
@@ -612,8 +652,7 @@ def test_workload(corpus, scope, phase, batch, context):
     assert got == want
 
 
-@pytest.mark.parametrize("sort", WORKLOAD_SORTS)
-@pytest.mark.parametrize("desc", [None, False, True])
+@pytest.mark.parametrize("sort,desc", WORKLOAD_SORT_CASES)
 def test_workload_sorts_and_filters(corpus, sort, desc):
     lk, rows = corpus
     f = {"model": "m1", "phase": "prefill", "batch": 2, "context": 256, "framework": "vllm"}
@@ -749,10 +788,23 @@ def ref_curves(rows, scope, f, axes, max_env=50_000, max_points=4_000, key=None)
     return {"ops": ops}
 
 
-@pytest.mark.parametrize("scope", ["shared", "union", "mine"])
-@pytest.mark.parametrize("f", [{}, {"gpu": "H100"}, {"kernel": "KA", "check": "ok"}, {"model": "m1"}])
-@pytest.mark.parametrize("axes", [AXES, SEPARATE, CONTEXT, NO_MOE],
-                         ids=["attn-folded", "attn-separate", "attn-context", "moe-no-contract"])
+@pytest.mark.parametrize("scope,f,axes", (
+    pytest.param("union", {}, AXES, id="union-attn-folded"),
+    pytest.param("union", {}, SEPARATE, id="union-attn-separate"),
+    pytest.param("union", {}, CONTEXT, id="union-attn-context"),
+    pytest.param("union", {}, NO_MOE, id="union-moe-no-contract"),
+    pytest.param("shared", {}, AXES, id="shared-attn-folded"),
+    pytest.param("mine", {}, AXES, id="mine-attn-folded"),
+    pytest.param("run", {}, AXES, id="run-attn-folded"),
+    pytest.param("anonymous", {}, AXES, id="anonymous-attn-folded"),
+    pytest.param("admin-run", {}, AXES, id="admin-run-attn-folded"),
+    pytest.param("shared", {"gpu": "H100"}, SEPARATE,
+                 id="shared-gpu-attn-separate"),
+    pytest.param("run", {"kernel": "KA", "check": "ok"}, CONTEXT,
+                 id="run-kernel-attn-context"),
+    pytest.param("mine", {"model": "m1"}, NO_MOE,
+                 id="mine-model-moe-no-contract"),
+))
 def test_curves(corpus, scope, f, axes):
     lk, rows = corpus
     got = browse(lk, query(scope, view="curves", filters={**f, "call_tokens": axes}))
@@ -813,9 +865,12 @@ def test_curves_bounds(corpus, monkeypatch):
 
 # ------------------------------------------------------------------- coverage
 
-@pytest.mark.parametrize("scope", ["shared", "union", "run"])
-@pytest.mark.parametrize("f", [{}, {"gpu": "A100", "dtype": "bf16"}, {"phase": "decode", "check": "over"},
-                               {"model": "m1", "kernel": "KA", "framework": "vllm"}])
+@pytest.mark.parametrize("scope,f", (
+    ("union", {}),
+    ("shared", {"gpu": "A100", "dtype": "bf16"}),
+    ("run", {"phase": "decode", "check": "over"}),
+    ("mine", {"model": "m1", "kernel": "KA", "framework": "vllm"}),
+))
 def test_coverage(corpus, scope, f):
     lk, rows = corpus
     got = browse(lk, query(scope, view="coverage", filters=f))
