@@ -415,8 +415,8 @@ class TestMultiModeBatch(unittest.TestCase):
         dedicated call per SKU. H100-SXM and B300 are different classes
         (compute capability 9.0 and 10.3), so this is also the check that
         neither card is priced off the other's walk."""
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
-        env = _base_env(llama, "meta-llama/Llama-3.2-3B")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
+        env = _base_env(llama, "meta-llama/Llama-3.2-1B")
         kw = dict(mode="tp_tp", contexts=[1024], base_env=env)
         both = estimate_parallel_sweep(gpu_skus=["H100-SXM", "B300"], **kw)
         h100 = estimate_parallel_sweep(gpu_skus=["H100-SXM"], **kw)
@@ -428,8 +428,8 @@ class TestMultiModeBatch(unittest.TestCase):
     def test_points_past_the_published_context_say_so(self):
         # Every card's point, the restamped ones included, carries the
         # model's published context and whether this request runs past it.
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
-        env = _base_env(llama, "meta-llama/Llama-3.2-3B")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
+        env = _base_env(llama, "meta-llama/Llama-3.2-1B")
         for ctx, past in ((131072, False), (262144, True)):
             r = estimate_parallel_sweep(mode="tp_tp", contexts=[ctx],
                                         gpu_skus=["H100-SXM", "B300"],
@@ -544,6 +544,7 @@ class TestThroughputCloud(unittest.TestCase):
             self.assertAlmostEqual(got["tok_s_per_gpu"], pt["tok_s_per_gpu"], places=6)
             self.assertAlmostEqual(got["tpot_s"], pt["tpot_s"], places=12)
 
+    @pytest.mark.regression
     def test_cloud_concurrency_and_per_layout_fronts(self):
         dsv3 = _cfg("deepseek-ai__DeepSeek-V3.json")
         env = _base_env(dsv3, "deepseek-ai/DeepSeek-V3")

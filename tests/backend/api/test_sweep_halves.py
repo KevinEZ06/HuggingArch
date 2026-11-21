@@ -19,7 +19,7 @@ from backend.inference.sol_pool import SolPool
 from tests.snapshots import snapshot_config
 from tests.sweep_parity import FixtureBench, diff
 
-MODEL = "meta-llama/Llama-3.2-3B"
+MODEL = "meta-llama/Llama-3.2-1B"
 
 
 @pytest.fixture
