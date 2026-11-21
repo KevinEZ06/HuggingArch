@@ -75,9 +75,18 @@ class TestDecodeBindingSpecVerify(unittest.TestCase):
 # 2. End-to-end: verify-shape reaches per_op_timing, draft never costed.
 # ---------------------------------------------------------------------------
 
+_ESTIMATES: dict[tuple, dict] = {}
+
+
 class TestSpecDecodeEndToEnd(unittest.TestCase):
 
     def _estimate(self, model_id, K, alpha=0.7):
+        key = (model_id, K, alpha)
+        if key not in _ESTIMATES:
+            _ESTIMATES[key] = self._estimate_uncached(model_id, K, alpha)
+        return _ESTIMATES[key]
+
+    def _estimate_uncached(self, model_id, K, alpha=0.7):
         from fastapi.testclient import TestClient
         from backend.api import app
         client = TestClient(app)

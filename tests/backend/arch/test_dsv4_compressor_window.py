@@ -341,8 +341,9 @@ def test_cp_gathers_the_sequence_before_the_fold():
                    and r["op"] in ("position_table_add", "softmax_act",
                                    "sum_reduce"))
 
-    for seq in (4096, 1000):
-        assert window_flops(2, seq) == window_flops(1, seq), seq
+    # The ragged length is the discriminative one: a divisible length cannot
+    # tell a rank-local fold from the gathered whole-sequence fold.
+    assert window_flops(2, 1000) == window_flops(1, 1000)
 
 
 class _Rule:

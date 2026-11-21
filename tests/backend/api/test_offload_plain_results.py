@@ -21,12 +21,13 @@ import sympy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from backend.api import gallery_frontier, sweep_runtime, warm
+from backend.api import gallery_frontier, sweep_runtime
 from backend.api.gallery_frontier import _resolve_one
 from backend.inference.defaults import GPU_MEMORY_FRACTION_DEFAULT
 from backend.inference.parallel_sweep import class_cards, frontier_layouts, sweep_caps
 
 MODEL = "Qwen/Qwen3-8B"
+PLAIN_DENSE_MODEL = "meta-llama/Llama-3.2-1B"
 
 
 def _expressions(value, path="result"):
@@ -56,10 +57,19 @@ def test_a_frontier_layout_returns_plain_laws():
 
 
 def test_a_scaling_sweep_cell_returns_plain_points():
+    from backend.api._models import (
+        BatchPoint, InferenceEstimateSweepRequest, InferenceParallelSweepRequest,
+    )
     requests = (
-        (sweep_runtime._PARALLEL, warm.default_scaling_sweep_request(MODEL)),
-        (sweep_runtime._ESTIMATE,
-         warm.default_scaling_batch_request(MODEL, "B200", "dp_ep", 8)),
+        (sweep_runtime._PARALLEL, InferenceParallelSweepRequest(
+            model_id=PLAIN_DENSE_MODEL, gpu_sku="", contexts=[1024],
+            modes=["tp_tp"], gpu_skus=["B200"], avg_output_tokens=256,
+            selection_mode="theoretical_only")),
+        (sweep_runtime._ESTIMATE, InferenceEstimateSweepRequest(
+            model_id=PLAIN_DENSE_MODEL, gpu_sku="B200", seq_lens=[1024],
+            batch_grid=[BatchPoint(key="b1", prefill_batch_size=1,
+                                   decode_batch_size=1)],
+            avg_output_tokens=256, selection_mode="theoretical_only")),
     )
     for sweep, request in requests:
         plan = sweep.plan(request)

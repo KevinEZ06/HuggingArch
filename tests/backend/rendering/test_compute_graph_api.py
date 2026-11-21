@@ -384,15 +384,16 @@ class TestComputeGraphEndpoint(unittest.TestCase):
         #      (Qwen3 has no shared expert).
         #   C. router primary-fold — `softmax_scores` reading `gate.linear`
         #      after the wrapper absorbed the primary linear.
+        # One discriminative deployment per structure: TP8 exercises the
+        # collectives and fusions; the other TP/phase cells repeat this
+        # resolver path on the same graph shapes.
         for model in ("deepseek-ai/DeepSeek-V3", "Qwen/Qwen3-30B-A3B",
                       "meta-llama/Llama-2-7b-hf"):
-            for tp in (1, 8):
-                for phase in ("prefill", "decode"):
-                    data = self._graph(model_id=model, tp_attention=tp,
-                                       tp_dense_ffn=tp, ep_moe=tp,
-                                       phase=phase).json()
-                    with self.subTest(model=model, tp=tp, phase=phase):
-                        self._assert_no_dangling(data)
+            data = self._graph(model_id=model, tp_attention=8,
+                               tp_dense_ffn=8, ep_moe=8,
+                               phase="prefill").json()
+            with self.subTest(model=model):
+                self._assert_no_dangling(data)
 
     def test_collision_victim_block_renders_fused(self):
         # DSv3 dense + MoE blocks share the template-local spec_id

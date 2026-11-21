@@ -36,7 +36,7 @@ from tests.sweep_parity import (AMBIGUOUS, MISSING, ROW_LISTS, Deployment, Fixtu
                                 diff, law_view, measured_rows, phase_scalars, report,
                                 response_cell, rows_at, without_breakdown)
 
-LLAMA = "meta-llama/Llama-3.2-3B"
+LLAMA = "meta-llama/Llama-3.2-1B"
 QWEN_MOE = "Qwen/Qwen3-30B-A3B"
 GPT_OSS = "openai/gpt-oss-20b"   # sliding-window attention
 #: A model whose FUSED GRAPH depends on the card: vLLM gates
@@ -60,10 +60,6 @@ POINT_CARDS = ("H100-SXM", "H200", "B200")
 #: (`framework_bindings.card_class`). `CARDS` is two of them; the mixed-series
 #: oracle below runs all of it, which is the sweep's real shape.
 SERIES = tuple(DEFAULT_SWEEP_GPUS)
-# The PR/deploy gate's one served Blackwell-class card whose row set is its
-# class's; the full series (including the Ada walk that changes Kimi-K3's
-# fused rows) is regression.
-SMOKE_SERIES = ("B300",)
 
 TP2 = ParallelConfig(tp_attention=2, tp_dense_ffn=2, tp_moe_expert=2)
 EP8 = ParallelConfig(dp_attention=8, ep_moe=8)
@@ -180,12 +176,10 @@ def _row_shape(rows) -> list:
 #: everything above it. Qwen3-MoE is second as the breadth case — it serves
 #: on more of the series, so it compares more cards' verdicts — but it
 #: deploys one graph on every class and so discriminates nothing on its own
-#: (`_row_shape`). Keep that order: the default suite and the deploy gate
-#: see only the first.
+#: (`_row_shape`). Both full comparisons are regression: the cheap class-count
+#: and refusal tests guard the mechanism on every PR, while this one proves a
+#: published card's rows came from its own class.
 _MIXED_SERIES = [
-    pytest.param(Deployment(KIMI_K3, parallel=ParallelConfig(
-        tp_attention=8, tp_dense_ffn=8, ep_moe=8)), SMOKE_SERIES,
-        id="kimi-k3-tp8ep8"),
     pytest.param(Deployment(KIMI_K3, parallel=ParallelConfig(
         tp_attention=8, tp_dense_ffn=8, ep_moe=8)), SERIES,
         id="kimi-k3-tp8ep8-full", marks=pytest.mark.regression),
@@ -194,12 +188,9 @@ _MIXED_SERIES = [
 ]
 
 
-# The default/deploy gate sees the first case only: one model and one card
-# from every walk class. Others catch the MECHANISM going wrong —
-# `test_a_layout_walks_once_per_card_class` counts the walks, and the refusal
-# tests catch a cross-class re-price being attempted. This one catches a wrong
-# walk PUBLISHED as a card's own numbers, while the full series/model matrix
-# stays behind `regression`.
+# The mechanism tests catch a wrong class count or a cross-class re-price on
+# every PR; this regression catches a wrong walk PUBLISHED as a card's own
+# numbers.
 @pytest.mark.parametrize(("dep", "cards"), _MIXED_SERIES)
 def test_a_mixed_series_card_is_the_direct_walk_on_that_card(dep, cards):
     """Every card of the Scaling series, priced in ONE sweep cell, is what a

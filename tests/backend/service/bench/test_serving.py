@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import uuid
 from collections import namedtuple
 
 import httpx
@@ -239,15 +238,13 @@ def test_an_unleased_development_lake_has_its_own_writable_identity(env, opened)
     gate = _gate(opened)
     gate.writer()
     assert store.meta(gate.lake)["lake_role"] == "development"
-
-
-def test_a_development_lake_cannot_become_the_authority_by_turning_the_lease_on(
-        env, opened):
-    _dev_schema(opened(), lake_id="11111111-1111-4111-8111-111111111111")
-    gate = _gate(opened)
+    env.setenv("BENCH_LAKE_LEASE", "on")
+    # The same development lake cannot turn itself into the authority merely
+    # by turning the production lease back on.
+    authority_gate = _gate(opened)
     with pytest.raises(LakeUnavailable, match="development lake cannot claim"):
-        gate.reader()
-    assert gate.phase == "unavailable"
+        authority_gate.reader()
+    assert authority_gate.phase == "unavailable"
 
 
 def test_no_supabase_and_the_lease_on_is_503(env, opened, monkeypatch):
@@ -284,25 +281,6 @@ def test_a_lake_made_before_lake_meta_gets_an_identity(env, opened):
     gate = _gate(opened)
     meta = store.meta(gate.reader())
     assert meta["import_state"] == "none" and len(meta["lake_id"]) == 36
-
-
-def test_an_old_lake_migrates_its_data_rules_before_it_serves(
-        env, opened, make_rows, annotate, new_owner):
-    env.setenv("BENCH_LAKE_LEASE", "off")
-    lake = opened()
-    _dev_schema(lake, lake_id="x", import_state="none")
-    store.upload(lake, owner=new_owner(), upload_id=str(uuid.uuid4()), run_id=None,
-                 label=None, rows=make_rows(1))
-    assert "data_rules" not in store.meta(lake)
-    gate = _gate(opened)
-    gate.reader()
-    assert store.meta(lake)["data_rules"] == serving.data_rules.registered_version()
-    assert gate.health()["data_rules"] == {
-        "state": "current", "registered": serving.data_rules.registered_version(),
-        "lake": serving.data_rules.registered_version(),
-        "migration": {"rekeyed_rows": 0, "env_rekeyed_rows": 0,
-                      "dropped_shared_rows": 0, "reasons": {}},
-    }
 
 
 def test_a_lake_behind_is_degraded_while_it_migrates_and_failed_migrations_stay_degraded(

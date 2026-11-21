@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from dataclasses import replace
+from functools import lru_cache
 
 import pytest
 
@@ -323,6 +324,7 @@ def test_a_pin_the_weights_are_narrower_than_is_the_w4a16_case():
 
 # -- the card's own fallback (§3.8, and what vLLM runs) ---------------------
 
+@lru_cache(maxsize=None)
 def _estimate(name: str, sku: str, profile=AS_SHIPPED):
     from tests.snapshots import snapshot_config
     from backend.inference.capacity import estimate_capacity

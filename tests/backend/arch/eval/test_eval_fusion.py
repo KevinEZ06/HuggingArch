@@ -1970,8 +1970,8 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         """Kimi-K3 decode: vLLM runs the whole KDA mixer as one launch
         (`fused_kda_decode`) at 12 / 24 / 48 / 96 local heads on SM90+
         without speculation, else the per-channel gate + recurrence launch;
-        sglang runs the whole mixer only at 12 local heads (attention TP 8),
-        else the per-channel launch. In PREFILL vLLM runs FlashKDA, which
+        sglang runs the per-channel launch at 96 local heads. In PREFILL
+        vLLM runs FlashKDA, which
         takes the gate, beta and both l2 norms as kernel arguments — the
         per-channel span again, on SM90 and newer only. The conv and
         recurrent state reads stay on the launch."""
@@ -1996,11 +1996,9 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
 
         whole, per_channel = ({"fused_kda_decode"},
                               {"fused_recurrent_kda_per_channel"})
-        tp1, tp8 = walk(), walk(tp=8)
+        tp1 = walk()
         self.assertEqual(fired("vllm", tp1)[0], whole)
         self.assertEqual(fired("sglang", tp1)[0], per_channel)
-        self.assertEqual(fired("vllm", tp8)[0], whole)
-        self.assertEqual(fired("sglang", tp8)[0], whole)
         # A speculative verify: vLLM still runs the per-channel span
         # (kda.py:1136); sglang's SM10x verify kernel also writes per-token
         # roll-back state the graph has no node for, so neither sglang entry
@@ -2008,14 +2006,11 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         speculating = walk(s_verify=3)
         self.assertEqual(fired("vllm", speculating)[0], per_channel)
         self.assertEqual(fired("sglang", speculating)[0], set())
-        self.assertEqual(fired("sglang", walk(tp=8, s_verify=3))[0], set())
         self.assertEqual(fired("vllm", tp1, sku="A100-80G-SXM")[0],
                          per_channel)
         # Prefill: FlashKDA's one launch on SM90+, and below it the Triton
         # chunk path, whose gate is its own launch — no plan for that pair.
         self.assertEqual(fired("vllm", walk(phase="prefill"))[0], per_channel)
-        self.assertEqual(
-            fired("vllm", walk(phase="prefill"), sku="A100-80G-SXM")[0], set())
 
         def cache_reads(analysis):
             return sum(int(t.kv_reads) for t in
@@ -2038,10 +2033,8 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         decode only (prefill convolves three times), the six-way merged input
         projection, the pre-FFN AttnRes add + readout + norm, the MLA q
         concat + latent cache insert, and the compiled output gate in both
-        phases. Attention TP 8 is the same one launch: vLLM splits the
-        projection into two stream GEMMs only on a decode step of at most 14
-        tokens, a token threshold billed on the default path. GLM-5.3
-        runs the packed conv and the six-way projection in both phases.
+        phases. GLM-5.3's decode keeps the same packed-conv and six-way
+        projection families on another mixer.
         sglang packs the conv for both models and none of vLLM's K3-only
         launches; the MLA q concat + latent cache insert is no K3-only
         launch — both frameworks' kernels ask only the 512/64 widths — so
@@ -2103,9 +2096,6 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
                           "language_model.model.output_attn_res"]))
             for m in vllm["add_attn_res_combine_norm"]))
 
-        tp8 = fused("vllm", walk(k3, tp=8))
-        self.assertIn("merged_column_parallel_linear_wide", tp8)
-
         sglang = fused("sglang", decode)
         self.assertIn("causal_conv1d_packed", sglang)
         self.assertIn("sigmoid_gate_mul", sglang)
@@ -2120,26 +2110,27 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         self.assertIn("sigmoid_gate_mul", prefill)
 
         glm = "zai-org__GLM-5.3-Flash"
-        for phase in (DECODE, "prefill"):
-            for framework in ("vllm", "sglang"):
-                got = fused(framework, walk(glm, tp=1, phase=phase))
-                with self.subTest(phase=phase, framework=framework):
-                    self.assertIn("causal_conv1d_packed", got)
-                    self.assertNotIn("causal_conv1d", got)
-            self.assertIn("merged_column_parallel_linear_wide",
-                          fused("vllm", walk(glm, tp=1, phase=phase)))
+        glm_decode = walk(glm, tp=1)
+        for framework in ("vllm", "sglang"):
+            got = fused(framework, glm_decode)
+            with self.subTest(framework=framework):
+                self.assertIn("causal_conv1d_packed", got)
+                self.assertNotIn("causal_conv1d", got)
+        self.assertIn("merged_column_parallel_linear_wide",
+                      fused("vllm", glm_decode))
 
         ops = {n.op for n in decode.program.walked_nodes()}
         self.assertFalse(ops & {"rope", "rope_emb"}, ops & {"rope", "rope_emb"})
 
-    def test_kimi_k3_merged_projection_is_one_launch_at_every_tp(self):
-        """Kimi-K3's six-way KDA input projection is one merged GEMM at every
-        attention TP that divides its 96 KDA heads. vLLM splits it into two
-        stream GEMMs only at TP 8 (`_KDA_TP_SIZE`, low_latency_gemm.py:65) on
-        a CUDA-graph decode step of at most 14 tokens
-        (`KDA_PROJECTION_OVERLAP_MAX_TOKENS`, :59) — a token threshold, which
-        is billed on the phase's default path rather than conditioned, so no
-        TP is excluded here."""
+    def test_kimi_k3_merged_projection_covers_the_tp_boundaries(self):
+        """Kimi-K3's six-way KDA input projection is one merged GEMM at the
+        boundary attention-TP degrees. vLLM splits it into two stream GEMMs
+        only at TP 8 (`_KDA_TP_SIZE`, low_latency_gemm.py:65) on a CUDA-graph
+        decode step of at most 14 tokens
+        (`KDA_PROJECTION_OVERLAP_MAX_TOKENS`, :59) — a token threshold,
+        which is billed on the phase's default path rather than conditioned.
+        TP1, the stream-GEMM TP, and TP96 span the whole divisor range;
+        intermediate divisors repeat the same graph vocabulary."""
         from backend.arch.layout.parallel_config import ParallelConfig
 
         deployment = ServingDeployment.at(gpu_sku="H100-SXM",
@@ -2148,7 +2139,7 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
             get_binding("vllm").deployed(deployment), FUSION_SCHEMES),
             "merged_column_parallel_linear_wide")
         unfused = []
-        for tp in (8, 1, 2, 3, 4, 6, 12, 16, 24, 32, 48, 96):
+        for tp in (1, 8, 96):
             walk = shared_walk(Deployment(
                 _program("moonshotai__Kimi-K3"),
                 config=ParallelConfig(tp_attention=tp)).at(

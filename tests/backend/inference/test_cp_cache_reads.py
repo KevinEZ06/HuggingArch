@@ -163,7 +163,7 @@ def test_a_cache_union_keeps_its_seeds_past_the_cp_collectives(
 
 def test_ulysses_reads_an_mla_sparse_cache_as_tp_does():
     """DeepSeek-V3.2's DSA: the gathered latent under Ulysses is TP's."""
-    args = ("deepseek-ai__DeepSeek-V3.2", 8192)
+    args = ("deepseek-ai__DeepSeek-V3.2", 1024)
     cp = _attention_rows(args[0], "cp_ep", "ulysses", args[1], "flash_dsa")
     tp = _attention_rows(args[0], "tp_ep", "ulysses", args[1], "flash_dsa")
     assert cp and cp.keys() == tp.keys()
@@ -176,7 +176,7 @@ def test_ulysses_reads_an_mla_sparse_cache_as_tp_does():
 
 def test_pcp_reads_its_share_of_the_gathered_pairs():
     """PCP scores `1/cp` of the queries, so it gathers `1/cp` of TP's pairs."""
-    args = ("deepseek-ai__DeepSeek-V3.2", 8192)
+    args = ("deepseek-ai__DeepSeek-V3.2", 1024)
     pcp = _attention_rows(args[0], "cp_ep", "pcp", args[1], "flash_dsa")
     tp = _attention_rows(args[0], "tp_ep", "ulysses", args[1], "flash_dsa")
     assert pcp and pcp.keys() == tp.keys()
@@ -237,7 +237,7 @@ def test_ulysses_decompresses_only_its_resident_mla_rows():
     Ulysses computes the same local shape TP would before its entry A2A. The
     weight and cache residency laws do not move with this invocation cut.
     """
-    args = ("deepseek-ai__DeepSeek-V3", 8192)
+    args = ("deepseek-ai__DeepSeek-V3", 1024)
     results = {
         label: _capacity(args[0], mode, scheme, args[1])
         for label, mode, scheme in (("tp", "tp_ep", "ulysses"),

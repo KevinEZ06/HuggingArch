@@ -180,9 +180,9 @@ class TestTheLayoutDecidesTheLadder(unittest.TestCase):
 
 class TestMoEGating(unittest.TestCase):
     def test_dense_is_not_moe_ep_modes_empty(self):
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
-        self.assertFalse(is_moe(llama, model_id="meta-llama/Llama-3.2-3B"))
-        env = _base_env(llama, "meta-llama/Llama-3.2-3B")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
+        self.assertFalse(is_moe(llama, model_id="meta-llama/Llama-3.2-1B"))
+        env = _base_env(llama, "meta-llama/Llama-3.2-1B")
         for mode in EP_MODES:
             r = estimate_parallel_sweep(mode=mode, contexts=[1024],
                                         gpu_skus=["B300"], base_env=env)
@@ -190,8 +190,8 @@ class TestMoEGating(unittest.TestCase):
             self.assertEqual(r["series"], [])
 
     def test_dense_tp_tp_runs(self):
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
-        env = _base_env(llama, "meta-llama/Llama-3.2-3B")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
+        env = _base_env(llama, "meta-llama/Llama-3.2-1B")
         r = estimate_parallel_sweep(mode="tp_tp", contexts=[1024],
                                     gpu_skus=["B300"], base_env=env)
         pts = [p for p in r["series"][0]["points"] if p["feasible"]]
@@ -211,12 +211,12 @@ class TestMoEGating(unittest.TestCase):
         # "max" — _stamp_gpu_on_result used to rescale every point to the
         # capacity max, ignoring the requested batch. A pinned batch runs
         # both phases there; "max" runs one prefill request.
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
         kw = dict(mode="tp_tp", contexts=[1024], gpu_skus=["B300"])
         r_max = estimate_parallel_sweep(
-            batch="max", base_env=_base_env(llama, "meta-llama/Llama-3.2-3B"), **kw)
+            batch="max", base_env=_base_env(llama, "meta-llama/Llama-3.2-1B"), **kw)
         r_pin = estimate_parallel_sweep(
-            batch=4, base_env=_base_env(llama, "meta-llama/Llama-3.2-3B"), **kw)
+            batch=4, base_env=_base_env(llama, "meta-llama/Llama-3.2-1B"), **kw)
 
         def first(r):
             pts = [p for p in r["throughput_cloud"] if "refused" not in p]
@@ -370,8 +370,8 @@ class TestMultiModeBatch(unittest.TestCase):
     """Several axes in one call equal N single-mode calls, env resolved once."""
 
     def test_dense_batches_ep_skip_and_tp(self):
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
-        env = _base_env(llama, "meta-llama/Llama-3.2-3B")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
+        env = _base_env(llama, "meta-llama/Llama-3.2-1B")
         kw = dict(contexts=[1024], gpu_skus=["B300"], base_env=env)
         multi = estimate_parallel_sweep(modes=["dp_ep", "tp_tp"], **kw)
         self.assertEqual(set(multi["by_mode"]), {"dp_ep", "tp_tp"})
@@ -387,8 +387,8 @@ class TestMultiModeBatch(unittest.TestCase):
     def test_forwards_request_selection_mode(self):
         """The Scaling panel's Measured toggle reads t_measured_s; the sweep
         must honour the request's selection_mode instead of forcing theory."""
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
-        env = _base_env(llama, "meta-llama/Llama-3.2-3B")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
+        env = _base_env(llama, "meta-llama/Llama-3.2-1B")
         env["selection_mode"] = "latest"
         captured = []
 
@@ -404,8 +404,8 @@ class TestMultiModeBatch(unittest.TestCase):
         self.assertTrue(all(s == "latest" for s in captured))
 
     def test_unknown_mode_raises(self):
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
-        env = _base_env(llama, "meta-llama/Llama-3.2-3B")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
+        env = _base_env(llama, "meta-llama/Llama-3.2-1B")
         with self.assertRaises(ValueError):
             estimate_parallel_sweep(modes=["nope"], contexts=[1024],
                                     gpu_skus=["B300"], base_env=env)
@@ -457,8 +457,8 @@ class TestThroughputCloud(unittest.TestCase):
         A second route to the rate itself: the prompt the request reads over
         the step time the point publishes, neither of which is the
         throughput payload the point's rate comes from."""
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
-        env = _base_env(llama, "meta-llama/Llama-3.2-3B")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
+        env = _base_env(llama, "meta-llama/Llama-3.2-1B")
         r = estimate_parallel_sweep(mode="tp_tp", contexts=[1024, 4096],
                                     gpu_skus=["B300"], base_env=env)
         cloud = [p for p in r["throughput_cloud"] if "refused" not in p]
@@ -525,9 +525,9 @@ class TestThroughputCloud(unittest.TestCase):
     def test_a_frontier_point_is_the_sweep_pinned_at_its_batch(self):
         # A second route: the same layout swept with its batch pinned (an
         # independent `_point_batches` override) prices the same decode.
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
         kw = dict(mode="tp_tp", contexts=[1024], gpu_skus=["B300"])
-        env = _base_env(llama, "meta-llama/Llama-3.2-3B")
+        env = _base_env(llama, "meta-llama/Llama-3.2-1B")
         cloud = estimate_parallel_sweep(base_env=env, **kw)["throughput_cloud"]
         (line,) = cloud_view(cloud, fix={}, group_by=["gpu_sku"])["series"]
         front = [p for p in line["frontier"] if p["batch_key"] != "max"]
@@ -593,8 +593,8 @@ class TestSweepRobustness(unittest.TestCase):
         # for. Every layout used to fail on the series' first card and the
         # whole mode read "unavailable" ("TP does not apply to this model"),
         # though the Blackwell cards price it.
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
-        env = {**_base_env(llama, "meta-llama/Llama-3.2-3B"),
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
+        env = {**_base_env(llama, "meta-llama/Llama-3.2-1B"),
                "precision": {"preset": "w_nvfp4_w4a4_kv_fp8"}}
         r = estimate_parallel_sweep(mode="tp_tp", contexts=[1024],
                                     gpu_skus=["H100-SXM", "B300"], base_env=env)
@@ -637,10 +637,10 @@ class TestSweepRobustness(unittest.TestCase):
         preparation answers both halves."""
         from backend.inference import capacity as cap
 
-        llama = _cfg("meta-llama__Llama-3.2-3B.json")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
         prep = cap._capacity_preparation(
             config=llama, gpu_sku="H100-SXM",
-            knobs=cap.CapacityKnobs(model_id="meta-llama/Llama-3.2-3B"))
+            knobs=cap.CapacityKnobs(model_id="meta-llama/Llama-3.2-1B"))
         with self.assertRaises(ValueError) as refused:
             cap._restamp_gpu(prep, Card.of("B200"))
         said = str(refused.exception)
@@ -872,11 +872,11 @@ class TestOneDecodeCloud(unittest.TestCase):
     and a point of it answers what the Context × Batch sweep answered for the
     same deployment (`test_a_cloud_point_is_the_context_batch_sweeps_decode`)."""
 
-    LLAMA = "meta-llama/Llama-3.2-3B"
+    LLAMA = "meta-llama/Llama-3.2-1B"
 
     @classmethod
     def setUpClass(cls):
-        cls.env = _base_env(_cfg("meta-llama__Llama-3.2-3B.json"), cls.LLAMA)
+        cls.env = _base_env(_cfg("meta-llama__Llama-3.2-1B.json"), cls.LLAMA)
         cls.sweep = estimate_parallel_sweep(
             modes=["tp_tp"], contexts=[1024, 16384], gpu_skus=["B300"],
             base_env=cls.env)
@@ -918,9 +918,9 @@ class TestOneDecodeCloud(unittest.TestCase):
 #: at, and a card whose HBM binds another pipeline stage than the walk
 #: card's (MiMo-V2-Flash at pp=4: H200 stage 0, H20 stage 3).
 _ORACLE_CASES = [
-    ("meta-llama__Llama-3.2-3B", ("B300",), {"tp_attention": 2, "tp_dense_ffn": 2,
+    ("meta-llama__Llama-3.2-1B", ("B300",), {"tp_attention": 2, "tp_dense_ffn": 2,
                                              "tp_moe_expert": 2}, 16384, "B300"),
-    ("meta-llama__Llama-3.2-3B", ("H100-SXM", "H200"),
+    ("meta-llama__Llama-3.2-1B", ("H100-SXM", "H200"),
      {"tp_attention": 2, "tp_dense_ffn": 2, "tp_moe_expert": 2}, 16384, "H100-SXM"),
     ("XiaomiMiMo__MiMo-V2-Flash", ("H200", "H20"), {"pp": 4}, 4096, "H20"),
 ]

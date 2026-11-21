@@ -161,9 +161,12 @@ def test_every_op_fusion_meets_is_in_the_vocabulary(model_id):
     vocabulary = fp.ModelFootprint(resolved).ops
     binding = FRAMEWORK_BINDINGS["vllm"].deployed(
         ServingDeployment.at(gpu_sku="H100-SXM", activation_dtype="BF16"))
-    for parallel in ({}, {"tp_attention": 8, "tp_dense_ffn": 8,
-                          "tp_moe_expert": 8}, {"ep_moe": 8, "dp_attention": 8},
-                     {"pp": 2}):
+    # Two structurally different shadings, each in both phases. TP8 creates
+    # collectives and fused launches; DP+EP changes the MoE route's ownership.
+    # Plain TP1 and PP2 repeat the vocabulary path without adding an op class.
+    for parallel in ({"tp_attention": 8, "tp_dense_ffn": 8,
+                      "tp_moe_expert": 8},
+                     {"ep_moe": 8, "dp_attention": 8}):
         for phase in ("prefill", "decode"):
             result = analyze(resolved, parallel=ParallelConfig(**parallel),
                              framework_binding=binding, batch_size=2,

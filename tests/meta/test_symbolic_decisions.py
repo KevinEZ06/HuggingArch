@@ -112,6 +112,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from functools import lru_cache
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -365,8 +366,13 @@ ALLOWED_SKIPS = {
 class TestNoSecondRoadFromUndecidableToAnswer(unittest.TestCase):
     maxDiff = None
 
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _sites() -> frozenset:
+        return frozenset(sb.undecided_decision_sites())
+
     def test_no_new_place_decides_an_undecidable_magnitude(self) -> None:
-        now = set(sb.undecided_decision_sites())
+        now = set(self._sites())
         new = sorted(now - set(ALLOWED_DECISIONS))
         self.assertEqual(
             new, [],
@@ -381,7 +387,7 @@ class TestNoSecondRoadFromUndecidableToAnswer(unittest.TestCase):
             f"{new}")
 
     def test_the_allowance_is_not_stale(self) -> None:
-        now = set(sb.undecided_decision_sites())
+        now = set(self._sites())
         gone = sorted(set(ALLOWED_DECISIONS) - now)
         self.assertEqual(
             gone, [],
@@ -394,8 +400,13 @@ class TestNoSecondRoadFromUndecidableToAnswer(unittest.TestCase):
 class TestTheSymbolicDomainKeepsGating(unittest.TestCase):
     maxDiff = None
 
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _sites() -> frozenset:
+        return frozenset(sb.symbol_skipping_gate_sites())
+
     def test_no_new_gate_skips_itself_on_a_symbol(self) -> None:
-        now = set(sb.symbol_skipping_gate_sites())
+        now = set(self._sites())
         new = sorted(now - set(ALLOWED_SKIPS))
         self.assertEqual(
             new, [],
@@ -407,7 +418,7 @@ class TestTheSymbolicDomainKeepsGating(unittest.TestCase):
             f"refuse at a point that breaks it): {new}")
 
     def test_the_skip_inventory_is_not_stale(self) -> None:
-        now = set(sb.symbol_skipping_gate_sites())
+        now = set(self._sites())
         gone = sorted(set(ALLOWED_SKIPS) - now)
         self.assertEqual(
             gone, [],

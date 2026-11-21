@@ -338,14 +338,9 @@
   },
   {
     "identifiers": [
-      "Qwen__Qwen3-30B-A3B",
       "XiaomiMiMo__MiMo-V2.5",
-      "deepseek-ai__DeepSeek-V3",
       "deepseek-ai__DeepSeek-V3.2",
-      "deepseek-ai__DeepSeek-V4-Pro",
-      "google__gemma-4-12B-it",
-      "meta-llama__Llama-3.2-3B",
-      "openai__gpt-oss-20b"
+      "meta-llama__Llama-3.2-3B"
     ],
     "kind": "curated",
     "module": "tests/backend/arch/test_axis_propagation.py",
@@ -683,7 +678,7 @@
   {
     "identifiers": [
       "XiaomiMiMo__MiMo-V2-Flash",
-      "meta-llama__Llama-3.2-3B"
+      "meta-llama__Llama-3.2-1B"
     ],
     "kind": "curated",
     "module": "tests/backend/inference/test_parallel_sweep.py",
