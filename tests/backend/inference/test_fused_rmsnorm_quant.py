@@ -94,6 +94,22 @@ def test_module_bench_tries_plans_in_the_loader_order():
         assert sorted(ops, key=union.index) == ops, framework
 
 
+def test_module_bench_keeps_each_shipped_plan_graph_condition():
+    """The union is over shipped dispatch entries, not bare pattern names.
+
+    iHC and MHC have the same three-node flatten/norm/project pattern for
+    different architectures.  Dropping their graph conditions made the union
+    refuse every one of those models as a tied preemption.
+    """
+    from backend.playground.module_bench import shipped_fusion_plans
+    plans = {plan.scheme_name: plan for plan in shipped_fusion_plans()}
+    assert plans["ihc_pre_mix"].condition.architectures == (
+        "HYV4ForCausalLM",)
+    assert "DeepseekV4ForCausalLM" in plans["mhc_pre_gemm"].condition.architectures
+    assert "Glm5NextForConditionalGeneration" in (
+        plans["mhc_pre_gemm"].condition.architectures)
+
+
 @pytest.mark.parametrize("framework", ["sglang", "vllm"])
 def test_bare_norm_takes_its_cast_and_the_add_keeps_its_own(framework):
     """DeepSeek-V3 under FP8: `q_a_layernorm` and the cast `q_b_proj`

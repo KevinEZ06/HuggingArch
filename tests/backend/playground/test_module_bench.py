@@ -778,9 +778,10 @@ def test_runtime_params_values_bind_the_walk_like_inspector(loader):
     on both sides of `=`."""
     import sympy as sp
 
-    r = _bench("deepseek-ai/DeepSeek-V3", "mla_attention", loader, L=4096)
+    r = _bench("deepseek-ai/DeepSeek-V4-Flash", "dsv4_csa_attention",
+               loader, L=4096)
     q_b = next(row for row in r["op_tables"]["prefill"]["rows"]
-               if row["label"] == "q_b_proj")
+               if row["label"] == "wq_b")
     f = q_b["formulas"]["params"]
     assert "d_q_lora" in f["symbolic"]
     left = f["substituted"].split("=")[0].strip().replace(",", "")
@@ -792,10 +793,10 @@ def test_runtime_params_values_bind_the_walk_like_inspector(loader):
     # latent-KV a-norms are one launch (`fused_q_kv_rmsnorm`, 2e9b07932); a
     # fused row's params identity carries each member's own law.
     q_n = next(row for row in r["op_tables"]["prefill"]["rows"]
-               if "q_a_layernorm" in (row["origins"] or [row["label"]]))
+               if "q_norm" in (row["origins"] or [row["label"]]))
     nf = q_n["formulas"]["params"]
     if q_n["origins"]:
-        nf = next(st for st in nf["subterms"] if st["label"] == "q_a_layernorm")
+        nf = next(st for st in nf["subterms"] if st["label"] == "q_norm")
     assert nf["symbolic"] == "d_q_lora"
     assert str(r["dims_used"]["d_q_lora"]) == nf["substituted"].replace(",", "")
 
@@ -943,7 +944,7 @@ def test_an_fp8_module_runs_the_launches_its_serving_graph_runs(loader, phase):
     from backend.inference.pipeline import analyze
     from backend.inference.step_eval import evaluate_step
 
-    model_id, name, L = "deepseek-ai/DeepSeek-V3", "mla_attention", 2048
+    model_id, name, L = "deepseek-ai/DeepSeek-V4-Flash", "dsv4_csa_attention", 2048
     base = resolve_snapshot(model_id, loader)
     site = _site(base, name)
     bench = _bench(model_id, name, loader, L=L)["op_tables"][phase]["rows"]
@@ -992,7 +993,7 @@ def test_an_fp8_module_runs_the_launches_its_serving_graph_runs(loader, phase):
     if phase == PREFILL:
         # The casts are launches here as they are in the serving graph.
         assert any(row["kernel"] == "quantise_activation" for row in live)
-        assert any(row["kernel"] == "fused_q_kv_rmsnorm_quant" for row in live)
+        assert any(row["kernel"] == "fused_q_kv_rmsnorm" for row in live)
     assert per_op(live, lambda r: r["kernel"], lambda r: (
         r["flops"], r["act_write_bytes"], r["weight_read_bytes"],
         r["kv_read_bytes"])) == per_op(served, lambda r: r["op"], per_layer)

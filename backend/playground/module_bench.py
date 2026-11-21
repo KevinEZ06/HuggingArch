@@ -142,6 +142,7 @@ from backend.arch.eval.fusion import (
 )
 from backend.inference.fusion_plans import FUSION_SCHEMES
 from backend.inference.framework_bindings import (
+    DispatchCondition,
     FRAMEWORK_BINDINGS,
     match_order,
 )
@@ -160,20 +161,35 @@ def shipped_fusion_plans():
     in; non-matching plans are no-ops, so each variant gets exactly the kernels
     that fit it (none for a recurrent state). Built once.
     """
-    names = set()
+    #: The union may not erase a plan's graph condition.  Two shipped plans
+    #: can have the same naive pattern for different architectures (iHC and
+    #: MHC both flatten, normalise, and project); without their conditions the
+    #: union thinks they are tied for every model and refuses.  Deployment
+    #: facts are deliberately dropped: this union answers "is the span shipped
+    #: anywhere", while the caller's card and dtype choose how it is priced.
+    entries = []
     for binding in FRAMEWORK_BINDINGS.values():
-        names.update(binding.fused_ops())
-    ordered = sorted(names, key=match_order)
-    return [Fusion.named(n, FUSION_SCHEMES) for n in ordered]
+        for op_name, impl in binding.op_implementations:
+            graphs = tuple(dict.fromkeys(
+                when.graph for when in impl.whens))
+            for condition in graphs or (None,):
+                entry = (op_name, condition, impl.crosses)
+                if entry not in entries:
+                    entries.append(entry)
+    entries.sort(key=lambda entry: match_order(entry[0]))
+    return [Fusion.named(op_name, FUSION_SCHEMES, condition, crosses)
+            for op_name, condition, crosses in entries]
 
 
 _FUSION_PLANS = shipped_fusion_plans()
 
 _UNION_BINDING = FrameworkBinding(
-    framework="huggingarch-shipped",
-    audited_at=AuditedAt(tag="union", commit=""),
-    op_implementations=tuple(
-        (plan.scheme_name, FusionImplementation())
+        framework="huggingarch-shipped",
+        audited_at=AuditedAt(tag="union", commit=""),
+        op_implementations=tuple(
+        (plan.scheme_name, FusionImplementation(whens=(
+            (DispatchCondition(graph=plan.condition),)
+            if plan.condition is not None else ())))
         for plan in _FUSION_PLANS
     ),
 )
