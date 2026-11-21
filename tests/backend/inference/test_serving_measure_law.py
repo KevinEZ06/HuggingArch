@@ -233,6 +233,53 @@ def test_a_stored_k1_measure_is_the_direct_speculative_walk():
                 without_anomaly_numbers(direct)["measure"]))
 
 
+def test_a_stored_measure_point_survives_json_and_the_matrix_fold():
+    """The PR gate's one representative: a record's concrete measure point
+    survives JSON, folds through the matrix road, restamps, and equals the
+    direct estimate's `PointMeasure` at that point."""
+    model, parallel = LONG_CASES[0]
+    gpu = "H100-SXM"
+    snapshot_config(model)
+    request = _point_request(model, gpu, parallel, 1)
+    record = servingLawRecord(
+        resolve_estimate_environment(request), gpu_sku=gpu,
+        anchorContext=1024, outputTokens=256, parallel=parallel,
+        capacityCards=(gpu,), capacityContexts=(1024,),
+        measureContexts=(1024,), measureBatchGrid=[{"decode_batch_size": 1}])
+    throughJson = json.loads(json.dumps(record))
+    table = throughJson["phases"]["decode"]["measurePoints"]
+    assert table["cardless"]
+    assert all("gpu" not in point for point in table["points"])
+    ks = [0, 1] if record.get("speculative") else [0]
+    wanted = [(1024, 1, k) for k in ks]
+    assert set(wanted) <= {
+        (int(point["context"]), int(point["batch"]),
+         int(point.get("draftTokens", 0)))
+        for point in table["points"]}
+
+    matrix = servingMeasureMatrix(throughJson, card=Card.of(gpu),
+                                  points=wanted)
+    folds = matrix.fold(_oracle_select)
+    for point_key, row in matrix.point_rows.items():
+        measure = PointMeasure.from_json(servingMeasurePoint(
+            throughJson, card=Card.of(gpu), context=point_key[0],
+            batch=point_key[1], draft_tokens=point_key[2])["measure"])
+        reference = _reference_fold(measure, _oracle_select)
+        got = folds[row]
+        assert reference.track == got.track, point_key
+        assert reference.rows == got.rows, point_key
+    assert "error" not in gallery._restamp_layout(throughJson, gpu, parallel)
+    for k in ks:
+        stored = servingMeasurePoint(throughJson, card=Card.of(gpu),
+                                     context=1024, batch=1,
+                                     draft_tokens=k)
+        direct = _direct_measure(model, gpu, parallel, 1, draft_tokens=k)
+        assert (PointMeasure.from_json(stored["measure"])
+                == PointMeasure.from_json(
+                    without_anomaly_numbers(direct)["measure"])), k
+
+
+@pytest.mark.regression
 def test_stored_measure_points_are_point_keys_after_json():
     """A v6 record's concrete keys survive JSON and equal the plan road.
 

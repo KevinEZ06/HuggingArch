@@ -403,6 +403,7 @@ class _StubAnalysis(AnalysisResult):
                 # model-wide key.
                 "shape_in": [[1, 24, 2048, 128], [1, 8, 2048, 128]],
                 "shape_out": [1, 24, 2048, 128],
+                "operand_ports": [["q"], ["k"], ["v"]],
                 # The node's own dims, which the key reads beside its shapes.
                 "node_dims": {"n_heads": 24, "n_kv_heads": 8, "d_head": 128},
                 "act_dtype": "BF16",

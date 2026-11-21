@@ -220,17 +220,26 @@ class PerOpRowsFollowTheStage(unittest.TestCase):
         rows are the same op classes on every stage; what changes is the
         count each is charged. The rows themselves are structural and stay —
         this pins that the restriction is a re-count and not a filter, which
-        is why `per_op_timing` keeps its rows at `pp=8` — beside the rows
-        a stage adds, its sends across its exit cut: the hidden state.
+        is why `per_op_timing` keeps its rows at `pp=8` — beside the rows a
+        stage adds: its send across the exit cut and the seam-carried add
+        that cut keeps beside the hop.
         """
         name = "meta-llama__Llama-3.2-3B"
         one = _estimate(name, 1)
         many = _estimate(name, 8)
         sends = [r for r in many["per_op_timing"]
                  if r.get("comm_op") == "send_recv"]
+        seam_adds = [
+            r for r in many["per_op_timing"]
+            if r.get("op") == "add"
+            and r.get("display_path") == "out__block"
+            and r.get("spec_id") is None
+        ]
         self.assertLessEqual(len(sends), 2)
+        self.assertEqual(len(seam_adds), 1)
         self.assertEqual(len(one["per_op_timing"]),
-                         len(many["per_op_timing"]) - len(sends))
+                         len(many["per_op_timing"])
+                         - len(sends) - len(seam_adds))
         self.assertLess(
             sum(int(r.get("flops_per_rank") or 0)
                 for r in many["per_op_timing"]),
@@ -401,8 +410,8 @@ class ThePipelineClock(unittest.TestCase):
 
     def test_pp_time_is_the_pp1_time_plus_the_hops(self):
         """Pinned batch: with no TP, the only comm rows are the pipeline
-        hops, so the pp=2 step must equal the single-rank step plus
-        exactly their transfer time."""
+        hops, so the pp=2 step must equal the single-rank step plus their
+        transfer time and the cut's one extra launch."""
         from tests.snapshots import shared_loader
         from backend.analyzer import fetch_config
         from backend.inference.capacity import estimate_capacity
@@ -418,8 +427,12 @@ class ThePipelineClock(unittest.TestCase):
         t1 = one["phases"]["decode"]["t_sol_s"]
         p2 = two["phases"]["decode"]
         hops = p2["pipeline_time"]["t_comm"]
+        launch_delta = (
+            p2["t_sol_by_bound"]["launch"]
+            - one["phases"]["decode"]["t_sol_by_bound"]["launch"]
+        )
         self.assertGreater(hops, 0)
-        self.assertAlmostEqual(p2["t_sol_s"], t1 + hops,
+        self.assertAlmostEqual(p2["t_sol_s"], t1 + hops + launch_delta,
                                delta=1e-6 * max(t1, 1e-9))
 
 

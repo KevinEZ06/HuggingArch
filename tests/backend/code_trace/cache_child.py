@@ -70,7 +70,6 @@ def _point(model: str, entry: str) -> dict:
     and the cache's own plumbing."""
     from backend.api.sweep_runtime import compute_estimate_sweep_cached
     from backend.code_trace.provider import recording
-
     req = _point_request(model)
     with recording() as rec:
         if entry == "warm":

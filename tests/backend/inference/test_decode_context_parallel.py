@@ -37,6 +37,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -129,6 +131,25 @@ class TestDecodeContextParallelIsASubgroup(unittest.TestCase):
                     phase="decode")
                 self.assertEqual(degrees.get("s_kv", 1), want)
 
+    def test_prefill_context_parallelism_does_not_touch_the_cache_representative(self):
+        """The priced claim's PR gate: CP alone moves nothing, DCP moves by its
+        degree. The full degree/TP matrix is the regression test below."""
+        from backend.inference.parallel_config import ParallelConfig
+        model = "deepseek-ai__DeepSeek-V3"
+        base = dict(tp_attention=8, tp_dense_ffn=8, tp_moe_expert=8)
+        whole = _capacity(model, ParallelConfig(**base))[
+            "formulas"]["per_request_kv"]["result_bytes"]
+        cp = ParallelConfig(tp_attention=2, tp_dense_ffn=2, tp_moe_expert=2,
+                            ep_moe=4, cp=4, dp_attention=1)
+        dcp = ParallelConfig(tp_attention=2, tp_dense_ffn=2,
+                             tp_moe_expert=2, ep_moe=4, cp=4, dcp=4)
+        assert cp.validate() == [] and dcp.validate() == []
+        self.assertEqual(_capacity(model, cp)[
+            "formulas"]["per_request_kv"]["result_bytes"], whole)
+        self.assertAlmostEqual(_capacity(model, dcp)[
+            "formulas"]["per_request_kv"]["result_bytes"], whole / 4, delta=1.0)
+
+    @pytest.mark.regression
     def test_prefill_context_parallelism_does_not_touch_the_cache(self):
         """The claim above, priced: `cp` moves the per-request KV bytes not at
         all, while `dcp` moves them by its degree. Measured on the head-free

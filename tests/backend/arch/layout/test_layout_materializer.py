@@ -72,7 +72,9 @@ class TestUnknownCollectivesRefuse(unittest.TestCase):
         cls.step = evaluate_step(
             resolved,
             ParallelConfig(tp_attention=8, tp_dense_ffn=8),
-            phase="prefill",
+            # The all-reduce + RMSNorm launch the fusion test below pins is
+            # decode-bound; a prefill chunk is past its workspace token cap.
+            phase="decode",
             batch=1,
             input_tokens=128, output_tokens=0,
         )

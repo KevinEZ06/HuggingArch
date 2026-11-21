@@ -290,7 +290,12 @@ def test_only_the_capability_windowed_dispatch_leaves_the_audited_card(
     _walk, points = _points("Qwen/Qwen3-8B", "prefill", 16, gpu_sku=gpu_sku)
     state = {p.op: p.dispatch.state for p in points}
     assert state["flash_attention"] == flash_attention
-    for op in ("rmsnorm", "silu_and_mul", "add", "fused_qk_rope"):
+    # The serving row need not keep the primitive `add`: vLLM's rewrite can
+    # hand its operands to `fused_add_rmsnorm`, whose launch is the row that
+    # asks the declaration.
+    add_launch = state.get("add", state.get("fused_add_rmsnorm"))
+    assert add_launch == DispatchDecision.DECLARED, add_launch
+    for op in ("rmsnorm", "silu_and_mul", "fused_qk_rope"):
         assert state[op] == DispatchDecision.DECLARED, (op, state[op])
 
 

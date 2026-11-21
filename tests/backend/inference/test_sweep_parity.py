@@ -60,6 +60,10 @@ POINT_CARDS = ("H100-SXM", "H200", "B200")
 #: (`framework_bindings.card_class`). `CARDS` is two of them; the mixed-series
 #: oracle below runs all of it, which is the sweep's real shape.
 SERIES = tuple(DEFAULT_SWEEP_GPUS)
+# The PR/deploy gate's one served Blackwell-class card whose row set is its
+# class's; the full series (including the Ada walk that changes Kimi-K3's
+# fused rows) is regression.
+SMOKE_SERIES = ("B300",)
 
 TP2 = ParallelConfig(tp_attention=2, tp_dense_ffn=2, tp_moe_expert=2)
 EP8 = ParallelConfig(dp_attention=8, ep_moe=8)
@@ -180,21 +184,24 @@ def _row_shape(rows) -> list:
 #: see only the first.
 _MIXED_SERIES = [
     pytest.param(Deployment(KIMI_K3, parallel=ParallelConfig(
-        tp_attention=8, tp_dense_ffn=8, ep_moe=8)), id="kimi-k3-tp8ep8"),
-    pytest.param(Deployment(QWEN_MOE, parallel=EP8), id="qwen3-moe-dp8ep8"),
+        tp_attention=8, tp_dense_ffn=8, ep_moe=8)), SMOKE_SERIES,
+        id="kimi-k3-tp8ep8"),
+    pytest.param(Deployment(KIMI_K3, parallel=ParallelConfig(
+        tp_attention=8, tp_dense_ffn=8, ep_moe=8)), SERIES,
+        id="kimi-k3-tp8ep8-full", marks=pytest.mark.regression),
+    pytest.param(Deployment(QWEN_MOE, parallel=EP8), SERIES,
+        id="qwen3-moe-dp8ep8-full", marks=pytest.mark.regression),
 ]
 
 
-# No `regression` mark: the comment above says the default suite and the
-# deploy gate see the first case, and a mark here would have made that false.
-# Others catch the MECHANISM going wrong — `test_a_layout_walks_once_per_card_class`
-# counts the walks, and the two refusal tests catch a cross-class re-price being
-# attempted. This is the only one that catches a wrong walk PUBLISHED as a card's
-# own numbers: a swept card's rows and verdicts against a fresh direct walk on
-# that card. A check nothing runs cannot be told from one that passes, so this
-# one runs; `conftest` deselects the second case, so the gate pays for one cell.
-@pytest.mark.parametrize("dep", _MIXED_SERIES)
-def test_a_mixed_series_card_is_the_direct_walk_on_that_card(dep):
+# The default/deploy gate sees the first case only: one model and one card
+# from every walk class. Others catch the MECHANISM going wrong —
+# `test_a_layout_walks_once_per_card_class` counts the walks, and the refusal
+# tests catch a cross-class re-price being attempted. This one catches a wrong
+# walk PUBLISHED as a card's own numbers, while the full series/model matrix
+# stays behind `regression`.
+@pytest.mark.parametrize(("dep", "cards"), _MIXED_SERIES)
+def test_a_mixed_series_card_is_the_direct_walk_on_that_card(dep, cards):
     """Every card of the Scaling series, priced in ONE sweep cell, is what a
     fresh direct walk on that card gives — feasible or infeasible.
 
@@ -211,10 +218,10 @@ def test_a_mixed_series_card_is_the_direct_walk_on_that_card(dep):
     it is compared on the verdict it publishes (`_CARD_VERDICT`) and on
     publishing no rows — from that card's own walk either way.
     """
-    swept = _parallel_cell(dep, cards=SERIES)
-    assert sorted(swept) == sorted(SERIES)
+    swept = _parallel_cell(dep, cards=cards)
+    assert sorted(swept) == sorted(cards)
     priced = 0
-    for card in SERIES:
+    for card in cards:
         point = swept[card]
         direct = _direct_at_point(dep, card, point)
         diffs = [d for key in _CARD_VERDICT
@@ -233,7 +240,7 @@ def test_a_mixed_series_card_is_the_direct_walk_on_that_card(dep):
         assert not diffs, f"{card}:\n{report(diffs)}"
     # A series on which nothing was priced would pass every assertion above
     # without comparing one row.
-    assert priced, f"no card of {SERIES} served {dep.model_id}"
+    assert priced, f"no card of {cards} served {dep.model_id}"
 
 
 #: A row's measurement identity. A row re-read at another batch does not

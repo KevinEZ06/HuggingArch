@@ -216,18 +216,24 @@ class TestTheChannelDisturbsNothingElse(unittest.TestCase):
         offered to every projection and only the collective one takes it,
         so no existing key can move."""
         launch = CommLaunch.from_row(_row())
-        cases = (("linear", [1, 2048, 3072], [1, 2048, 4096]),
-                 ("rmsnorm", [1, 2048, 3072], None),
-                 ("silu_and_mul", [1, 2048, 512], None),
-                 ("flash_attention", [[1, 32, 2048, 128], [1, 8, 2048, 128]],
-                  None))
-        for op, shape_in, shape_out in cases:
+        cases = (("linear", [1, 2048, 3072], [1, 2048, 4096], None),
+                 ("rmsnorm", [1, 2048, 3072], None, None),
+                 ("silu_and_mul",
+                  [[1, 2048, 512], [1, 2048, 512]], None,
+                  [["gate"], ["up"]]),
+                 ("flash_attention",
+                  [[1, 32, 2048, 128], [1, 8, 2048, 128],
+                   [1, 8, 2048, 128]], None,
+                  [["q"], ["k"], ["v"]]))
+        for op, shape_in, shape_out, ports in cases:
             with self.subTest(op=op):
                 self.assertEqual(
                     identity_shape_from_shape_in(op, shape_in,
-                                                 shape_out=shape_out),
+                                                 shape_out=shape_out,
+                                                 operand_ports=ports),
                     identity_shape_from_shape_in(op, shape_in,
                                                  shape_out=shape_out,
+                                                 operand_ports=ports,
                                                  comm=launch))
 
     def test_a_routed_exchange_is_its_own_cell(self):

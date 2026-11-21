@@ -74,8 +74,10 @@ def test_a_scale_over_fp32_logits_is_keyed_at_the_width_it_was_billed():
 def test_an_ordinary_elementwise_row_keeps_its_bf16_key():
     """Control: a scale over a bf16 activation edge is keyed as it was."""
     qwen = _qwen()
-    row = _row(qwen,
-               "qwen_hc_full_block|mlp_inject_scale__qwen_hc_full_block")
+    row, = [r for r in qwen.per_op_timing
+            if "mlp_inject_scale" in r.get("aggregation_id", "")
+            if r.get("aggregation_id", "").endswith(
+                "__qwen_hc_linear_block")]
     billed = _billed_read_width(row)
     env = RowIdentity(qwen).dtype_env(row)
     assert billed == 2.0

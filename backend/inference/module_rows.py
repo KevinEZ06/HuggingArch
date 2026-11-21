@@ -363,7 +363,10 @@ def physical_module_rows(
         for stage in stack.stages:
             if isinstance(stage, BlockStage):
                 roots = tuple(stage.template.roots)
-                count = count_of(roots[0].uid) if roots else 0
+                # The template's own multiplicity, not a post-rewrite root's
+                # instance count: a seam launch can take one of that root's
+                # runs while the block still has every physical layer.
+                count = stage.template.count if roots else 0
                 header_at = len(rows)
                 sums = [visit(root, 1, count, stage.template.name)
                         for root in roots]

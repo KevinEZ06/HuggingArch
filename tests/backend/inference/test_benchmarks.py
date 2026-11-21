@@ -1125,6 +1125,7 @@ class TestSuggestShapesCsvAlignment:
             "spec_id": "self_attn", "op": "flash_attention", "count_per_step": 32,
             "shape_in": [[8, 32, 4096, 128], [8, 8, 4096, 128], [8, 8, 4096, 128]],
             "shape_out": [[8, 32, 4096, 128]],
+            "operand_ports": [["q"], ["k"], ["v"]],
             "node_dims": {"n_heads": 32, "n_kv_heads": 8, "d_head": 128},
             "act_dtype": "BF16",
             "zero_cost": False,
@@ -1197,6 +1198,7 @@ class TestSuggestShapesCsvAlignment:
 
         self._patch_pipeline(monkeypatch, [
             {"spec_id": "self_attn", "op": "flash_attention", "count_per_step": 32,
+             "operand_ports": [["q"], ["k"], ["v"]],
              "node_dims": {"n_heads": 32, "n_kv_heads": 8, "d_head": 128},
              "act_dtype": "BF16",
              "zero_cost": False},

@@ -78,8 +78,15 @@ def point(tmp_path_factory):
 def test_a_cached_answer_names_all_the_code_its_cold_computation_ran(point):
     cold, hit, _route = point
     assert hit["result"] == cold["result"]
+    # Request plumbing is not value computation: a cache hit deliberately
+    # starts no work, so it neither enters `within_deadline` nor charges the
+    # rate limiter (`_stored_answer`).
+    plumbing = (*_items(hit["plumbing"]),
+                *((name, digest) for name, digest in _items(cold["trace"])
+                  if name.startswith(("api/offload.py::",
+                                      "service/rate_limit.py::"))))
     hidden = sorted(_items(cold["trace"]) - _items(hit["trace"])
-                    - _items(hit["plumbing"]))
+                    - set(plumbing))
     assert hidden == [], f"code a cache hit skipped without naming: {hidden}"
 
 

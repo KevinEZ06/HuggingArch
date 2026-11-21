@@ -414,6 +414,10 @@ class TestPerOpTimingShape(unittest.TestCase):
             # one per `shape_outs` port, and the streamed weights no input
             # names (`LeafAccess.weights`).
             "input_dtypes", "port_dtypes", "weights",
+            # The port each operand fills, in plan order. A port-keyed
+            # signature refuses an operand list without it: position is not a
+            # contract across plans that share a signature.
+            "operand_ports",
         }
         from fastapi.encoders import jsonable_encoder
         from backend.inference.module_rows import served

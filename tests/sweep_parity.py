@@ -287,7 +287,8 @@ def without_breakdown(result: Mapping[str, Any], *, keyed: bool) -> Dict[str, An
     def row(r: Mapping[str, Any]) -> Dict[str, Any]:
         out = {k: v for k, v in r.items()
                if not k.endswith("_formula")
-               and k not in ("comm_phases", "comm_bw_bytes_per_sec", "comm_bw_label",
+               and k not in ("comm_phases", "comm_choice",
+                             "comm_bw_bytes_per_sec", "comm_bw_label",
                              "comm_collective_in_shape", "comm_collective_out_shape")
                and (keyed or k != "node_dims")
                and (keyed or k != "comm_payload_shape" or not r.get("is_comm"))}

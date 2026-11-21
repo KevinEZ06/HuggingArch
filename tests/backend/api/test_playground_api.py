@@ -108,11 +108,11 @@ def test_the_skeleton_lists_every_layer_group(client):
 
 
 @pytest.mark.timeout(1200)
+@pytest.mark.regression
 def test_a_hybrid_group_swap_changes_that_group_only(client):
     """A hybrid Kimi-K3 edit prices both whole models and every group row.
-    That legitimate request takes more than ten minutes on a loaded dev box;
-    keep it in the smoke run, but at the regression workflow's longer timeout
-    rather than letting the default's 600s ceiling report it as stuck."""
+    The full Kimi edit belongs to regression; the default suite keeps the
+    cheaper group/MTP edits beside this file's skeleton contract."""
     sk = _skeleton(client, "moonshotai/Kimi-K3")
     r = client.post("/api/playground/compose-model", json={
         "base_model_id": "moonshotai/Kimi-K3",

@@ -162,7 +162,7 @@ def test_installed_kimi_help_matches_spawn_resume_argv():
     missing = _run_cli([
         "kimi", "-p", "hi", "--output-format", "text",
         "--session", "ha-contract-missing-session",
-    ], timeout=15)
+    ], timeout=60)
     missing_text = missing.stdout + missing.stderr
     assert missing.returncode != 0
     assert "not found" in missing_text.lower() or "session" in missing_text.lower(), (

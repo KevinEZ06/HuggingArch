@@ -31,6 +31,7 @@ PHASE_ADDS = (
 
 MODULE_DROPS = frozenset({
     "node_dims", "shape_in_exact", "shape_in_dims", "shape_out_dims",
+    "operand_ports",
     "weight_shards", "shape_json", "dtype_env_json", "shape_weight",
     "shape_weight_dims", "weight_bytes_per_rank",
     "weight_bytes_total_per_rank",
