@@ -921,6 +921,14 @@ only while its trace can be read. Publishing uses Supabase's resumable
 upload for every object, through the environment's proxy only when one is
 configured.
 
+Storage's per-object size limit is a transport concern, not a new artifact
+shape. An archive above `HA_ARTIFACT_OBJECT_MAX_BYTES` (default 256 MiB)
+publishes as ordered `.part-NNN` objects. The index still names one logical
+tar.gz and one end-to-end SHA-256; startup concatenates the parts, verifies
+that whole digest, and only then installs the archive. Smaller artifacts
+remain one `.tar.gz` object, and a pinned logical path finds its transport
+plan in `<artifact>.parts.json`.
+
 Gallery and Scaling project a serving-law record in-process. The compiled CSE
 graph is memoized by its law content for the process's lifetime; there is no
 durable projection cache or remote tier. Only the serving-law pool above is

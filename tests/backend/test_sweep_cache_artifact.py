@@ -6,6 +6,7 @@ tampered archive fails the pull and installs nothing."""
 from __future__ import annotations
 
 import base64
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import threading
@@ -14,6 +15,7 @@ from typing import ClassVar
 import pytest
 
 from backend import release_artifacts
+from backend.fingerprint import cache_engine_version
 from backend.code_trace.provider import TRACES
 from backend.measure.cache import DiskBackend, KeyedCache
 from backend.sweep_cache_artifact import SWEEP_CACHE
@@ -153,6 +155,58 @@ def test_publish_then_pull_serves_the_published_keys(
     gets = len(storage.objects)
     assert SWEEP_CACHE.installed(root, path, marker["sha256"])
     assert SWEEP_CACHE.pull(timeout=30) == 0 and len(storage.objects) == gets
+
+
+def test_an_archive_above_the_object_limit_publishes_ordered_parts(
+        tmp_path, monkeypatch, storage):
+    """The storage limit is transport, not a new artifact format.
+
+    Index and pin still name one digest-addressed tar.gz.  Only the bytes move
+    as ordered parts, and a fresh machine transparently reassembles and checks
+    the whole archive before installing it.
+    """
+    source = tmp_path / "warm"
+    keys = _warm(source)
+    monkeypatch.setenv("HA_ARTIFACT_OBJECT_MAX_BYTES", "4096")
+    path = SWEEP_CACHE.publish(source)
+
+    index = json.loads(storage.objects[
+        f"sol-pool/sweep-cache-v1/{cache_engine_version()}"
+        "/index.json"])
+    entry = index["artifacts"][0]
+    assert index["schema"] == release_artifacts.SHARDED_INDEX_SCHEMA
+    assert entry["path"] == path and len(entry["parts"]) > 1
+    assert f"sol-pool/{path}" not in storage.objects
+    assert all(part["size"] <= 4096 for part in entry["parts"])
+    whole = b"".join(storage.objects[f"sol-pool/{part['path']}"]
+                     for part in entry["parts"])
+    assert hashlib.sha256(whole).hexdigest() == entry["sha256"]
+
+    root = _fresh_machine(tmp_path, monkeypatch, "sharded-fresh")
+    reader = KeyedCache("sweep", DiskBackend(root))
+    assert SWEEP_CACHE.pull(timeout=30) == 0
+    assert all(reader.get(key) is not None for key in keys)
+    marker = json.loads((root / ".bootstrap.json").read_text())
+    assert marker["artifact"] == path and marker["sha256"] == entry["sha256"]
+
+
+def test_a_corrupt_part_fails_before_install(tmp_path, monkeypatch, storage):
+    source = tmp_path / "warm"
+    _warm(source, n=30)
+    monkeypatch.setenv("HA_ARTIFACT_OBJECT_MAX_BYTES", "4096")
+    SWEEP_CACHE.publish(source)
+    index_name = (
+        f"sol-pool/sweep-cache-v1/{cache_engine_version()}"
+        "/index.json")
+    part = json.loads(storage.objects[index_name])["artifacts"][0]["parts"][0]
+    data = bytearray(storage.objects[f"sol-pool/{part['path']}"])
+    data[-1] ^= 0xFF
+    storage.objects[f"sol-pool/{part['path']}"] = bytes(data)
+
+    root = _fresh_machine(tmp_path, monkeypatch, "corrupt-part")
+    with pytest.raises(ValueError, match="artifact part digest mismatch"):
+        SWEEP_CACHE.pull(timeout=30)
+    assert not root.exists() or not list(root.glob("*.json"))
 
 
 def test_a_digest_mismatch_fails_closed(tmp_path, monkeypatch, storage):

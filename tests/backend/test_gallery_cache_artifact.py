@@ -140,7 +140,7 @@ def test_index_selects_an_immutable_digest_addressed_artifact():
                 "engine_version": engine_version(),
                 "artifacts": [{
                     "path": "gallery-cache-v1/engine/digest.tar.gz",
-                    "sha256": "digest",
+                    "sha256": "a" * 64,
                 }],
             }).encode()
 
@@ -149,8 +149,8 @@ def test_index_selects_an_immutable_digest_addressed_artifact():
     assert selected_artifact(
         "gallery-cache-v1/engine/index.json", engine_version(),
         "https://supabase", "key", "sol-pool", 30,
-        request=lambda url, key, timeout: Response()) == (
-        "gallery-cache-v1/engine/digest.tar.gz", "digest")
+        request=lambda url, key, timeout: Response()
+    ).path == "gallery-cache-v1/engine/digest.tar.gz"
 
 
 def test_index_for_another_engine_is_refused():

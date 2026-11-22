@@ -1,13 +1,14 @@
 """Release bootstrap artifacts: one mechanism for every layer a new machine
 pulls at container start instead of recomputing.
 
-An artifact is an immutable, digest-addressed ``.tar.gz`` in Supabase
+An artifact is an immutable, digest-addressed logical ``.tar.gz`` in Supabase
 Storage, named by a small mutable index per engine version
-(``<prefix>/<engine>/index.json``). Publishing writes the archive and its
-``.sha256`` first and moves the index last; pulling reads the index,
-downloads the archive, verifies its digest and installs it. A missing index
-or pinned object means the layer falls back to runtime warm; a
-present-but-invalid artifact fails startup (the entrypoint exits with it).
+(``<prefix>/<engine>/index.json``). Publishing writes the archive (or its
+ordered transport parts) and the digest metadata first and moves the index
+last; pulling reads the index, reassembles the logical archive, verifies its
+digest and installs it. A missing index or pinned object means the layer falls
+back to runtime warm; a present-but-invalid artifact fails startup (the
+entrypoint exits with it).
 
 Two install shapes share this transport:
 
@@ -31,12 +32,13 @@ from __future__ import annotations
 
 import argparse
 import base64
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import gzip
 import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import sys
@@ -52,11 +54,20 @@ from backend.measure.cache import TRACE_FIELD, DiskBackend
 
 
 INDEX_SCHEMA = 1
+SHARDED_INDEX_SCHEMA = 2
 DEFAULT_BUCKET = "sol-pool"
 BUCKET_ENV = "HA_ARTIFACT_BUCKET"
 #: Supabase's resumable-upload chunk: every PATCH but the last carries
 #: exactly this many bytes.
 TUS_CHUNK = 6 * 1024 * 1024
+#: Supabase Storage rejects an object above its deployment-wide size limit
+#: (a 677 MiB Gallery artifact and a 1.2 GiB SOL artifact both answered 413).
+#: A logical release archive therefore becomes ordered ``.part-NNN`` objects
+#: above this bound.  The bound is transport only: installation still sees one
+#: tar.gz with one end-to-end digest.
+OBJECT_MAX_BYTES = 256 * 1024 * 1024
+OBJECT_MAX_BYTES_ENV = "HA_ARTIFACT_OBJECT_MAX_BYTES"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def bucket() -> str:
@@ -83,6 +94,22 @@ def download(url: str, key: str, destination: Path, timeout: float) -> None:
         shutil.copyfileobj(response, out, length=1024 * 1024)
 
 
+def download_part(url: str, key: str, destination: Path, expected: str,
+                  timeout: float) -> None:
+    """Append one verified transport part to ``destination``."""
+    result = hashlib.sha256()
+    with request(url, key, timeout) as response, destination.open("ab") as out:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            result.update(chunk)
+            out.write(chunk)
+    actual = result.hexdigest()
+    if actual != expected:
+        raise ValueError(f"artifact part digest mismatch: {actual} != {expected}")
+
+
 def digest(path: Path) -> str:
     result = hashlib.sha256()
     with path.open("rb") as source:
@@ -99,6 +126,60 @@ def valid_artifact_path(path: object) -> bool:
         and ".." not in Path(path).parts
         and path.endswith(".tar.gz")
     )
+
+
+@dataclass(frozen=True)
+class ArtifactPart:
+    """One ordered byte range of a logical archive, small enough for Storage."""
+
+    path: str
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True)
+class SelectedArtifact:
+    """The immutable logical archive an engine's index names.
+
+    ``path`` and ``sha256`` always name the whole tar.gz.  ``parts`` is empty
+    when that archive is one Storage object; otherwise the parts concatenate,
+    in order, to exactly that archive.
+    """
+
+    path: str
+    sha256: str
+    parts: tuple[ArtifactPart, ...] = ()
+
+
+def _valid_sha256(value: object) -> bool:
+    return isinstance(value, str) and bool(_SHA256.fullmatch(value))
+
+
+def _parts_of(specification: object, artifact: str,
+              size: object = None) -> tuple[ArtifactPart, ...]:
+    """Validate an index's transport parts, or ``()`` for a single object."""
+    if specification is None:
+        return ()
+    if not isinstance(specification, list) or not specification:
+        raise ValueError("release artifact index has invalid transport parts")
+    parts: list[ArtifactPart] = []
+    for index, part in enumerate(specification):
+        if not isinstance(part, dict):
+            raise ValueError("release artifact transport part is not an object")
+        path, digest, part_size = (part.get("path"), part.get("sha256"),
+                                   part.get("size"))
+        expected = f"{artifact}.part-{index:03d}"
+        if (path != expected or not _valid_sha256(digest)
+                or not isinstance(part_size, int)
+                or isinstance(part_size, bool) or part_size <= 0):
+            raise ValueError(
+                "release artifact index has an invalid transport part")
+        parts.append(ArtifactPart(path, digest, part_size))
+    if size is not None and (not isinstance(size, int)
+                             or isinstance(size, bool) or size <= 0
+                             or size != sum(part.size for part in parts)):
+        raise ValueError("release artifact part sizes do not name the archive")
+    return tuple(parts)
 
 
 def read_object(url: str, key: str, timeout: float,
@@ -125,11 +206,12 @@ def read_object(url: str, key: str, timeout: float,
 def artifact_to_pull(configured: str, index_path: str, expected_engine: str,
                      base: str, key: str, bucket: str, timeout: float,
                      request: Callable[..., Any]
-                     ) -> Optional[tuple[str, str]]:
-    """``(path, sha256)`` of the archive to install, ``None`` when absent.
+                     ) -> Optional[SelectedArtifact]:
+    """The logical archive to install, ``None`` when absent.
 
     ``configured`` pins an archive path (its digest is the ``.sha256``
-    sibling); empty reads this engine version's index.
+    sibling, and its optional ``.parts.json`` names transport parts); empty
+    reads this engine version's index.
     """
     if not configured:
         return selected_artifact(index_path, expected_engine, base, key,
@@ -138,19 +220,35 @@ def artifact_to_pull(configured: str, index_path: str, expected_engine: str,
                          key, timeout, request)
     if digest is None:
         return None
-    return configured, digest.decode().strip().split()[0]
+    sha = digest.decode().strip().split()[0]
+    if not _valid_sha256(sha):
+        raise ValueError(f"pinned artifact {configured} has an invalid digest")
+    raw = read_object(
+        f"{base}/storage/v1/object/{bucket}/{configured}.parts.json", key,
+        timeout, request)
+    if raw is None:
+        return SelectedArtifact(configured, sha)
+    document = json.loads(raw)
+    if (document.get("schema") != 1
+            or document.get("artifact") != configured
+            or document.get("sha256") != sha):
+        raise ValueError(f"pinned artifact {configured} has invalid part metadata")
+    return SelectedArtifact(
+        configured, sha, _parts_of(document.get("parts"), configured,
+                                   document.get("size")))
 
 
 def selected_artifact(index_path: str, expected_engine: str, base: str,
                       key: str, bucket: str, timeout: float,
                       request: Callable[..., Any]
-                      ) -> Optional[tuple[str, str]]:
+                     ) -> Optional[SelectedArtifact]:
     raw = read_object(f"{base}/storage/v1/object/{bucket}/{index_path}", key,
                       timeout, request)
     if raw is None:
         return None
     index = json.loads(raw)
-    if index.get("schema") != INDEX_SCHEMA:
+    schema = index.get("schema")
+    if schema not in (INDEX_SCHEMA, SHARDED_INDEX_SCHEMA):
         raise ValueError("release artifact index has an unknown schema")
     if index.get("engine_version") != expected_engine:
         raise ValueError("release artifact index names another engine version")
@@ -159,9 +257,13 @@ def selected_artifact(index_path: str, expected_engine: str, base: str,
         raise ValueError("release artifact index has no artifacts")
     selected = artifacts[0]
     path, digest = selected.get("path"), selected.get("sha256")
-    if not valid_artifact_path(path) or not isinstance(digest, str):
+    if not valid_artifact_path(path) or not _valid_sha256(digest):
         raise ValueError("release artifact index has an invalid artifact")
-    return path, digest
+    parts = _parts_of(selected.get("parts"), path, selected.get("size"))
+    if schema == INDEX_SCHEMA and parts:
+        raise ValueError(
+            "a schema-1 release artifact cannot name transport parts")
+    return SelectedArtifact(path, digest, parts)
 
 
 def fetch_verified(label: str, prefix: str, pin_env: str, destination: Path,
@@ -192,7 +294,7 @@ def fetch_verified(label: str, prefix: str, pin_env: str, destination: Path,
               f"({prefix}/{engine}/index.json); this layer starts cold",
               file=sys.stderr, flush=True)
         return 0
-    artifact, expected = selected
+    artifact, expected = selected.path, selected.sha256
     if installed(artifact, expected):
         print(f"{label} artifact: {destination} already has {artifact}",
               flush=True)
@@ -201,8 +303,16 @@ def fetch_verified(label: str, prefix: str, pin_env: str, destination: Path,
     archive = destination.parent / f".{destination.name}.{os.getpid()}.tar.gz"
     try:
         print(f"{label} artifact: downloading {artifact}", flush=True)
-        download(f"{base}/storage/v1/object/{bucket()}/{artifact}", key,
-                 archive, timeout)
+        if selected.parts:
+            for index, part in enumerate(selected.parts, 1):
+                print(f"{label} artifact: part {index}/{len(selected.parts)} "
+                      f"({part.size} bytes)", flush=True)
+                download_part(
+                    f"{base}/storage/v1/object/{bucket()}/{part.path}", key,
+                    archive, part.sha256, timeout)
+        else:
+            download(f"{base}/storage/v1/object/{bucket()}/{artifact}", key,
+                     archive, timeout)
         actual = digest(archive)
         if actual != expected:
             raise ValueError(
@@ -254,13 +364,11 @@ def _open(req: urllib.request.Request, timeout: float):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
-def upload(base: str, key: str, bucket: str, path: str, data: bytes,
-           content_type: str, *, chunk: Optional[int] = None,
-           retries: int = 30, wait: float = 5.0) -> None:
-    """Store ``data`` at ``bucket/path`` (upsert) by a resumable (TUS)
-    upload, whatever its size: ``chunk`` (`TUS_CHUNK`) bytes per PATCH; a
-    failed PATCH is resent from the offset the server reports, up to
-    ``retries`` failures in a row."""
+def _upload_source(base: str, key: str, bucket: str, path: str, source: Any,
+                   size: int, content_type: str, *, start: int = 0,
+                   chunk: Optional[int] = None, retries: int = 30,
+                   wait: float = 5.0) -> None:
+    """Store ``source[start:start + size]`` by a resumable (TUS) upload."""
     chunk = TUS_CHUNK if chunk is None else chunk
     tus = {"Authorization": f"Bearer {key}", "apikey": key,
            "x-upsert": "true", "Tus-Resumable": "1.0.0"}
@@ -273,23 +381,24 @@ def upload(base: str, key: str, bucket: str, path: str, data: bytes,
         "contentType": content_type, "cacheControl": "3600"}.items())
     create = urllib.request.Request(
         f"{base}/storage/v1/upload/resumable", data=b"", method="POST",
-        headers={**tus, "Upload-Length": str(len(data)),
+        headers={**tus, "Upload-Length": str(size),
                  "Upload-Metadata": metadata, "Content-Length": "0"})
     with _open(create, 120) as response:
         location = response.headers["Location"]
     if location.startswith("/"):
         location = base + location
     offset, failures = 0, 0
-    while offset < len(data):
+    while offset < size:
+        source.seek(start + offset)
         patch = urllib.request.Request(
-            location, data=data[offset:offset + chunk], method="PATCH",
+            location, data=source.read(chunk), method="PATCH",
             headers={**tus, "Upload-Offset": str(offset),
                      "Content-Type": "application/offset+octet-stream"})
         try:
             with _open(patch, 600) as response:
                 offset = int(response.headers["Upload-Offset"])
             failures = 0
-            print(f"uploaded {offset}/{len(data)} bytes of {path}",
+            print(f"uploaded {offset}/{size} bytes of {path}",
                   file=sys.stderr, flush=True)
         except (OSError, urllib.error.URLError) as error:
             failures += 1
@@ -309,15 +418,69 @@ def upload(base: str, key: str, bucket: str, path: str, data: bytes,
                 failures += 1
                 if failures > retries:
                     raise
-    if offset != len(data):
+    if offset != size:
         raise RuntimeError(
-            f"upload of {path} ended at {offset} of {len(data)} bytes")
+            f"upload of {path} ended at {offset} of {size} bytes")
+
+
+def upload(base: str, key: str, bucket: str, path: str, data: bytes,
+           content_type: str, *, chunk: Optional[int] = None,
+           retries: int = 30, wait: float = 5.0) -> None:
+    """Store ``data`` at ``bucket/path`` (upsert) by a resumable (TUS)
+    upload, whatever its size: ``chunk`` (`TUS_CHUNK`) bytes per PATCH; a
+    failed PATCH is resent from the offset the server reports, up to
+    ``retries`` failures in a row."""
+    _upload_source(base, key, bucket, path, io.BytesIO(data), len(data),
+                   content_type, chunk=chunk, retries=retries, wait=wait)
+
+
+def upload_file_part(base: str, key: str, bucket: str, path: str,
+                     archive: Path, offset: int, size: int) -> None:
+    """Upload one byte range of ``archive`` without holding it all in RAM."""
+    with archive.open("rb") as source:
+        _upload_source(base, key, bucket, path, source, size,
+                       "application/octet-stream", start=offset)
+
+
+def object_max_bytes() -> int:
+    """The largest Storage object this publisher will attempt."""
+    raw = os.environ.get(OBJECT_MAX_BYTES_ENV, "").strip()
+    value = int(raw) if raw else OBJECT_MAX_BYTES
+    if value <= 0:
+        raise ValueError(f"{OBJECT_MAX_BYTES_ENV} must be positive")
+    return value
+
+
+def _plan_parts(archive: Path, artifact: str,
+                maximum: int) -> tuple[ArtifactPart, ...]:
+    """Digest fixed-size byte ranges without loading an archive into RAM."""
+    size = archive.stat().st_size
+    parts: list[ArtifactPart] = []
+    with archive.open("rb") as source:
+        for index, offset in enumerate(range(0, size, maximum)):
+            result = hashlib.sha256()
+            remaining = min(maximum, size - offset)
+            while remaining:
+                data = source.read(min(1024 * 1024, remaining))
+                if not data:
+                    raise ValueError(f"release artifact {archive} shrank while reading")
+                result.update(data)
+                remaining -= len(data)
+            parts.append(ArtifactPart(
+                f"{artifact}.part-{index:03d}", result.hexdigest(),
+                min(maximum, size - offset)))
+    return tuple(parts)
 
 
 def publish(prefix: str, build: Callable[[Path, Path], int], root: Path,
             count_field: str) -> str:
-    """Build ``root``'s archive, upload it, its ``.sha256`` and then this
-    engine version's index naming it; the archive's storage path."""
+    """Build, upload and index one logical artifact; its logical path.
+
+    Storage's per-object limit is a transport fact, so an archive above
+    ``object_max_bytes()`` uploads as ordered byte parts.  The index moves
+    last and names the logical tar.gz digest plus every part; installation is
+    unchanged and still verifies one end-to-end digest.
+    """
     from backend.fingerprint import cache_engine_version
     from backend.supabase_env import configured, service_role
     if not configured():
@@ -331,17 +494,40 @@ def publish(prefix: str, build: Callable[[Path, Path], int], root: Path,
         count = build(root, archive)
         sha = digest(archive)
         path = f"{prefix}/{engine}/{sha}.tar.gz"
-        print(f"{path}: {archive.stat().st_size} bytes, {count} "
-              f"{count_field}", file=sys.stderr, flush=True)
-        # The archive before what names it: a reader that finds the digest
-        # or the index finds the archive too.
-        upload(base, key, target, path, archive.read_bytes(),
-               "application/octet-stream")
+        size = archive.stat().st_size
+        parts = (_plan_parts(archive, path, object_max_bytes())
+                 if size > object_max_bytes() else ())
+        print(f"{path}: {size} bytes, {count} {count_field}, "
+              f"{len(parts) + 1} object(s)", file=sys.stderr, flush=True)
+        # The bytes and their digests move before anything that names them:
+        # a reader that finds the index also finds every object it names.
+        if parts:
+            uploaded = 0
+            for part in parts:
+                upload_file_part(base, key, target, part.path, archive,
+                                 uploaded, part.size)
+                uploaded += part.size
+            if uploaded != size:
+                raise ValueError(
+                    "release artifact part plan did not cover the archive")
+        else:
+            upload_file_part(base, key, target, path, archive, 0, size)
         upload(base, key, target, f"{path}.sha256", f"{sha}\n".encode(),
                "text/plain")
-        index = {"schema": INDEX_SCHEMA, "engine_version": engine,
-                 "artifacts": [{"path": path, "sha256": sha,
-                                count_field: count}]}
+        if parts:
+            upload(base, key, target, f"{path}.parts.json", (
+                json.dumps({"schema": 1, "artifact": path, "sha256": sha,
+                            "size": size,
+                            "parts": [asdict(part) for part in parts]},
+                           sort_keys=True)
+                + "\n").encode(), "application/json")
+        entry: dict[str, Any] = {"path": path, "sha256": sha,
+                                 count_field: count}
+        if parts:
+            entry.update(size=size,
+                         parts=[asdict(part) for part in parts])
+        index = {"schema": SHARDED_INDEX_SCHEMA if parts else INDEX_SCHEMA,
+                 "engine_version": engine, "artifacts": [entry]}
         upload(base, key, target, f"{prefix}/{engine}/index.json",
                json.dumps(index, sort_keys=True).encode() + b"\n",
                "application/json")
