@@ -160,7 +160,12 @@ jobs:
         run: |
           skip_warm=0
           [ "$SKIP_BUILD_WARM" = true ] && skip_warm=1
+          # The entrypoint downloads and verifies the release artifacts before
+          # it binds port 8000.  A cold 1.9 GB bootstrap can exceed flyctl's
+          # default five-minute health wait; the post-deploy content smoke
+          # below remains the actual release gate.
           flyctl deploy --remote-only --strategy rolling \
+            --wait-timeout 30m \
             --build-arg HA_GIT_SHA=${{ github.sha }} \
             --build-arg HA_SKIP_WARM=$skip_warm
 
