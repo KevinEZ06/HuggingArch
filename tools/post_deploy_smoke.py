@@ -374,8 +374,11 @@ def main(argv: Optional[list] = None) -> int:
         return _summary(rep)
     lake_serving = check_lake(rep, wait_for_lake(c, a.gallery_wait))
     gpus = shared_decode_gpus(c)
-    run_estimate(rep, c, gpus)
+    # The landing frontier is the product's first request and the warmest
+    # cache after a restart.  Waiting for it also lets the estimate pool leave
+    # its boot-time still_computing state before the estimate probe runs.
     run_gallery(rep, c, a.gallery_wait, lake_serving=lake_serving, lake_gpus=gpus)
+    run_estimate(rep, c, gpus)
     _, health = c.call("/health", timeout=60)
     check_health(rep, health)
     return _summary(rep)
