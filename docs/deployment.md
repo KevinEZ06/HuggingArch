@@ -1,12 +1,13 @@
 # Deployment — Fly.io + GitHub Actions + custom domain
 
-This walks you through a one-time setup, after which a release ships to
-`www.huggingarch.com` with one manual workflow run.
+This walks through the platform's setup. A normal release uses the one
+producer-to-production entry point in [Standard release](#standard-release).
 
 ## Architecture
 
 ```
-GitHub Actions → "deploy" workflow (run manually: workflow_dispatch)
+GitHub Actions → "tests" and "deploy" workflows on every `main` push
+  ├─ tests job      ← the default suite
   ├─ smoke job      ← this commit's `tests` run passed (waits for it), then
   │                    ruff + a few-minute smoke subset (web build, app boot,
   │                    core endpoints); the full suite is not run twice
@@ -25,9 +26,43 @@ Fly machine in iad region
 www.huggingarch.com
 ```
 
-Automatic deploy on every push to `main` is switched off for now; to turn it
-back on, restore `push: branches: [main]` under `on:` in
-`.github/workflows/deploy.yml`.
+## Standard release
+
+The release machine is the warm workstation (the 112-core box, not GitHub's
+4-core runner). From a clean checkout with `.env` beside it, one command does
+the whole form:
+
+```bash
+uv run python scripts/release.py
+```
+
+It is deliberately a program, not a checklist:
+
+1. reads `HA_CODE_TRACE` from `fly.toml`, the single source every producer
+   shares, and sets it before warm, publish and verification import backend;
+2. runs `backend.warm_caches`;
+3. publishes the SOL pool, Gallery cache and Scaling cache artifacts;
+4. verifies that all three engine-version indexes are readable for that same
+   trace mode;
+5. refuses an unclean or diverged checkout;
+6. pushes `HEAD` to `main`;
+7. waits for the repository's `tests -> deploy` workflow, whose post-deploy
+   content smoke is the release verdict.
+
+Stages are available for diagnosis, but they are parts of this one form:
+
+```bash
+uv run python scripts/release.py prepare --workers 12
+uv run python scripts/release.py verify
+uv run python scripts/release.py promote
+uv run python scripts/release.py smoke
+```
+
+Do not warm, publish or deploy with an `HA_CODE_TRACE` override that differs
+from `fly.toml`: a functions-mode deployment reads an index version derived
+from data and code traces, while a global-mode deployment reads the engine
+hash. Both are valid, but mixing them publishes an index the machine will
+never read and starts the site cold.
 
 The Fly app reads runtime config from `fly.toml` + secrets injected
 via `flyctl secrets set`. Deploys are zero-downtime rolling deploys. Schema
@@ -80,7 +115,7 @@ once per process that reads walks.
 |---|---|---|
 | `test.yml` | every push to `main`, every PR | A diff that only adds model YAML / snapshots / drafts runs `scripts/ci_spec_gate.py` (validate the changed snapshots); anything else runs ruff, pytest and the core/service boundary check. Both run `tools.corpus_admit verify` against the corpus pins. |
 | `regression.yml` | manual | The `regression` tests the default runs exclude (`-m regression`, up to 240 min): the per-model and minutes-long tests, and every parametrised test's non-first cases. |
-| `deploy.yml` | manual | Re-runs the suite, then deploys. |
+| `deploy.yml` | `main` push | Re-runs a release smoke subset, deploys, then runs the content smoke. |
 | `update-transformers.yml` | weekly + manual | Opens a PR bumping `transformers`. |
 
 ## One-time setup
@@ -323,4 +358,5 @@ These are intentionally NOT automated:
 - **Bootstrapping first admin** — run `scripts/bootstrap_admin.py` once
   after the first user signs up (via SSH or local with prod env)
 
-Anything else (code, config, dependencies, CI) is git → push → run deploy.
+Anything else (code, config, dependencies, CI) is one standard release
+command: `uv run python scripts/release.py`.
