@@ -38,7 +38,9 @@ on:
 
 # Don't ship two releases in parallel from rapid back-to-back pushes.
 concurrency:
-  group: deploy-prod
+  # An emergency restore must not queue behind a normal run that is waiting
+  # for the full suite; it still uses the smoke subset and post-deploy checks.
+  group: ${{ contains(github.event.head_commit.message, '[emergency-deploy]') && format('deploy-emergency-{0}', github.sha) || 'deploy-prod' }}
   cancel-in-progress: false
 
 jobs:
@@ -60,7 +62,7 @@ jobs:
       # passed. A push's run registers moments after this workflow starts,
       # so a run not found yet is waited for, not treated as absent.
       - name: The tests workflow passed on this commit
-        if: ${{ inputs.skip_tests != true }}
+        if: ${{ inputs.skip_tests != true && !contains(github.event.head_commit.message, '[emergency-deploy]') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
