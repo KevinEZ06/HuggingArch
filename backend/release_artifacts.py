@@ -224,17 +224,18 @@ def read_object(url: str, key: str, timeout: float,
     body (``"code":"NoSuchKey"``), not with 404; both mean absent. Any other
     failure raises.
     """
-    try:
-        with request(url, key, timeout) as response:
-            return response.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
-        if exc.code == 400:
-            body = exc.read().decode(errors="replace")
-            if "NoSuchKey" in body or "Object not found" in body:
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            with request(url, key, timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
                 return None
-        raise
+            if exc.code == 400:
+                body = exc.read().decode(errors="replace")
+                if "NoSuchKey" in body or "Object not found" in body:
+                    return None
+            _reraise_unless_download_retry(exc, attempt)
 
 
 def artifact_to_pull(configured: str, index_path: str, expected_engine: str,

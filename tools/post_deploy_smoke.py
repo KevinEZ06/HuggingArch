@@ -36,6 +36,7 @@ browse. Standard library only (runs on a bare CI runner); urllib honours
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import ssl
 import sys
@@ -46,7 +47,7 @@ import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 # How many (model, gpu, batch) reproductions to try before giving up, and the
 # revisit budget the Gallery promises for a cached GPU view.
@@ -228,18 +229,27 @@ class Client:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(
             self.base + path, data=data, method="POST" if data else "GET",
-            headers={"Content-Type": "application/json", "Accept": "application/json"})
+            headers={"Content-Type": "application/json",
+                     "Accept": "application/json",
+                     "Accept-Encoding": "gzip"})
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as r:
-                return r.status, json.load(r)
+                return r.status, _decode_json(r)
         except urllib.error.HTTPError as e:
             try:
-                return e.code, json.load(e)
+                return e.code, _decode_json(e)
             except ValueError:
                 return e.code, None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
             print(f"  {path}: {e}", flush=True)
             return None, None
+
+
+def _decode_json(response: Any) -> dict:
+    payload = response.read()
+    if (response.headers.get("Content-Encoding") or "").lower() == "gzip":
+        payload = gzip.decompress(payload)
+    return json.loads(payload)
 
 
 def wait_for_version(c: Client, expect: str, wait_s: float) -> bool:

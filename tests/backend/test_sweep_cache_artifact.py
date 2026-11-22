@@ -26,6 +26,7 @@ class _Storage(BaseHTTPRequestHandler):
     uploads: ClassVar[dict[str, dict]] = {}
     fail_next_patch = 0
     fail_next_get = 0
+    fail_next_index_get = 0
     patches = 0
 
     def log_message(self, *args):
@@ -48,6 +49,10 @@ class _Storage(BaseHTTPRequestHandler):
         name = self.path[len(prefix):]
         if not self.path.startswith(prefix) or name not in self.objects:
             self._reply(400, b'{"code":"NoSuchKey"}')
+            return
+        if type(self).fail_next_index_get and self.path.endswith("/index.json"):
+            type(self).fail_next_index_get -= 1
+            self._reply(500, b"transient")
             return
         if type(self).fail_next_get and ".part-" in self.path:
             type(self).fail_next_get -= 1
@@ -95,7 +100,9 @@ class _Storage(BaseHTTPRequestHandler):
 @pytest.fixture
 def storage(monkeypatch):
     _Storage.objects, _Storage.uploads = {}, {}
-    _Storage.fail_next_patch, _Storage.fail_next_get, _Storage.patches = 0, 0, 0
+    _Storage.fail_next_patch = 0
+    _Storage.fail_next_get, _Storage.fail_next_index_get = 0, 0
+    _Storage.patches = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Storage)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY",
@@ -204,6 +211,19 @@ def test_transient_part_downloads_are_retried(
     storage.fail_next_get = 2
 
     root = _fresh_machine(tmp_path, monkeypatch, "transient-download")
+    assert SWEEP_CACHE.pull(timeout=30) == 0
+    reader = KeyedCache("sweep", DiskBackend(root))
+    assert all(reader.get(key) is not None for key in keys)
+
+
+def test_a_transient_index_download_is_retried(
+        tmp_path, monkeypatch, storage):
+    source = tmp_path / "warm"
+    keys = _warm(source, n=3)
+    SWEEP_CACHE.publish(source)
+    storage.fail_next_index_get = 1
+
+    root = _fresh_machine(tmp_path, monkeypatch, "transient-index")
     assert SWEEP_CACHE.pull(timeout=30) == 0
     reader = KeyedCache("sweep", DiskBackend(root))
     assert all(reader.get(key) is not None for key in keys)
