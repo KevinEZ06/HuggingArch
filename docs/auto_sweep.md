@@ -922,7 +922,7 @@ upload for every object, through the environment's proxy only when one is
 configured.
 
 Storage's per-object size limit is a transport concern, not a new artifact
-shape. An archive above `HA_ARTIFACT_OBJECT_MAX_BYTES` (default 128 MiB)
+shape. An archive above `HA_ARTIFACT_OBJECT_MAX_BYTES` (default 96 MiB)
 publishes as ordered `.part-NNN` objects. The index still names one logical
 tar.gz and one end-to-end SHA-256; startup concatenates the parts, verifies
 that whole digest, and only then installs the archive. Smaller artifacts

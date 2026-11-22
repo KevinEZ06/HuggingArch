@@ -61,11 +61,11 @@ BUCKET_ENV = "HA_ARTIFACT_BUCKET"
 #: exactly this many bytes.
 TUS_CHUNK = 6 * 1024 * 1024
 #: Supabase Storage rejects an object above its deployment-wide size limit
-#: (a 677 MiB Gallery artifact and a 1.2 GiB SOL artifact both answered 413).
+#: (observed between 96 and 128 MiB during publication).
 #: A logical release archive therefore becomes ordered ``.part-NNN`` objects
 #: above this bound.  The bound is transport only: installation still sees one
 #: tar.gz with one end-to-end digest.
-OBJECT_MAX_BYTES = 128 * 1024 * 1024
+OBJECT_MAX_BYTES = 96 * 1024 * 1024
 OBJECT_MAX_BYTES_ENV = "HA_ARTIFACT_OBJECT_MAX_BYTES"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -399,6 +399,14 @@ def _upload_source(base: str, key: str, bucket: str, path: str, source: Any,
                 offset = int(response.headers["Upload-Offset"])
             failures = 0
             print(f"uploaded {offset}/{size} bytes of {path}",
+                  file=sys.stderr, flush=True)
+        except urllib.error.HTTPError as error:
+            if 400 <= error.code < 500 and error.code not in (408, 429):
+                raise
+            failures += 1
+            if failures > retries:
+                raise
+            print(f"upload chunk failed ({error!r:.200}); retry {failures}",
                   file=sys.stderr, flush=True)
         except (OSError, urllib.error.URLError) as error:
             failures += 1
