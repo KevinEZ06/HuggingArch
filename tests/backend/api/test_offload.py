@@ -8,6 +8,7 @@ work already running.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import pickle
 import threading
@@ -438,6 +439,38 @@ def test_a_maps_cells_report_their_progress(process_pool, monkeypatch):
     finally:
         app.router.routes[:] = [r for r in app.router.routes
                                 if getattr(r, "path", "") != "/__test/cells"]
+
+
+def test_a_long_tail_cell_does_not_stop_the_next_cell(monkeypatch):
+    """A plan submits every cell before collecting any result.
+
+    This is the cell level `ParallelSweepPlan` reaches through
+    `map_off_loop`: one long-tail cell must not stop later cells from taking
+    freed slots.  (The warm's former POST-level loop had that defect; the
+    plan's cell map must not grow one.)
+    """
+    async def scenario():
+        second_started = asyncio.Event()
+        slots = offload.PrioritySlots(2)
+
+        async def fake_run_off_loop(_fn, item):
+            if item != "slow":
+                second_started.set()
+                return item
+            try:
+                await asyncio.wait_for(second_started.wait(), timeout=0.5)
+            except TimeoutError:
+                raise AssertionError(
+                    "the next cell waited for the long tail") from None
+            return item
+
+        monkeypatch.setattr(offload, "_off_process", True)
+        monkeypatch.setattr(offload, "run_off_loop", fake_run_off_loop)
+        monkeypatch.setattr(offload, "_cell_slots", lambda: slots)
+        return await offload.map_off_loop(
+            lambda item: item, ["slow", "next", "last"])
+
+    assert asyncio.run(scenario()) == ["slow", "next", "last"]
 
 
 def test_a_maps_cells_report_nothing_by_default(monkeypatch):

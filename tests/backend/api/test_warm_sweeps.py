@@ -239,6 +239,38 @@ def test_warm_then_serve_is_a_hit_not_a_recompute(isolated):
     assert calls["sweep"] == 1
 
 
+def test_a_long_tail_post_does_not_stop_the_next_post(isolated, monkeypatch):
+    """The pool's next work is submitted before the current POST completes.
+
+    A POST is a submitter whose cells occupy the pool, not one indivisible pool
+    job.  The old outer loop awaited it before submitting the next POST, so one
+    long-tail cell left every other worker idle.
+    """
+    _inf, warm, _calls = isolated
+    second_started = asyncio.Event()
+
+    async def fake_parallel(_req):
+        try:
+            await asyncio.wait_for(second_started.wait(), timeout=1)
+        except TimeoutError:
+            raise AssertionError(
+                "the second POST waited for the long tail") from None
+        return {"results": ["slow"]}
+
+    async def fake_batch(_req):
+        second_started.set()
+        return {"results_by_batch": ["next"]}
+
+    monkeypatch.setattr(warm, "compute_parallel_sweep_cached", fake_parallel)
+    monkeypatch.setattr(warm, "compute_estimate_sweep_cached", fake_batch)
+    monkeypatch.setattr(warm, "scaling_jobs", lambda *_args, **_kwargs: [
+        ("parallel", "slow", object()),
+        ("batch", "next", object()),
+    ])
+
+    assert asyncio.run(warm.warm_sweeps(models=[MODEL])) == 2
+
+
 def test_pool_only_warm_bakes_laws_without_response_documents(isolated, monkeypatch):
     """An image build keeps canonical SOL laws, not request-shaped answers."""
     _inf, warm, calls = isolated

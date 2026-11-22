@@ -40,6 +40,7 @@ import logging
 import os
 import pathlib
 import sys
+from typing import Any
 
 from backend.fingerprint import engine_version
 from backend.measure.cache import WRITE_BEHIND
@@ -230,18 +231,28 @@ async def ensureSharedWalks(models: list[str] | None,
         cards = class_cards(gpu, series)
         representatives[cards[0]] = cards[0]
     wanted = list(dict.fromkeys(_scaling_models(models)))
-    ok = 0
-    total = len(wanted) * len(representatives)
-    done = 0
-    for model in wanted:
-        for walkCard, askedGpu in representatives.items():
-            done += 1
-            label = f"{model} · {walkCard}"
-            print(f"[walk {done}/{total}] {label}", flush=True)
+    work = [(model, walkCard, askedGpu)
+            for model in wanted
+            for walkCard, askedGpu in representatives.items()]
+    total = len(work)
+    window = asyncio.Semaphore(max(1, pool.worker_count()))
+
+    async def run_walk(index: int, model: str, walk_card: str,
+                       asked_gpu: str) -> int:
+        label = f"{model} · {walk_card}"
+        async with window:
+            print(f"[walk {index}/{total}] {label}", flush=True)
             try:
-                ok += int(await keepSharedWalk(model, askedGpu))
+                return int(await keepSharedWalk(model, asked_gpu))
             except Exception as e:
                 print(f"  fail walk {label}: {e}", flush=True)
+                return 0
+
+    answers = await asyncio.gather(*[
+        asyncio.create_task(run_walk(index, *item))
+        for index, item in enumerate(work, 1)
+    ])
+    ok = sum(answers)
     print(f"canonical walks ensured {ok}/{total}", flush=True)
     return ok
 
@@ -251,6 +262,7 @@ async def warm_sweeps(
     gpus: list[str] | None = None,
     modes: list[str] | None = None,
     degrees: list[int] | None = None,
+    job_concurrency: int | None = None,
 ) -> int:
     """Fill the sweep cache (`_SWEEP`: memory→disk→Supabase) for every Scaling
     panel POST (parallel + Context × Batch + KV) through the SAME
@@ -274,17 +286,41 @@ async def warm_sweeps(
         f"({n_par} parallel + {n_batch} batch)",
         flush=True,
     )
-    ok = 0
-    for i, (kind, label, req) in enumerate(jobs, 1):
-        print(f"[{i}/{len(jobs)}] {kind} {label}", flush=True)
-        try:
-            if kind == "parallel":
-                await compute_parallel_sweep_cached(req)
-            else:
-                await compute_estimate_sweep_cached(req)
-            ok += 1
-        except Exception as e:  # isolate: one model's failure never aborts warm
-            print(f"  fail {kind} {label}: {e}", flush=True)
+    # A sweep POST is a submitter, not one pool job: its cells occupy the pool.
+    # Awaiting a POST before handing the pool the next leaves every worker idle
+    # as soon as that POST has one long-tail cell.  Keep a bounded window of
+    # POSTs in flight; their cells still share this process's one pool and its
+    # per-loop slot budget, so this adds work without adding workers.
+    window = asyncio.Semaphore(
+        max(1, job_concurrency or pool.worker_count()))
+    progress = asyncio.Lock()
+    state = {"done": 0, "ok": 0}
+
+    async def run_job(index: int, kind: str, label: str, req: Any) -> bool:
+        async with window:
+            print(f"[{index}/{len(jobs)}] {kind} {label}", flush=True)
+            try:
+                if kind == "parallel":
+                    await compute_parallel_sweep_cached(req)
+                else:
+                    await compute_estimate_sweep_cached(req)
+                succeeded = True
+            except Exception as e:  # isolate: one model never aborts warm
+                print(f"  fail {kind} {label}: {e}", flush=True)
+                succeeded = False
+        async with progress:
+            state["done"] += 1
+            state["ok"] += int(succeeded)
+            if (state["done"] % 10 == 0
+                    or state["done"] == len(jobs)):
+                print(f"progress {state['done']}/{len(jobs)}", flush=True)
+        return succeeded
+
+    await asyncio.gather(*[
+        asyncio.create_task(run_job(index, kind, label, req))
+        for index, (kind, label, req) in enumerate(jobs, 1)
+    ])
+    ok = state["ok"]
     print(f"warmed {ok}/{len(jobs)} sweeps", flush=True)
     return ok
 
