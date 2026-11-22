@@ -295,27 +295,42 @@ def run_estimate(rep: Report, c: Client, gpus: list) -> None:
                          f"&gpu={urllib.request.quote(gpu)}&page_size=200", timeout=120)
         rows.extend((page or {}).get("items") or [])
     groups = candidate_groups(rows)
-    rep.note(f"browse: {len(rows)} shared decode rows, {len(groups)} (model, gpu, parallel, B) groups")
-    tried = 0
-    for (model, gpu, parallel, b), keys in groups:
-        if tried >= MAX_ESTIMATE_TRIES:
-            break
-        tried += 1
-        request = {"model_id": model, "gpu_sku": gpu, "decode_batch_size": b}
-        if parallel_of(parallel):
-            request["parallel"] = parallel_of(parallel)
-        status, est = c.call("/inference/estimate", request)
-        label = f"estimate {model} @{gpu} {parallel or 'tp1'} B={b}"
-        if status != 200 or not est:
+    rep.note(f"browse: {len(rows)} shared decode rows, "
+             f"{len(groups)} (model, gpu, parallel, B) groups")
+    deadline = time.time() + 600
+    while True:
+        tried = 0
+        retry_after = 0.0
+        for (model, gpu, parallel, b), keys in groups:
+            if tried >= MAX_ESTIMATE_TRIES:
+                break
+            tried += 1
+            request = {"model_id": model, "gpu_sku": gpu, "decode_batch_size": b}
+            if parallel_of(parallel):
+                request["parallel"] = parallel_of(parallel)
+            status, est = c.call("/inference/estimate", request)
+            label = f"estimate {model} @{gpu} {parallel or 'tp1'} B={b}"
+            if status == 200 and est:
+                hits = lake_keys_in_estimate(keys, est)
+                if hits:
+                    check_estimate(rep, label, hits, est)
+                    return
+                rep.note(f"{label}: no per-op key matches the "
+                         f"{len(keys)} lake keys, next group")
+                continue
+            if status == 503 and (est or {}).get("reason") == "still_computing":
+                retry_after = max(retry_after,
+                                  float((est or {}).get("retry_after_s") or 0))
+                rep.note(f"{label}: still computing, will retry")
+                continue
             rep.note(f"{label}: {status}, trying the next group")
-            continue
-        hits = lake_keys_in_estimate(keys, est)
-        if not hits:
-            rep.note(f"{label}: no per-op key matches the {len(keys)} lake keys, next group")
-            continue
-        check_estimate(rep, label, hits, est)
-        return
-    rep.check(False, f"no estimate reproduced a shared measurement's key in {tried} tries")
+        if retry_after <= 0 or time.time() >= deadline:
+            break
+        delay = min(max(retry_after, 5.0), 30.0)
+        rep.note(f"estimate pool still computing; retrying in {delay:.0f}s")
+        time.sleep(delay)
+    rep.check(False, f"no estimate reproduced a shared measurement's key "
+                     f"in {MAX_ESTIMATE_TRIES} tries")
 
 
 #: The Gallery page's axes, as its bundle is built from them: the landing GPU.
