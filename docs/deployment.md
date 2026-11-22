@@ -87,7 +87,7 @@ runs the agents as an unprivileged `specagent` user. `HA_GIT_SHA` is passed in
 at deploy so the service can report which code it runs (the image has no
 `.git`).
 
-`fly.toml` sets the VM (`shared-cpu-1x`, 2 GB), a 3 GB volume
+`fly.toml` sets the VM (`shared-cpu-1x`, 2 GB), a 20 GB volume
 `huggingarch_cache` mounted at `/app/.cache`, rate limits (`ANALYZE_RPM`,
 `INFERENCE_RPM`), `SPEC_AGENT_MAX_CONCURRENT`, and the result-cache directories
 `HA_GALLERY_CACHE_DIR` / `HA_SWEEP_CACHE_DIR` with the code-trace bodies their

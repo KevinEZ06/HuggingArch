@@ -17,21 +17,28 @@ jobs:
         run: |
           set -euo pipefail
           flyctl machines list -a huggingarch
-          # A cold artifact bootstrap can take much longer than flyctl's
-          # health-check default.  Restart without waiting, then let the
-          # bootstrap finish; logs expose a deterministic failure instead of
-          # reporting success for a started-but-unhealthy machine.
-          flyctl machine restart 811d5e2c504e18 -a huggingarch \
-            --skip-health-checks
+          volume_json=$(flyctl volumes list -a huggingarch -o json)
+          echo "$volume_json"
+          volume_id=$(jq -r '.[0].id // .[0].ID' <<<"$volume_json")
+          volume_size=$(jq -r '.[0].size // .[0].size_gb // .[0].SizeGb' <<<"$volume_json" | tr -dc '0-9')
+          test -n "$volume_id"
+          if [ "${volume_size:-0}" -lt 20 ]; then
+            # The release bootstrap needs room for the archive, its expanded
+            # install and the lake already on this persistent volume.
+            flyctl volumes extend "$volume_id" --size 20 -a huggingarch
+          fi
+          # The failed deploy cleared its machine lease; start the already
+          # downloaded retry image without going through another rollout.
+          flyctl machine start 811d5e2c504e18 -a huggingarch
           flyctl logs -a huggingarch --machine 811d5e2c504e18 --no-tail || true
-          for _ in $(seq 1 180); do
+          for _ in $(seq 1 120); do
             code=$(curl -sS --max-time 5 -o /dev/null \
               -w '%{http_code}' https://www.huggingarch.com/health || true)
             if [ "$code" = 200 ]; then
               flyctl status -a huggingarch
               exit 0
             fi
-            sleep 10
+            sleep 15
           done
           flyctl logs -a huggingarch --machine 811d5e2c504e18 --no-tail || true
           flyctl status -a huggingarch

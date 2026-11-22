@@ -145,6 +145,7 @@ jobs:
     # Only this public repository owns the current Fly deploy token. The old
     # archive repository must never deploy again.
     if: github.repository == 'shenh10/HuggingArch'
+      && !contains(github.event.head_commit.message, '[storage-recovery]')
     steps:
       - uses: actions/checkout@v4
 
