@@ -17,16 +17,10 @@ jobs:
         run: |
           set -euo pipefail
           flyctl machines list -a huggingarch
-          volume_json=$(flyctl volumes list -a huggingarch -o json)
-          echo "$volume_json"
-          volume_id=$(jq -r '.[0].id // .[0].ID' <<<"$volume_json")
-          volume_size=$(jq -r '.[0].size // .[0].size_gb // .[0].SizeGb' <<<"$volume_json" | tr -dc '0-9')
-          test -n "$volume_id"
-          if [ "${volume_size:-0}" -lt 20 ]; then
-            # The release bootstrap needs room for the archive, its expanded
-            # install and the lake already on this persistent volume.
-            flyctl volumes extend "$volume_id" --size 20 -a huggingarch
-          fi
+          flyctl volumes list -a huggingarch
+          # The production app has one attached cache volume; extend it in
+          # place. The archive, expanded install and lake no longer fit in 3 GB.
+          flyctl volumes extend vol_vjyo0y3m3w628wpv --size 20 -a huggingarch
           # The failed deploy cleared its machine lease; start the already
           # downloaded retry image without going through another rollout.
           flyctl machine start 811d5e2c504e18 -a huggingarch
