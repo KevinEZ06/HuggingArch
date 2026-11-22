@@ -65,7 +65,7 @@ TUS_CHUNK = 6 * 1024 * 1024
 #: A logical release archive therefore becomes ordered ``.part-NNN`` objects
 #: above this bound.  The bound is transport only: installation still sees one
 #: tar.gz with one end-to-end digest.
-OBJECT_MAX_BYTES = 256 * 1024 * 1024
+OBJECT_MAX_BYTES = 128 * 1024 * 1024
 OBJECT_MAX_BYTES_ENV = "HA_ARTIFACT_OBJECT_MAX_BYTES"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
