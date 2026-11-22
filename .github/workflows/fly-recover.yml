@@ -17,11 +17,22 @@ jobs:
         run: |
           set -euo pipefail
           flyctl machines list -a huggingarch
-          # `machines start` is a no-op on a running machine; `machine
-          # restart` re-runs the entrypoint (a new release artifact under
-          # the running image's engine), and starts a stopped machine too.
+          # A cold artifact bootstrap can take much longer than flyctl's
+          # health-check default.  Restart without waiting, then let the
+          # bootstrap finish; logs expose a deterministic failure instead of
+          # reporting success for a started-but-unhealthy machine.
           flyctl machine restart 811d5e2c504e18 -a huggingarch \
-            || flyctl machines start 811d5e2c504e18 -a huggingarch \
-            || flyctl apps restart -a huggingarch
-          sleep 15
+            --skip-health-checks
+          flyctl logs -a huggingarch --machine 811d5e2c504e18 --no-tail || true
+          for _ in $(seq 1 180); do
+            code=$(curl -sS --max-time 5 -o /dev/null \
+              -w '%{http_code}' https://www.huggingarch.com/health || true)
+            if [ "$code" = 200 ]; then
+              flyctl status -a huggingarch
+              exit 0
+            fi
+            sleep 10
+          done
+          flyctl logs -a huggingarch --machine 811d5e2c504e18 --no-tail || true
           flyctl status -a huggingarch
+          exit 1

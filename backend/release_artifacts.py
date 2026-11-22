@@ -67,6 +67,7 @@ TUS_CHUNK = 6 * 1024 * 1024
 #: tar.gz with one end-to-end digest.
 OBJECT_MAX_BYTES = 96 * 1024 * 1024
 OBJECT_MAX_BYTES_ENV = "HA_ARTIFACT_OBJECT_MAX_BYTES"
+DOWNLOAD_ATTEMPTS = 5
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -90,24 +91,57 @@ def request(url: str, key: str, timeout: float):
 
 
 def download(url: str, key: str, destination: Path, timeout: float) -> None:
-    with request(url, key, timeout) as response, destination.open("wb") as out:
-        shutil.copyfileobj(response, out, length=1024 * 1024)
+    temporary = destination.with_name(f".{destination.name}.download.tmp")
+    try:
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            try:
+                with request(url, key, timeout) as response, temporary.open("wb") as out:
+                    shutil.copyfileobj(response, out, length=1024 * 1024)
+                os.replace(temporary, destination)
+                return
+            except Exception as error:
+                _reraise_unless_download_retry(error, attempt)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def download_part(url: str, key: str, destination: Path, expected: str,
                   timeout: float) -> None:
     """Append one verified transport part to ``destination``."""
-    result = hashlib.sha256()
-    with request(url, key, timeout) as response, destination.open("ab") as out:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            result.update(chunk)
-            out.write(chunk)
-    actual = result.hexdigest()
-    if actual != expected:
-        raise ValueError(f"artifact part digest mismatch: {actual} != {expected}")
+    temporary = destination.with_name(f".{destination.name}.part.tmp")
+    try:
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            try:
+                result = hashlib.sha256()
+                with request(url, key, timeout) as response, temporary.open("wb") as out:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        result.update(chunk)
+                        out.write(chunk)
+                actual = result.hexdigest()
+                if actual != expected:
+                    raise ValueError(
+                        f"artifact part digest mismatch: {actual} != {expected}")
+                with temporary.open("rb") as source, destination.open("ab") as out:
+                    shutil.copyfileobj(source, out, length=1024 * 1024)
+                return
+            except Exception as error:
+                _reraise_unless_download_retry(error, attempt)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _reraise_unless_download_retry(error: Exception, attempt: int) -> None:
+    """Retry transport failures, but fail closed on a permanent HTTP error."""
+    transient = not isinstance(error, urllib.error.HTTPError) or error.code >= 500
+    if attempt >= DOWNLOAD_ATTEMPTS or not transient:
+        raise error
+    delay = min(2 ** (attempt - 1), 10)
+    print(f"artifact download failed on attempt {attempt} ({error}); "
+          f"retrying in {delay}s", file=sys.stderr, flush=True)
+    time.sleep(delay)
 
 
 def digest(path: Path) -> str:

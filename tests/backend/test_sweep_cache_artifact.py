@@ -25,6 +25,7 @@ class _Storage(BaseHTTPRequestHandler):
     objects: ClassVar[dict[str, bytes]] = {}
     uploads: ClassVar[dict[str, dict]] = {}
     fail_next_patch = 0
+    fail_next_get = 0
     patches = 0
 
     def log_message(self, *args):
@@ -47,6 +48,10 @@ class _Storage(BaseHTTPRequestHandler):
         name = self.path[len(prefix):]
         if not self.path.startswith(prefix) or name not in self.objects:
             self._reply(400, b'{"code":"NoSuchKey"}')
+            return
+        if type(self).fail_next_get and ".part-" in self.path:
+            type(self).fail_next_get -= 1
+            self._reply(500, b"transient")
             return
         self._reply(200, self.objects[name])
 
@@ -90,7 +95,7 @@ class _Storage(BaseHTTPRequestHandler):
 @pytest.fixture
 def storage(monkeypatch):
     _Storage.objects, _Storage.uploads = {}, {}
-    _Storage.fail_next_patch, _Storage.patches = 0, 0
+    _Storage.fail_next_patch, _Storage.fail_next_get, _Storage.patches = 0, 0, 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Storage)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY",
@@ -188,6 +193,20 @@ def test_an_archive_above_the_object_limit_publishes_ordered_parts(
     assert all(reader.get(key) is not None for key in keys)
     marker = json.loads((root / ".bootstrap.json").read_text())
     assert marker["artifact"] == path and marker["sha256"] == entry["sha256"]
+
+
+def test_transient_part_downloads_are_retried(
+        tmp_path, monkeypatch, storage):
+    source = tmp_path / "warm"
+    keys = _warm(source, n=30)
+    monkeypatch.setenv("HA_ARTIFACT_OBJECT_MAX_BYTES", "4096")
+    SWEEP_CACHE.publish(source)
+    storage.fail_next_get = 2
+
+    root = _fresh_machine(tmp_path, monkeypatch, "transient-download")
+    assert SWEEP_CACHE.pull(timeout=30) == 0
+    reader = KeyedCache("sweep", DiskBackend(root))
+    assert all(reader.get(key) is not None for key in keys)
 
 
 def test_a_corrupt_part_fails_before_install(tmp_path, monkeypatch, storage):
