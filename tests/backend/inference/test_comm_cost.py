@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -13,10 +14,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.arch.layout.comm_volume import RouteFanout, ring_factor
 from backend.inference.comm_cost import (
-    COMM_OPS, Fabric, PlacementLevel, collective_latency,
-    collective_per_rank_bytes, collective_phases, members_per_node,
-    placement_levels, price_collective, routed_shares,
+    COMM_OPS, COMM_REACH_HOST, COMM_REACH_SCALEOUT, COMM_REACH_SCALEUP,
+    Fabric, PlacementLevel, collective_latency,
+    collective_per_rank_bytes, collective_phases, comm_reach,
+    members_per_node, placement_levels, price_collective, routed_shares,
 )
+from backend.inference.op_signatures import COMM_DOMAIN_AXIS
 
 
 class TestCollectiveFormulas(unittest.TestCase):
@@ -1066,9 +1069,370 @@ class TestCardFabricHasOneStatement(unittest.TestCase):
                 gs.peak_intra_bw_bytes_per_sec(gpu),
                 gs.peak_inter_bw_bytes_per_sec(gpu),
                 gs.intra_bw_label(gpu), gs.inter_bw_label(gpu),
-                latency)._replace(**topology(gpu))
+                latency,
+                scaleup_domain=gs.ranks_per_scaleup_domain(gpu),
+                )._replace(**topology(gpu))
             self.assertEqual(Fabric.of(gpu, latency), was, gpu.sku)
+
+
+class TheReachOfAGroup(unittest.TestCase):
+    """A collective's group spans one chassis, a scale-up domain, or more
+    than one — and a measurement of each must answer only for its own.
+
+    Before this, a sheet row meant one chassis and a group either fitted it
+    or did not. A supernode ends that: on an Atlas A3, 32 ranks leave the
+    16-die chassis and are still on the scale-up fabric, a domain away in
+    bandwidth from the RoCE the two-valued reading prices them at.
+    """
+
+    def test_a_group_inside_one_chassis_is_host(self):
+        for world in (2, 8, 16):
+            self.assertEqual(
+                comm_reach(world, base_stride=1, ranks_per_host=16),
+                COMM_REACH_HOST, world)
+
+    def test_without_a_wider_domain_leaving_the_chassis_is_scaleout(self):
+        """What the two-valued reading has always said, unchanged: a card
+        declaring no domain past its chassis has nothing in between."""
+        self.assertEqual(
+            comm_reach(32, base_stride=1, ranks_per_host=16),
+            COMM_REACH_SCALEOUT)
+
+    def test_a_declared_supernode_puts_a_tier_in_between(self):
+        def reach(n):
+            return comm_reach(n, base_stride=1, ranks_per_host=16,
+                              ranks_per_scaleup_domain=384)
+        self.assertEqual(reach(16), COMM_REACH_HOST)
+        self.assertEqual(reach(32), COMM_REACH_SCALEUP)
+        self.assertEqual(reach(384), COMM_REACH_SCALEUP)
+        self.assertEqual(reach(385), COMM_REACH_SCALEOUT)
+
+    def test_stride_spreads_a_small_group_past_its_chassis(self):
+        """An outer axis composed over an inner one is spaced out: four
+        ranks at stride 8 touch four chassis of 16, not one."""
+        self.assertEqual(
+            comm_reach(4, base_stride=8, ranks_per_host=16,
+                       ranks_per_scaleup_domain=384),
+            COMM_REACH_SCALEUP)
+
+    def test_the_price_and_the_key_divide_the_same_way(self):
+        """`collective_phases` and `comm_reach` must not disagree about
+        where a group sits: one says intra, the other says host, and they
+        are the same sentence. Both read `members_within`."""
+        for world, stride, g in ((8, 1, 16), (32, 1, 16), (4, 8, 16),
+                                 (16, 1, 8), (12, 1, 16), (2, 1, 16)):
+            phases = collective_phases("all_reduce", world, 1 << 20,
+                                       gpus_per_node=g, base_stride=stride)
+            priced_all_intra = bool(phases) and all(
+                p["fabric"] == "intra" for p in phases)
+            keyed_host = comm_reach(world, base_stride=stride,
+                                    ranks_per_host=g) == COMM_REACH_HOST
+            self.assertEqual(priced_all_intra, keyed_host,
+                             f"world={world} stride={stride} g={g}")
+
+
+class WhatACollectiveCellIsKeyedOn(unittest.TestCase):
+    """The reach belongs in the key, and belongs there by its ABSENCE for
+    the common case."""
+
+    HOST = '{"n_comm_elems":4194304,"n_comm_ranks":8,"n_comm_stride":1}'
+
+    @staticmethod
+    def _sig(name="all_reduce"):
+        import backend.inference.op_signatures_catalog  # noqa: F401
+        from backend.inference.op_signatures import get_signature
+        return get_signature(name)
+
+    def _keyed(self, reach, name="all_reduce"):
+        import json
+        return self._sig(name).project(json.dumps(
+            {**json.loads(self.HOST), COMM_DOMAIN_AXIS: int(reach)},
+            separators=(",", ":"), sort_keys=True))
+
+    def test_an_intra_host_row_keys_exactly_as_it_did(self):
+        """Every collective row measured so far is intra-host, so this is
+        the whole backward-compatibility claim: the axis costs them
+        nothing and no corpus row is rewritten to gain it."""
+        self.assertEqual(self._sig().project(self.HOST), self.HOST)
+
+    def test_the_same_payload_and_group_at_two_reaches_are_two_keys(self):
+        self.assertNotEqual(self._keyed(COMM_REACH_SCALEUP),
+                            self._sig().project(self.HOST))
+
+    def test_scaleup_and_scaleout_do_not_share_a_key_either(self):
+        """The middle tier is the point: a supernode measurement must not
+        answer for a group that left the supernode."""
+        self.assertNotEqual(self._keyed(COMM_REACH_SCALEUP),
+                            self._keyed(COMM_REACH_SCALEOUT))
+
+    def test_every_collective_signature_declares_the_axis(self):
+        """A signature that forgot it would go on sharing one key across
+        fabrics, which is the defect this axis exists to end."""
+        for name in ("all_reduce", "all_gather", "reduce_scatter",
+                     "all_to_all", "send_recv"):
+            self.assertIn(COMM_DOMAIN_AXIS, self._sig(name).variant_dims, name)
+
+    def test_the_axis_is_not_a_cell_dim(self):
+        """It identifies by presence. In `cell_dims` it would be REQUIRED,
+        and every existing row — none of which carries it — would stop
+        keying at all."""
+        for name in ("all_reduce", "send_recv"):
+            self.assertNotIn(COMM_DOMAIN_AXIS, self._sig(name).cell_dims, name)
+
+    def test_a_crossing_lookup_misses_a_corpus_of_host_rows(self):
+        """The property the axis exists for, asserted on the real lookup
+        and not on two strings being unequal.
+
+        An absent axis is the DEFAULT (host), never a wildcard matching
+        every reach. So a group that left the chassis must not be handed
+        an intra-host row just because that row's key omits the axis the
+        asking key carries — the difference between those two readings is
+        a cross-fabric collective priced on HCCS.
+
+        The corpus now holds rows of BOTH reaches, so this asks the
+        question at a reach nothing was measured at (`scaleout`) as well
+        as at one that was (`scaleup`): the first must miss every row, and
+        the second must not be answered by the chassis rows that share its
+        payload and world.
+        """
+        import csv
+        from backend.inference.op_calibration import (
+            CalibrationRegistry, BenchmarkKey, merge_validated_rows,
+            physical_time_for)
+        path = PROJECT_ROOT / "tests/golden/ascend_vllm_ascend.csv"
+        with open(path, newline="") as handle:
+            rows = [r for r in csv.DictReader(handle) if r["op"] in COMM_OPS]
+        registry = merge_validated_rows(
+            CalibrationRegistry(), [dict(r) for r in rows],
+            source="<test>", origin="shared")
+
+        import json
+
+        def timing(key):
+            return physical_time_for(
+                registry, key,
+                current_peak_tflops_at=lambda *_a, **_k: 248.4,
+                current_peak_bw_gbps=1600.0)
+
+        def reach_of(row):
+            return json.loads(row["shape_json"]).get(COMM_DOMAIN_AXIS)
+
+        host_rows = [r for r in rows if reach_of(r) is None]
+        host_keys = [BenchmarkKey.from_csv_row(r).to_physical()
+                     for r in host_rows]
+        self.assertTrue(host_keys, "no intra-host collective rows to ask about")
+
+        # The corpus answers for the reach each row was taken at ...
+        hit = [k for k in host_keys if timing(k) is not None]
+        self.assertTrue(hit, "no intra-host collective row answered at all, "
+                             "so a miss below would prove nothing")
+
+        # ... and a chassis row never answers for a group that left it.
+        # `scaleout` is asked too: nothing has been measured there, so
+        # every one of these must miss outright.
+        for reach in (COMM_REACH_SCALEUP, COMM_REACH_SCALEOUT):
+            for key in host_keys:
+                crossing = replace(key, shape_json=json.dumps(
+                    {**json.loads(key.shape_json), COMM_DOMAIN_AXIS: int(reach)},
+                    separators=(",", ":"), sort_keys=True))
+                self.assertEqual(
+                    registry.get_physical(crossing), [],
+                    f"reach {reach} found a row keyed for another reach")
+                self.assertIsNone(
+                    timing(crossing),
+                    f"reach {reach} was handed a measurement of another")
+
+    def test_the_measured_corpus_keys_each_row_at_its_own_reach(self):
+        """What the corpus says about where its rows were taken.
+
+        The chassis rows must key exactly as they did before the axis
+        existed -- they are the backward-compatibility claim, and not one
+        of them was re-measured to gain it. The rows taken across two
+        chassis of the supernode must carry `scaleup`, because a reader
+        that cannot tell them apart would answer a cross-fabric
+        deployment with a chassis measurement.
+        """
+        import csv
+        import json
+        from backend.inference.op_calibration import BenchmarkKey
+        path = PROJECT_ROOT / "tests/golden/ascend_vllm_ascend.csv"
+        with open(path, newline="") as handle:
+            rows = [r for r in csv.DictReader(handle) if r["op"] in COMM_OPS]
+        self.assertTrue(rows, "no collective rows to check")
+
+        chassis = crossing = 0
+        for row in rows:
+            stated = json.loads(row["shape_json"]).get(COMM_DOMAIN_AXIS)
+            keyed = BenchmarkKey.from_csv_row(row).to_physical().shape_json
+            if stated is None:
+                chassis += 1
+                self.assertNotIn(COMM_DOMAIN_AXIS, keyed, row["op"])
+            else:
+                crossing += 1
+                self.assertEqual(stated, COMM_REACH_SCALEUP, row["op"])
+                self.assertIn(f'"{COMM_DOMAIN_AXIS}":{COMM_REACH_SCALEUP}',
+                              keyed, row["op"])
+        self.assertTrue(chassis, "the chassis rows are the compatibility claim")
+        self.assertTrue(crossing, "no row records a group that crossed "
+                                  "machines, so nothing pins the axis on "
+                                  "real data")
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ASupernodeIsScaleUpAcrossMachines(unittest.TestCase):
+    """Both halves of the question, on the sheet row that answers it.
+
+    `gpus_per_node` is the CHASSIS and `ranks_per_scaleup_domain` is the
+    fast fabric's reach. They coincide on every card that has no
+    supernode, and on an Atlas A3 they do not: 16 against 768. Getting
+    that wrong is not a crash, it is 32 ranks priced on a 25 GB/s NIC
+    that carried none of their traffic.
+    """
+
+    def _ascend(self):
+        from backend.inference.gpu_specs import get_gpu
+        gpu = get_gpu("Ascend-910C-A3")
+        self.assertIsNotNone(gpu, "the Ascend row is what this tests")
+        return gpu
+
+    def test_the_sheet_separates_the_chassis_from_the_domain(self):
+        from backend.inference.gpu_specs import (gpus_per_node,
+                                                 ranks_per_scaleup_domain)
+        gpu = self._ascend()
+        self.assertEqual(gpus_per_node(gpu), 16)
+        self.assertEqual(ranks_per_scaleup_domain(gpu), 768)
+
+    def test_the_lookup_tiers_a_crossing_group_as_scaleup(self):
+        """A measured row keyed `scaleup` is only found if the estimate
+        asks for `scaleup`."""
+        from backend.inference.gpu_specs import (gpus_per_node,
+                                                 ranks_per_scaleup_domain)
+        gpu = self._ascend()
+        host, domain = gpus_per_node(gpu), ranks_per_scaleup_domain(gpu)
+        for world, want in ((8, COMM_REACH_HOST), (16, COMM_REACH_HOST),
+                            (32, COMM_REACH_SCALEUP),
+                            (64, COMM_REACH_SCALEUP),
+                            (768, COMM_REACH_SCALEUP),
+                            (769, COMM_REACH_SCALEOUT),
+                            (1024, COMM_REACH_SCALEOUT)):
+            self.assertEqual(
+                comm_reach(world, base_stride=1, ranks_per_host=host,
+                           ranks_per_scaleup_domain=domain),
+                want, f"world={world}")
+
+    def test_a_world_with_no_measurement_is_priced_on_the_fast_fabric(self):
+        """The half a reach code cannot cover.
+
+        64 and 96 ranks are not in the corpus and will be priced from the
+        roofline. Inside the supernode that traffic never touches a NIC,
+        so pricing it on `rdma_gbps` would be wrong by the better part of
+        an order of magnitude -- and silently, since a number comes back
+        either way.
+        """
+        gpu = self._ascend()
+        fabric = Fabric.of(gpu, 2e-6)
+        for world in (16, 32, 64, 96, 768):
+            _t, phases = price_collective(
+                op="all_reduce", world=world, tensor_bytes=1 << 23,
+                count_per_step=1, fabric=fabric, base_stride=1)
+            labels = {p["fabric_label"] for p in phases}
+            self.assertEqual(labels, {"HCCS"}, f"world={world} left the "
+                                               f"scale-up fabric: {labels}")
+
+    def test_past_the_domain_it_is_the_nic(self):
+        gpu = self._ascend()
+        _t, phases = price_collective(
+            op="all_reduce", world=1024, tensor_bytes=1 << 23,
+            count_per_step=1, fabric=Fabric.of(gpu, 2e-6), base_stride=1)
+        self.assertIn("RDMA", {p["fabric_label"] for p in phases})
+
+    def test_a_card_with_no_supernode_is_unchanged(self):
+        """Every other row on the sheet leaves the column empty, and must
+        read exactly as it did: this is what keeps the GPU baseline
+        byte-identical."""
+        from backend.inference import gpu_specs as gs
+        for gpu in gs.load_gpu_specs():
+            if gpu.sku == "Ascend-910C-A3":
+                continue
+            self.assertEqual(
+                gs.ranks_per_scaleup_domain(gpu), gs.gpus_per_node(gpu),
+                f"{gpu.sku} gained a domain it never declared")
+
+
+class TestTheScaleUpDomainReachesTheEstimate(unittest.TestCase):
+    """The sheet's `ranks_per_scaleup_domain` has to arrive at the walk that
+    prices a deployment, not merely at `Fabric.of`.
+
+    It did not, once: `Fabric.of` passed the width and the phase walk built
+    its fabric by hand without it, so every Ascend group wider than one
+    16-die chassis was split at `gpus_per_node` and its middle phase priced
+    as RDMA with a 4.4us hop -- the error the column exists to remove, on
+    the one path an estimate actually takes. A test that hands a hand-made
+    `Fabric` to `price_collective` cannot see this; it proves what the
+    pricing does GIVEN a fabric, and what broke was which fabric arrives.
+    So this drives `topology()`, the one both construction sites share.
+    """
+
+    def test_topology_carries_the_domain_width(self):
+        from backend.inference import gpu_specs as gs
+        from backend.inference.comm_cost import Fabric, topology
+
+        ascend = gs.get_gpu("Ascend-910C-A3")
+        self.assertEqual(topology(ascend).get("scaleup_domain"), 768)
+        # Both construction sites agree, because both read `topology`.
+        self.assertEqual(Fabric.of(ascend).scaleup_domain, 768)
+
+        # A card that declares no supernode reads as its own chassis, which
+        # is what `None` meant before: no card changes behaviour here.
+        for gpu in gs.load_gpu_specs():
+            if gpu.sku == "Ascend-910C-A3":
+                continue
+            self.assertEqual(topology(gpu).get("scaleup_domain"),
+                             gs.gpus_per_node(gpu),
+                             f"{gpu.sku} would split somewhere new")
+
+    def test_a_group_inside_the_supernode_crosses_no_rdma(self):
+        """32 Ascend dies span two chassis and stay in one scale-up domain,
+        so the whole collective is HCCS: 174.5 GB/s measured, against the
+        25 GB/s an RDMA split would have charged."""
+        from backend.inference.comm_cost import (Fabric, collective_phases,
+                                                 topology)
+        from backend.inference.gpu_specs import get_gpu
+
+        fabric = Fabric.of(get_gpu("Ascend-910C-A3"))
+        self.assertEqual(fabric.gpus_per_node, 16)
+
+        for world in (8, 16, 32, 64, 768):
+            phases = collective_phases(
+                op="all_reduce", world=world, tensor_bytes=float(1 << 20),
+                gpus_per_node=int(fabric.scaleup_domain),
+                base_stride=1, algorithm="nccl")
+            crossings = [p for p in phases if p.get("fabric") == "inter"]
+            self.assertEqual(
+                crossings, [],
+                f"world={world} is inside the 768-rank domain and must not "
+                f"cross: {crossings}")
+
+        # Past the domain it must split, or the fabric would be infinite.
+        beyond = collective_phases(
+            op="all_reduce", world=1024, tensor_bytes=float(1 << 20),
+            gpus_per_node=int(fabric.scaleup_domain),
+            base_stride=1, algorithm="nccl")
+        self.assertTrue(
+            [p for p in beyond if p.get("fabric") == "inter"],
+            "a group wider than the supernode has to leave it")
+
+        # The width is what splits it, not the chassis: splitting at 16
+        # would have crossed at 32.
+        at_chassis = collective_phases(
+            op="all_reduce", world=32, tensor_bytes=float(1 << 20),
+            gpus_per_node=int(fabric.gpus_per_node),
+            base_stride=1, algorithm="nccl")
+        self.assertTrue(
+            [p for p in at_chassis if p.get("fabric") == "inter"],
+            "this is the behaviour the domain width replaces; if it stopped "
+            "crossing, the test above no longer discriminates")
+        _ = topology

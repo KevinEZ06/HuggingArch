@@ -508,11 +508,12 @@ class TheAbsenceTravels(unittest.TestCase):
         )["kv_transfer"]
         self.assertAlmostEqual(over["handoff_latency_s"], kv / (25.0 * 1e9))
 
-        # No RDMA column: NVLink and PCIe are intra-node fabrics and never
+        # No RDMA column: the scale-up link and PCIe are intra-node fabrics and never
         # carry a cross-node handoff, so there is no latency to report.
         no_rdma = {
             **stub,
-            "gpu": {"nvlink_gbps": 450.0, "pcie_gbps": 64.0},
+            "gpu": {"scaleup_gbps": 450.0, "scaleup_fabric": "NVLink",
+                    "pcie_gbps": 64.0},
         }
         absent = disagg_handoff(
             stub, no_rdma, kv_transfer_bw_gbps=None, avg_output_tokens=1,
