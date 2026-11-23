@@ -45,13 +45,20 @@ class GPUSpec:
     int8_tops: Optional[float]
     fp8_tflops: Optional[float]
     fp4_tflops: Optional[float]
-    #: The per-direction NVLink bandwidth. A value also declares the
-    #: topology: every GPU of the card's NVLink domain (`gpus_per_node` of
-    #: them — an HGX baseboard, a whole NVL72 rack) reaches every other
-    #: over NVLink, which is what a peer-to-peer (one-shot, two-shot)
-    #: all-reduce requires (`comm_cost.Fabric.refusal`). Empty: the GPUs talk over PCIe.
-    nvlink_gbps: Optional[float]
-    #: `yes` when the NVLink domain's switches reduce in the network and
+    #: The per-direction bandwidth of the card's scale-up link — NVLink on
+    #: NVIDIA parts, HCCS on Ascend (`scaleup_fabric` names which). A
+    #: value also declares the topology: every device of the card's
+    #: scale-up domain (`gpus_per_node` of them — an HGX baseboard, a whole
+    #: NVL72 rack, an Atlas A3 node) reaches every other over that link,
+    #: which is what a framework's peer-to-peer all-reduce kernels require.
+    #: Empty: the devices talk over PCIe.
+    scaleup_gbps: Optional[float]
+    #: The name of that link (`NVLink`, `HCCS`), the label a row's
+    #: intra-node bandwidth is shown under. Set exactly when `scaleup_gbps`
+    #: is (`check_scaleup`): the bandwidth is the fact, the name says which
+    #: wire carries it, and neither is guessed from the vendor.
+    scaleup_fabric: str
+    #: `yes` when the scale-up domain's switches reduce in the network and
     #: multicast (NVLink SHARP, "NVLS": third-generation NVSwitch and later,
     #: Hopper/Blackwell HGX and NVL72), `no` otherwise (A100's NVSwitch, a
     #: PCIe card). What the NVLS all-reduce needs (`comm_cost`).
@@ -82,6 +89,15 @@ class GPUSpec:
     mem_bw_gbps: Optional[float]
     tdp_w: Optional[float]
     gpus_per_node: Optional[float] = None
+    #: How many ranks the SCALE-UP DOMAIN holds, when it is wider than one
+    #: chassis. An Atlas A3 supernode reaches 768 dies over Lingqu (UB) at
+    #: the chassis's own rate, so a 32-rank group there crosses machines
+    #: without leaving the fast fabric -- the case `gpus_per_node` alone
+    #: cannot express, because that is the CHASSIS and stays 16.
+    #: Empty means the card declares no domain past its chassis, and every
+    #: reader falls back to `gpus_per_node`: that is every other row on
+    #: the sheet, whose behaviour is unchanged.
+    ranks_per_scaleup_domain: Optional[float] = None
     notes: str = ""
     #: The CUDA compute capability (`major.minor`, "9.0" for Hopper, "10.0" /
     #: "10.3" for the data-centre Blackwells): what a framework's kernel
@@ -148,6 +164,7 @@ def load_gpu_specs() -> list[GPUSpec]:
         raise RuntimeError(f"could not load gpu_specs.csv after retries: {last}")
     for spec in specs:
         check_compute_capability(spec)
+        check_scaleup(spec)
         check_nvls(spec)
         check_rdma_hop_latency(spec)
         check_memory_bandwidth(spec)
@@ -162,16 +179,27 @@ def check_nvls(spec: GPUSpec) -> None:
         raise ValueError(
             f"gpu_specs.csv: {spec.sku} states nvls {spec.nvls!r}; every row "
             "says `yes` or `no`")
-    if spec.nvls == "yes" and not spec.nvlink_gbps:
+    if spec.nvls == "yes" and not spec.scaleup_gbps:
         raise ValueError(
-            f"gpu_specs.csv: {spec.sku} states nvls yes without an NVLink "
-            "domain (`nvlink_gbps`)")
+            f"gpu_specs.csv: {spec.sku} states nvls yes without a scale-up "
+            "domain (`scaleup_gbps`)")
 
 
-def has_nvlink_domain(gpu: GPUSpec) -> bool:
-    """Every GPU of the card's node reaches every other over NVLink
-    (`GPUSpec.nvlink_gbps`)."""
-    return bool(gpu is not None and gpu.nvlink_gbps)
+def check_scaleup(spec: GPUSpec) -> None:
+    """A row names its scale-up link exactly when it states one's
+    bandwidth: a bandwidth with no name would be labelled by a guess, and a
+    name with no bandwidth prices nothing."""
+    if bool(spec.scaleup_gbps) != bool(spec.scaleup_fabric):
+        raise ValueError(
+            f"gpu_specs.csv: {spec.sku} states scaleup_gbps "
+            f"{spec.scaleup_gbps!r} and scaleup_fabric "
+            f"{spec.scaleup_fabric!r}; a row states both or neither")
+
+
+def has_scaleup_domain(gpu: GPUSpec) -> bool:
+    """Every device of the card's node reaches every other over its
+    scale-up link (`GPUSpec.scaleup_gbps`)."""
+    return bool(gpu is not None and gpu.scaleup_gbps)
 
 
 def has_nvls(gpu: GPUSpec) -> bool:
@@ -245,9 +273,9 @@ PEAK_COLUMNS: Mapping[str, str] = _peak_columns()
 #:     row's compute term at its own dtype. Their PRESENCE is a walk fact
 #:     too (`peak_families`): a leaf whose dtype has no column is walked
 #:     weight-only. Value priced, presence walked;
-#:   * `nvlink_gbps` / `pcie_gbps` — `peak_intra_bw_bytes_per_sec` and
-#:     `intra_bw_label`; `nvlink_gbps` also says the card has an NVLink
-#:     domain (`has_nvlink_domain`);
+#:   * `scaleup_gbps` / `pcie_gbps` — `peak_intra_bw_bytes_per_sec` and
+#:     `intra_bw_label` (which `scaleup_fabric` names); `scaleup_gbps` also
+#:     says the card has a scale-up domain (`has_scaleup_domain`);
 #:   * `rdma_gbps`   — `peak_inter_bw_bytes_per_sec`, `inter_bw_label`;
 #:   * `rdma_hop_latency_us` — `inter_hop_latency_s`, what a cross-node
 #:     link traversal adds to the request's link latency;
@@ -258,8 +286,10 @@ PEAK_COLUMNS: Mapping[str, str] = _peak_columns()
 #: columns: a column in none of the three is refused at load
 #: (`framework_bindings._check_card_fact_classification`).
 PRICE_COLUMNS: FrozenSet[str] = frozenset({
-    "mem_gib", "mem_bw_gbps", "nvlink_gbps", "pcie_gbps", "rdma_gbps",
-    "rdma_hop_latency_us", "nvls", "gpus_per_node", *PEAK_COLUMNS.values()})
+    "mem_gib", "mem_bw_gbps", "scaleup_gbps", "scaleup_fabric",
+    "pcie_gbps", "rdma_gbps", "rdma_hop_latency_us",
+    "nvls", "gpus_per_node", "ranks_per_scaleup_domain",
+    *PEAK_COLUMNS.values()})
 
 #: The sheet columns no walk and no number reads — what a row says about
 #: itself, for a reader. Explicit, one entry per column with why: the third
@@ -380,7 +410,7 @@ def peak_intra_bw_bytes_per_sec(gpu: GPUSpec) -> Optional[float]:
     """
     if gpu is None:
         return None
-    bw = gpu.nvlink_gbps if gpu.nvlink_gbps else gpu.pcie_gbps
+    bw = gpu.scaleup_gbps if gpu.scaleup_gbps else gpu.pcie_gbps
     return gbps_to_bytes_per_sec(bw)
 
 
@@ -448,12 +478,34 @@ def gpus_per_node(gpu: GPUSpec) -> int:
     return value
 
 
+def ranks_per_scaleup_domain(gpu: GPUSpec) -> int:
+    """Ranks in the card's SCALE-UP domain — the chassis unless the sheet
+    says wider.
+
+    `gpus_per_node` is the chassis and answers "does this group leave the
+    machine". It is not the same question as "does this group leave the
+    fast fabric": on an Atlas A3 supernode 768 dies reach each other over
+    Lingqu at the chassis's own rate, so 32 ranks cross machines and stay
+    on scale-up. A row that states nothing here has the two questions
+    coincide, which is every other card on the sheet.
+    """
+    raw = getattr(gpu, "ranks_per_scaleup_domain", None)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return gpus_per_node(gpu)
+    # A domain narrower than the chassis it contains is a sheet error, not
+    # a topology: the chassis answer is the safe one and the louder bug.
+    return max(value, gpus_per_node(gpu))
+
+
 def intra_bw_label(gpu: GPUSpec) -> str:
-    """Display label for intra-node BW: `"NVLink"` / `"PCIe"` / `""`."""
+    """Display label for intra-node BW: the scale-up link's name
+    (`scaleup_fabric`: `"NVLink"`, `"HCCS"`), else `"PCIe"`, else `""`."""
     if gpu is None:
         return ""
-    if gpu.nvlink_gbps:
-        return "NVLink"
+    if gpu.scaleup_gbps:
+        return gpu.scaleup_fabric
     if gpu.pcie_gbps:
         return "PCIe"
     return ""
