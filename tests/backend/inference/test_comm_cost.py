@@ -1343,11 +1343,20 @@ class ASupernodeIsScaleUpAcrossMachines(unittest.TestCase):
                                                f"scale-up fabric: {labels}")
 
     def test_past_the_domain_it_is_the_nic(self):
-        gpu = self._ascend()
-        _t, phases = price_collective(
-            op="all_reduce", world=1024, tensor_bytes=1 << 23,
-            count_per_step=1, fabric=Fabric.of(gpu, 2e-6), base_stride=1)
-        self.assertIn("RDMA", {p["fabric_label"] for p in phases})
+        from backend.inference.comm_cost import collective_phases
+        from backend.inference.gpu_specs import NoFabricBandwidth
+        fabric = Fabric.of(self._ascend(), 2e-6)
+        phases = collective_phases(
+            op="all_reduce", world=1024, tensor_bytes=float(1 << 23),
+            gpus_per_node=fabric.scaleup_ranks(), base_stride=1)
+        self.assertIn("inter", {p["fabric"] for p in phases})
+        # ... which this row does not describe: its RoCE ports have never
+        # carried traffic, so the cell is empty and the group is refused
+        # rather than priced on a nameplate.
+        with self.assertRaises(NoFabricBandwidth):
+            price_collective(
+                op="all_reduce", world=1024, tensor_bytes=1 << 23,
+                count_per_step=1, fabric=fabric, base_stride=1)
 
     def test_the_hops_are_read_off_the_split_the_bytes_are(self):
         """A collective's time has two halves -- bytes over a bandwidth and
@@ -1476,17 +1485,23 @@ class AFabricTheCardDoesNotStateIsNotFree(unittest.TestCase):
             self.assertEqual({p["bw_bytes_per_sec"] for p in phases}, {0.0})
             self.assertAlmostEqual(t, sum(p["latency_s"] for p in phases))
 
-    def test_every_card_on_the_sheet_states_both_fabrics(self):
-        """Why no number moves on the sheet as it stands: the refusal has
-        nothing to refuse on any row. A row added without one of them is
-        refused where it is first asked, by name."""
+    def test_which_cards_on_the_sheet_leave_a_fabric_unstated(self):
+        """Every row states the fabric inside its scale-up domain, and
+        every row but one the link between domains -- so the refusal moves
+        no number on any other card. The one is the Ascend 910C, whose NIC
+        has never been observed carrying traffic."""
         from backend.inference import gpu_specs as gs
+        from backend.inference.gpu_specs import NoFabricBandwidth
         for gpu in gs.load_gpu_specs():
             fabric = Fabric.of(gpu, 2e-6)
             with self.subTest(sku=gpu.sku):
                 self.assertEqual(fabric.sku, gpu.sku)
                 self.assertTrue(fabric.bandwidth("intra"))
-                self.assertTrue(fabric.bandwidth("inter"))
+                if gpu.sku == "Ascend-910C-A3":
+                    with self.assertRaises(NoFabricBandwidth):
+                        fabric.bandwidth("inter")
+                else:
+                    self.assertTrue(fabric.bandwidth("inter"))
 
 
 class TestTheScaleUpDomainReachesTheEstimate(unittest.TestCase):

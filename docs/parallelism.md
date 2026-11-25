@@ -349,7 +349,7 @@ checks it on DeepSeek-V3, V3.2 and V4-Pro at `cp = 8`.
 | supernode (超节点) | supernode / superpod (Huawei CloudMatrix; cf. NVIDIA NVL72 rack) | one scale-up domain spanning SEVERAL chassis — on Atlas A3, up to 384 dies reached over Lingqu, which `npu-smi info -t spod-info` reports as `Super Pod Size`. Crossing chassis inside one is NOT crossing into scale-out |
 | Lingqu (灵渠) / UB / UnifiedBus | UnifiedBus (Huawei) | the fabric a supernode's scale-up domain is built from. Vendor name 灵渠; `HCCS` is what `npu-smi info -t topo` prints for the switched links inside one chassis |
 | `SIO` | 自述词(厂商缩写) | the faster link joining the two dies of one Ascend package, printed by `npu-smi info -t topo` alongside `HCCS_SW` |
-| `rdma_gbps`, RDMA | RDMA over Converged Ethernet (RoCE v2); InfiniBand | the scale-OUT NIC. On a supernode member this carries traffic leaving the supernode, NOT traffic between its chassis |
+| `rdma_gbps`, RDMA | RDMA over Converged Ethernet (RoCE v2); InfiniBand | the scale-OUT NIC. On a supernode member this carries traffic leaving the supernode, NOT traffic between its chassis. A row may leave it empty when the link was never observed; a collective or a disaggregated KV handoff that would cross it is then refused with the column named (`NoFabricBandwidth`, `disagg_handoff.kv_transfer.unavailable_reason`) rather than priced |
 | `gpus_per_node` | 自述词 | how many ranks one scale-up domain holds. The spelling says "node", but the fact is the DOMAIN's size: on Atlas A3 that is the supernode's 384, not one chassis's 16 |
 | `artifact` | 自述词(借建构词:a produced, stored thing) | one physically stored checkpoint tensor (primary or metadata sibling) |
 | `provenance` | data lineage | where a header count came from: declared, recovered, absent |

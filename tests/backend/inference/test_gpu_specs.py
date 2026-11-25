@@ -236,15 +236,26 @@ class TestGPUSpecsLoader(unittest.TestCase):
         with self.assertRaisesRegex(NoFabricBandwidth, "A100-40G-PCIe"):
             check_node_fabric(blank)
 
-    def test_every_sku_declares_an_rdma_link(self):
-        # A cross-node collective or KV handoff is priced against the RDMA
-        # column and nothing else (PCIe is intra-node). A SKU added without
-        # it would report no cross-node bandwidth at all, so the column is
-        # required, and the number must be a positive per-direction GB/s.
+    def test_an_rdma_link_is_stated_whole_or_not_at_all(self):
+        # Traffic that leaves a card's scale-up domain is priced against
+        # the RDMA columns and nothing else (PCIe is intra-node). A row
+        # states a positive per-direction GB/s and the hop that goes with
+        # it, or leaves both empty -- and then whatever would cross that
+        # link is refused by name (`NoFabricBandwidth`), not priced. A rate
+        # without its hop, or a hop left behind by a removed rate, is
+        # neither.
+        unstated = []
         for g in load_gpu_specs():
             with self.subTest(sku=g.sku):
-                self.assertIsNotNone(g.rdma_gbps)
+                if g.rdma_gbps is None:
+                    self.assertIsNone(g.rdma_hop_latency_us)
+                    unstated.append(g.sku)
+                    continue
                 self.assertGreater(float(g.rdma_gbps), 0.0)
+                self.assertIsNotNone(g.rdma_hop_latency_us)
+        # The one row whose NIC has never been observed carrying traffic.
+        # A row joining it is a decision, not a blank someone forgot.
+        self.assertEqual(unstated, ["Ascend-910C-A3"])
 
     def test_no_sku_prices_bf16_and_fp16_differently(self):
         """The premise behind serving a float32 checkpoint at ONE dtype.
