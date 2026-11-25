@@ -200,6 +200,16 @@ class Fabric(NamedTuple):
                    gpu_specs.intra_bw_label(gpu), gpu_specs.inter_bw_label(gpu),
                    step_latency)._replace(**topology(gpu))
 
+    def scaleup_ranks(self) -> int:
+        """Ranks one scale-up domain holds: the width that splits a
+        collective into intra and inter phases. The question a split asks
+        is whether the group's traffic stays on the fast fabric, and on a
+        supernode 768 dies do that across machines; a card declaring no
+        supernode has this equal to its chassis. A phase's bytes and the
+        hops it waits on are both read off that one split, so the two
+        cannot disagree about which fabric a phase crossed."""
+        return int(self.scaleup_domain or self.gpus_per_node or 1)
+
     def without_latency(self) -> "Fabric":
         """This fabric with free steps: what its bandwidth alone charges."""
         return self._replace(step_latency=0.0, inter_latency=0.0)
@@ -677,7 +687,7 @@ def collective_latency(*, op: str, world: int, count_per_step: int,
     step. Independent of the payload once the algorithm is chosen."""
     phases = collective_phases(
         op=op, world=int(world), tensor_bytes=1.0,
-        gpus_per_node=int(fabric.gpus_per_node or 1),
+        gpus_per_node=fabric.scaleup_ranks(),
         base_stride=int(base_stride or 1), algorithm=algorithm, fanout=fanout)
     return sum(fabric.hop_latency(ph["fabric"]) * ph["hops"]
                for ph in phases) * int(count_per_step)
@@ -704,15 +714,12 @@ def price_collective(
     the same loop as the first rather than by a scalar ratio of link
     bandwidths applied to the first card's total.
     """
-    # The size that decides intra vs inter is the SCALE-UP DOMAIN, not the
-    # chassis: what the split asks is whether this group's traffic stays on
-    # the fast fabric, and on a supernode 768 dies do that across machines.
+    # Split at the scale-up domain, not the chassis (`Fabric.scaleup_ranks`).
     # Cards declaring no supernode have the two equal, so their phases --
     # and every number on the GPU baseline -- are unchanged.
     phases_list = collective_phases(
         op=op, world=int(world), tensor_bytes=float(tensor_bytes),
-        gpus_per_node=int(fabric.scaleup_domain
-                          or fabric.gpus_per_node or 1),
+        gpus_per_node=fabric.scaleup_ranks(),
         base_stride=int(base_stride or 1), algorithm=algorithm,
         fanout=fanout, t_sym=t_sym, t_sub=t_sub,
     )

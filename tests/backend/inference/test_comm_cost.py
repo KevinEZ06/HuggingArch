@@ -1349,6 +1349,43 @@ class ASupernodeIsScaleUpAcrossMachines(unittest.TestCase):
             count_per_step=1, fabric=Fabric.of(gpu, 2e-6), base_stride=1)
         self.assertIn("RDMA", {p["fabric_label"] for p in phases})
 
+    def test_the_hops_are_read_off_the_split_the_bytes_are(self):
+        """A collective's time has two halves -- bytes over a bandwidth and
+        hops at a latency -- and the row publishes the envelope's sum of
+        them while its phase rows itemise the same collective. Both halves
+        have to ask the one question, "did this phase leave the fast
+        fabric", of the one width.
+
+        They did not: the bytes were split at the 768-rank domain and the
+        hops at the 16-die chassis, so 32 ranks moved their bytes over HCCS
+        and still waited on an RDMA hop per traversal. The published time of
+        an all-to-all there was 36.94us against phase rows summing to
+        14.94us. Pricing the bytes alone, as the test above does, could not
+        see it.
+        """
+        from backend.inference.comm_cost import CollectiveSignature
+        fabric = Fabric.of(self._ascend(), 2e-6)
+        payload = float(1 << 20)
+        for op in ("all_to_all", "all_reduce"):
+            for world in (32, 64, 768):
+                t_rows, rows = price_collective(
+                    op=op, world=world, tensor_bytes=payload,
+                    count_per_step=1, fabric=fabric, base_stride=1)
+                hops = collective_latency(
+                    op=op, world=world, count_per_step=1, fabric=fabric,
+                    base_stride=1)
+                self.assertAlmostEqual(
+                    hops, sum(r["latency_s"] for r in rows), places=12,
+                    msg=f"{op} world={world}: hops split elsewhere")
+                published = CollectiveSignature(
+                    op=op, world=world, count=1, stride=1).envelope(
+                        fabric).choose(payload)
+                self.assertEqual(published.algorithm, "nccl")
+                self.assertAlmostEqual(
+                    published.t(payload), t_rows, places=12,
+                    msg=f"{op} world={world}: the row's time is not its "
+                        "phase rows' sum")
+
     def test_a_card_with_no_supernode_is_unchanged(self):
         """Every other row on the sheet leaves the column empty, and must
         read exactly as it did: this is what keeps the GPU baseline
