@@ -51,6 +51,7 @@ from backend.arch.loader import get_default_loader
 
 from .parallel_config import ParallelConfig
 from .module_rows import served
+from .gpu_specs import NoFabricBandwidth
 from .pipeline import NoPeakForDtype
 from backend.arch.eval.analysis import Point
 from backend.measure.pool import map_cells
@@ -549,9 +550,10 @@ def _estimate_layout(payload: Dict[str, Any]) -> Dict[str, List[dict]]:
                                        schedule=schedule)
                         for length, schedule in zip(contexts, schedules,
                                                     strict=True)]
-        except NoPeakForDtype as exc:
+        except (NoPeakForDtype, NoFabricBandwidth) as exc:
             # The card's answer at every context: a format it lists no peak
-            # for is not a fact of the context.
+            # for, or a fabric this layout crosses that it states no
+            # bandwidth for, is not a fact of the context.
             out[sku] = [_absent("card", exc) for _ in contexts]
     return {sku: out[sku] for sku in gpu_skus}
 
@@ -576,7 +578,7 @@ def _price_context(payload: Dict[str, Any], p: Any, anchors: ContextAnchors,
     try:
         return {"context": length, **_priced_context(
             payload, p, anchors, length=length, schedule=schedule)}
-    except (NoPeakForDtype, MeasurementsUnavailable):
+    except (NoPeakForDtype, NoFabricBandwidth, MeasurementsUnavailable):
         raise  # the card's answer at every context / the whole sweep's
     except ValueError as exc:
         return _absent("layout", exc)

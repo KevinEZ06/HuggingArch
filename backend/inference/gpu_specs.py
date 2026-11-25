@@ -168,6 +168,7 @@ def load_gpu_specs() -> list[GPUSpec]:
         check_nvls(spec)
         check_rdma_hop_latency(spec)
         check_memory_bandwidth(spec)
+        check_node_fabric(spec)
     return specs
 
 
@@ -396,8 +397,9 @@ def peak_intra_bw_bytes_per_sec(gpu: GPUSpec) -> Optional[float]:
 
     Collectives whose `comm_world <= gpus_per_node` ride the high-speed
     fabric inside a single node — NVLink on modern SKUs, PCIe on older
-    or PCIe-form-factor cards. None when neither column is filled
-    (degenerate; t_comm then degrades to 0).
+    or PCIe-form-factor cards. None when neither column is filled: a
+    collective that needs it is refused (`NoFabricBandwidth`), not timed
+    at zero.
 
     CSV convention: all bandwidth columns store the *unidirectional*
     per-direction value, i.e. the throughput a single ring step can
@@ -420,7 +422,8 @@ def peak_inter_bw_bytes_per_sec(gpu: GPUSpec) -> Optional[float]:
     Collectives whose `comm_world > gpus_per_node` must cross node
     boundaries — RDMA (InfiniBand / RoCE / NVIDIA's CX-class NICs).
     None when the SKU lists no RDMA column: there is no cross-node path
-    to price, and PCIe is not one.
+    to price, and PCIe is not one. A collective that crosses nodes on such
+    a card is refused (`NoFabricBandwidth`).
 
     CSV convention: per-direction GB/s. CX-7 = 400 Gbps unidirectional
     = 50 GB/s; CX-8 = 800 Gbps = 100 GB/s; GB200/GB300 NDR/XDR =
@@ -552,6 +555,46 @@ class NoPeakBandwidth(ValueError):
             f"`mem_bw_gbps`), so a step that reads bytes has no time on this "
             f"card. Its FLOPs and bytes do not depend on the card; to time "
             f"it, state {gpu_sku}'s memory bandwidth on its sheet row")
+
+
+class NoFabricBandwidth(ValueError):
+    """The card states no bandwidth for a fabric a collective crosses, so
+    that collective has no time on it.
+
+    The sibling of `NoPeakBandwidth` on the interconnect: a phase's time is
+    `bytes / bw` plus its hops, so a blank column read as "no limit" moves
+    every byte across that fabric in zero seconds and leaves only the hop
+    latency -- a group that leaves the machine priced as if the link
+    between machines were free. Raised where a phase's bytes meet the
+    fabric (`comm_cost.Fabric.bandwidth`), which is the one place every
+    collective is priced, on the card it was walked on or any card it is
+    re-priced on, and at load for a row that states no fabric inside its
+    node (`check_node_fabric`). `field` is the sheet column that would
+    answer it."""
+
+    def __init__(self, gpu_sku: str, field: str, crossing: str):
+        self.gpu_sku, self.field = gpu_sku, field
+        super().__init__(
+            f"{gpu_sku} states no bandwidth for the link {crossing} "
+            f"(gpu_specs.csv column `{field}`), so a collective that "
+            f"crosses it has no time on this card. Its bytes do not depend "
+            f"on the card; to time it, keep the group on a fabric "
+            f"{gpu_sku} states, or state the bandwidth on its sheet row")
+
+
+def check_node_fabric(spec: GPUSpec) -> None:
+    """Every row states the fabric its node's devices reach each other
+    over -- a scale-up link or PCIe (`peak_intra_bw_bytes_per_sec`) -- for
+    the reason every row states an HBM bandwidth: refused here, at load,
+    a fabric handed NO bandwidth at all then means exactly "no card's
+    fabric was read", which is how a caller that asked for a step's bytes
+    and launches rather than its times is told from a card with a blank
+    cell (`comm_cost.Fabric.bandwidth`). The link BETWEEN scale-up domains
+    may be left out; what crosses it is then refused."""
+    if not (spec.scaleup_gbps or spec.pcie_gbps):
+        raise NoFabricBandwidth(
+            f"gpu_specs.csv: {spec.sku}", "scaleup_gbps",
+            "between the devices of one node")
 
 
 def check_memory_bandwidth(spec: GPUSpec) -> None:

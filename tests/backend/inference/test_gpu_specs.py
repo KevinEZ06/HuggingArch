@@ -221,6 +221,21 @@ class TestGPUSpecsLoader(unittest.TestCase):
             # gpus_per_node should resolve to a positive int.
             self.assertGreater(gpus_per_node(g), 0)
 
+    def test_every_row_states_the_fabric_inside_its_node(self):
+        """What lets a fabric handed no bandwidth at all mean "no card's
+        fabric was read" (`comm_cost.Fabric.bandwidth`): no row can be that
+        fabric, because the loader refuses one that states neither a
+        scale-up link nor PCIe."""
+        from dataclasses import replace
+        from backend.inference.gpu_specs import (
+            NoFabricBandwidth, check_node_fabric, peak_intra_bw_bytes_per_sec)
+        for spec in load_gpu_specs():
+            check_node_fabric(spec)
+            self.assertGreater(peak_intra_bw_bytes_per_sec(spec), 0, spec.sku)
+        blank = replace(get_gpu("A100-40G-PCIe"), pcie_gbps=None)
+        with self.assertRaisesRegex(NoFabricBandwidth, "A100-40G-PCIe"):
+            check_node_fabric(blank)
+
     def test_every_sku_declares_an_rdma_link(self):
         # A cross-node collective or KV handoff is priced against the RDMA
         # column and nothing else (PCIe is intra-node). A SKU added without

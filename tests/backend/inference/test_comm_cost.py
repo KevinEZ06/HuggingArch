@@ -1399,6 +1399,96 @@ class ASupernodeIsScaleUpAcrossMachines(unittest.TestCase):
                 f"{gpu.sku} gained a domain it never declared")
 
 
+class AFabricTheCardDoesNotStateIsNotFree(unittest.TestCase):
+    """A phase's time is `bytes / bw` plus its hops. A card whose sheet row
+    leaves a fabric's bandwidth blank used to have the division skipped, so
+    a group that left the machine moved its bytes in zero seconds and paid
+    only the hop latency: a cross-node all-reduce of 8 MiB priced at 4us.
+    A number came back, lower than any real link gives, with nothing beside
+    it to say a column was empty."""
+
+    def _card(self, sku, **blank):
+        from backend.inference import gpu_specs as gs
+        return replace(gs.get_gpu(sku), **blank)
+
+    def test_a_group_that_leaves_the_stated_fabric_is_refused(self):
+        from backend.inference.comm_cost import CollectiveSignature
+        from backend.inference.gpu_specs import NoFabricBandwidth
+        gpu = self._card("Ascend-910C-A3", rdma_gbps=None,
+                         rdma_hop_latency_us=None)
+        fabric = Fabric.of(gpu, 2e-6)
+        self.assertIsNone(fabric.inter_bw)
+        for op in ("all_reduce", "all_to_all"):
+            with self.assertRaises(NoFabricBandwidth) as refused:
+                price_collective(
+                    op=op, world=1024, tensor_bytes=1 << 23,
+                    count_per_step=1, fabric=fabric, base_stride=1)
+            self.assertEqual(refused.exception.field, "rdma_gbps")
+            self.assertIn("Ascend-910C-A3", str(refused.exception))
+            # The row's published time is the envelope's, built before any
+            # payload is known: it is refused there too, not left at zero
+            # seconds per byte.
+            with self.assertRaises(NoFabricBandwidth):
+                CollectiveSignature(op=op, world=1024, count=1,
+                                    stride=1).envelope(fabric)
+
+    def test_what_stays_on_a_stated_fabric_is_priced_as_before(self):
+        """The refusal is for the fabric a phase crosses, not for the card:
+        blanking the NIC changes nothing a group inside the supernode
+        pays."""
+        from backend.inference import gpu_specs as gs
+        stated = Fabric.of(gs.get_gpu("Ascend-910C-A3"), 2e-6)
+        blank = Fabric.of(self._card("Ascend-910C-A3", rdma_gbps=None,
+                                     rdma_hop_latency_us=None), 2e-6)
+        for world in (8, 16, 32, 64, 768):
+            for op in ("all_reduce", "all_to_all"):
+                kw = dict(op=op, world=world, tensor_bytes=1 << 23,
+                          count_per_step=1, base_stride=1)
+                self.assertEqual(price_collective(fabric=blank, **kw),
+                                 price_collective(fabric=stated, **kw),
+                                 f"{op} world={world}")
+
+    def test_the_fabric_inside_the_domain_is_held_to_the_same_rule(self):
+        from backend.inference.gpu_specs import NoFabricBandwidth
+        gpu = self._card("H100-SXM", scaleup_gbps=None, scaleup_fabric=None,
+                         pcie_gbps=None, nvls="no")
+        with self.assertRaises(NoFabricBandwidth) as refused:
+            price_collective(
+                op="all_reduce", world=8, tensor_bytes=1 << 23,
+                count_per_step=1, fabric=Fabric.of(gpu, 2e-6), base_stride=1)
+        self.assertEqual(refused.exception.field, "scaleup_gbps")
+
+    def test_no_bandwidth_handed_over_is_still_a_request_for_bytes(self):
+        """A fabric handed neither bandwidth is a caller that asked for no
+        times (`row_roofline.LawBook.row_at`), with or without a card: a
+        kernel plan and a fusion walk pass the card for its dispatch and no
+        interconnect, which is how `phases` builds the second fabric below.
+        An absent bandwidth there is "not asked", and the phases carry
+        their bytes and hops as they did. Refusing it took every plan built
+        on an H100 down with a complaint about a cell the sheet fills."""
+        from backend.inference import gpu_specs as gs
+        from backend.inference.comm_cost import topology
+        bare = Fabric(8, None, None, step_latency=2e-6)
+        for fabric in (bare, bare._replace(**topology(gs.get_gpu("H100-SXM")))):
+            t, phases = price_collective(
+                op="all_reduce", world=16, tensor_bytes=1 << 23,
+                count_per_step=1, fabric=fabric, base_stride=1)
+            self.assertEqual({p["bw_bytes_per_sec"] for p in phases}, {0.0})
+            self.assertAlmostEqual(t, sum(p["latency_s"] for p in phases))
+
+    def test_every_card_on_the_sheet_states_both_fabrics(self):
+        """Why no number moves on the sheet as it stands: the refusal has
+        nothing to refuse on any row. A row added without one of them is
+        refused where it is first asked, by name."""
+        from backend.inference import gpu_specs as gs
+        for gpu in gs.load_gpu_specs():
+            fabric = Fabric.of(gpu, 2e-6)
+            with self.subTest(sku=gpu.sku):
+                self.assertEqual(fabric.sku, gpu.sku)
+                self.assertTrue(fabric.bandwidth("intra"))
+                self.assertTrue(fabric.bandwidth("inter"))
+
+
 class TestTheScaleUpDomainReachesTheEstimate(unittest.TestCase):
     """The sheet's `ranks_per_scaleup_domain` has to arrive at the walk that
     prices a deployment, not merely at `Fabric.of`.

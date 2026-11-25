@@ -183,6 +183,10 @@ class Fabric(NamedTuple):
     #: traffic leaves the FAST FABRIC, and on a supernode 768 dies
     #: answer that together across machines.
     scaleup_domain: Optional[int] = None
+    #: The card this is the fabric of (`GPUSpec.sku`), stated with the rest
+    #: of its topology; empty for a fabric built with no card. It names the
+    #: card a refusal is about (`bandwidth`).
+    sku: str = ""
 
     @classmethod
     def of(cls, gpu: "gpu_specs.GPUSpec", step_latency: float = 0.0
@@ -209,6 +213,35 @@ class Fabric(NamedTuple):
         hops it waits on are both read off that one split, so the two
         cannot disagree about which fabric a phase crossed."""
         return int(self.scaleup_domain or self.gpus_per_node or 1)
+
+    def bandwidth(self, where: str) -> Optional[float]:
+        """The bandwidth (bytes/s) a phase on fabric `where` (`"intra"` /
+        `"inter"`) moves its bytes at, or None where no times were asked
+        for. A CARD that states none for a fabric a phase crosses is
+        refused here (`gpu_specs.NoFabricBandwidth`): this is where every
+        phase's bytes meet a bandwidth, so there is no path on which a
+        blank column divides into zero seconds.
+
+        "No times were asked for" is a fabric handed neither bandwidth: a
+        caller walking a step for its bytes and launches (a kernel plan, a
+        fusion walk, a single module's bench) passes the card for its
+        dispatch and no interconnect at all. That cannot be a card with
+        both cells blank -- every sheet row states the fabric inside its
+        node (`gpu_specs.check_node_fabric`) -- so one bandwidth present
+        and the other absent is the sheet not saying."""
+        bw = self.intra_bw if where == "intra" else self.inter_bw
+        if bw and bw > 0:
+            return bw
+        if not self.sku or not (self.intra_bw or self.inter_bw):
+            return None
+        domain = self.scaleup_ranks()
+        if where == "intra":
+            raise gpu_specs.NoFabricBandwidth(
+                self.sku, "scaleup_gbps",
+                f"inside its {domain}-rank scale-up domain")
+        raise gpu_specs.NoFabricBandwidth(
+            self.sku, "rdma_gbps",
+            f"between its {domain}-rank scale-up domains")
 
     def without_latency(self) -> "Fabric":
         """This fabric with free steps: what its bandwidth alone charges."""
@@ -284,7 +317,8 @@ def topology(gpu: Optional["gpu_specs.GPUSpec"]) -> Dict[str, Any]:
     remove."""
     if gpu is None:
         return {}
-    return {"nvlink": gpu_specs.has_scaleup_domain(gpu),
+    return {"sku": gpu.sku,
+            "nvlink": gpu_specs.has_scaleup_domain(gpu),
             "nvls": gpu_specs.has_nvls(gpu),
             "scaleup_domain": gpu_specs.ranks_per_scaleup_domain(gpu),
             "inter_latency": gpu_specs.inter_hop_latency_s(gpu)}
@@ -727,14 +761,14 @@ def price_collective(
     rows: List[Dict[str, Any]] = []
     for ph in phases_list:
         where = ph["fabric"]
-        fabric_bw = fabric.intra_bw if where == "intra" else fabric.inter_bw
+        fabric_bw = fabric.bandwidth(where)
         fabric_label = (fabric.intra_label if where == "intra"
                         else fabric.inter_label)
         phase_bytes = float(ph["bytes_per_rank"]) * int(count_per_step)
         hop_latency = fabric.hop_latency(where)
         phase_latency = hop_latency * ph["hops"] * int(count_per_step)
-        phase_t = (phase_bytes / fabric_bw if fabric_bw and fabric_bw > 0
-                   else 0.0) + phase_latency
+        phase_t = (phase_bytes / fabric_bw if fabric_bw else 0.0
+                   ) + phase_latency
         t_comm += phase_t
         rows.append({
             "name": ph["name"],
