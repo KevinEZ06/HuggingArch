@@ -236,6 +236,52 @@ class TestGPUSpecsLoader(unittest.TestCase):
         with self.assertRaisesRegex(NoFabricBandwidth, "A100-40G-PCIe"):
             check_node_fabric(blank)
 
+    def test_the_loader_refuses_a_row_that_states_no_fabric_at_all(self):
+        """A row with no bandwidth inside its node and none between nodes
+        is the one fabric `comm_cost.Fabric.bandwidth` reads as "no times
+        were asked for" -- so it must never be a card. Asked of the loader
+        itself, reading a sheet, not of the check alone: a check nobody
+        calls at load would leave the reading open.
+
+        The control rows load from the same file: the sheet as it is, and a
+        row that states its node's fabric and leaves the link between nodes
+        out, which a card may do."""
+        import csv
+        import io
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from backend.inference import gpu_specs as gs
+
+        with open(gs._CSV_PATH, encoding="utf-8", newline="") as f:
+            header = next(csv.reader(f))
+            rows = list(csv.DictReader(io.StringIO(
+                ",".join(header) + "\n" + f.read())))
+        base = next(r for r in rows if r["sku"] == "A100-40G-PCIe")
+        node_only = {**base, "sku": "Node-Fabric-Only", "rdma_gbps": "",
+                     "rdma_hop_latency_us": ""}
+        no_fabric = {**node_only, "sku": "No-Fabric-At-All",
+                     "scaleup_gbps": "", "scaleup_fabric": "",
+                     "pcie_gbps": ""}
+
+        def load(extra):
+            with tempfile.TemporaryDirectory() as tmp:
+                sheet = Path(tmp) / "gpu_specs.csv"
+                with open(sheet, "w", encoding="utf-8", newline="") as out:
+                    w = csv.DictWriter(out, fieldnames=header)
+                    w.writeheader()
+                    w.writerows([*rows, *extra])
+                with mock.patch.object(gs, "_CSV_PATH", str(sheet)):
+                    return gs.load_gpu_specs.__wrapped__()
+
+        self.assertEqual(len(load([])), len(rows))
+        self.assertIn("Node-Fabric-Only",
+                      [g.sku for g in load([node_only])])
+        with self.assertRaises(gs.NoFabricBandwidth) as refused:
+            load([no_fabric])
+        self.assertIn("No-Fabric-At-All", str(refused.exception))
+        self.assertEqual(refused.exception.field, "scaleup_gbps")
+
     def test_an_rdma_link_is_stated_whole_or_not_at_all(self):
         # Traffic that leaves a card's scale-up domain is priced against
         # the RDMA columns and nothing else (PCIe is intra-node). A row

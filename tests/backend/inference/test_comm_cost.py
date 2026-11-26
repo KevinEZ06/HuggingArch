@@ -1371,9 +1371,17 @@ class ASupernodeIsScaleUpAcrossMachines(unittest.TestCase):
         an all-to-all there was 36.94us against phase rows summing to
         14.94us. Pricing the bytes alone, as the test above does, could not
         see it.
+
+        The card is the 910C row with its NIC stated. The two splits charge
+        differently only where a hop between domains costs more than one
+        inside, and the sheet's 910C row states no RDMA hop at all -- on it
+        the old split and this one agree, and a test on it passes against
+        the bug it was written for.
         """
         from backend.inference.comm_cost import CollectiveSignature
-        fabric = Fabric.of(self._ascend(), 2e-6)
+        fabric = Fabric.of(replace(self._ascend(), rdma_gbps=25.0,
+                                   rdma_hop_latency_us=4.4), 2e-6)
+        self.assertGreater(fabric.inter_latency, 0)
         payload = float(1 << 20)
         for op in ("all_to_all", "all_reduce"):
             for world in (32, 64, 768):
@@ -1386,6 +1394,8 @@ class ASupernodeIsScaleUpAcrossMachines(unittest.TestCase):
                 self.assertAlmostEqual(
                     hops, sum(r["latency_s"] for r in rows), places=12,
                     msg=f"{op} world={world}: hops split elsewhere")
+                self.assertAlmostEqual(
+                    t_rows, sum(r["t_phase_s"] for r in rows), places=12)
                 published = CollectiveSignature(
                     op=op, world=world, count=1, stride=1).envelope(
                         fabric).choose(payload)
@@ -1406,6 +1416,86 @@ class ASupernodeIsScaleUpAcrossMachines(unittest.TestCase):
             self.assertEqual(
                 gs.ranks_per_scaleup_domain(gpu), gs.gpus_per_node(gpu),
                 f"{gpu.sku} gained a domain it never declared")
+
+
+class APublishedCollectiveIsItsPhasesSum(unittest.TestCase):
+    """A collective row publishes one time (`t_comm_s`, the row law's `Min`
+    over the envelope's candidates) and itemises the same collective as
+    phase rows (`RowRoofline.comm`, the phase loop in `price_collective`).
+    They are two derivations of one number by different code, so each is
+    the other's oracle: on every collective row of a real walk, the
+    published time is the sum of its phases' times.
+
+    `TestCommBandwidthLaneSplit` asserts the same sum, at a link latency of
+    0 on a card with no supernode, which is where the two derivations
+    cannot disagree: they differed only in where a hop was charged, and a
+    free hop costs the same everywhere. So the walk here pays the
+    estimate's own link latency, and the first card is a supernode whose
+    hops between domains cost more than those inside -- the 910C row with
+    its NIC stated. Against the split 9504f28 removed, every collective row
+    of that walk fails.
+
+    Single-phase rows publish no breakdown (`comm_phases` is empty), so
+    the phases are re-read from the row's own signature and payload rather
+    than taken off the row."""
+
+    def _walk(self, gpu, framework, world):
+        from backend.analyzer import fetch_config
+        from backend.inference import gpu_specs as gs
+        from backend.inference.framework_bindings import get_binding
+        from backend.inference.parallel_config import ParallelConfig
+        from backend.inference.pipeline import analyze
+        from tests.snapshots import shared_loader
+        model = "meta-llama/Llama-2-7b-hf"
+        fabric = Fabric.of(gpu, 2e-6)
+        rows = analyze(
+            shared_loader().match(fetch_config(model), model_id=model),
+            parallel=ParallelConfig(tp_attention=world, tp_dense_ffn=world),
+            framework_binding=get_binding(framework), batch_size=1,
+            avg_input_tokens=4096, avg_output_tokens=0,
+            peak_flops_per_sec=1e15,
+            peak_hbm_bw_bytes_per_sec=gs.peak_hbm_bw(gpu), gpu=gpu,
+            intra_bw_bytes_per_sec=fabric.intra_bw,
+            inter_bw_bytes_per_sec=fabric.inter_bw,
+            gpus_per_node=fabric.gpus_per_node,
+            intra_bw_label=fabric.intra_label,
+            inter_bw_label=fabric.inter_label,
+            comm_latency_s=fabric.step_latency, breakdown=True,
+        ).per_op_timing
+        return rows, fabric
+
+    def _assert_rows_are_their_phases(self, gpu, framework, world):
+        from backend.inference.comm_cost import CollectiveSignature
+        from backend.inference.row_roofline import RowRoofline
+        rows, fabric = self._walk(gpu, framework, world)
+        checked = 0
+        for row in rows:
+            sig = CollectiveSignature.of(row)
+            if sig is None:
+                continue
+            _t, phases = RowRoofline.comm(
+                sig, tensor_bytes=row["comm_tensor_bytes"], fabric=fabric)
+            with self.subTest(sku=gpu.sku, op=row["op"], world=world):
+                self.assertTrue(phases)
+                self.assertAlmostEqual(
+                    row["t_comm_s"], sum(p["t_phase_s"] for p in phases),
+                    delta=1e-9 * row["t_comm_s"])
+            checked += 1
+        self.assertGreater(checked, 0, f"{gpu.sku}: no collective to check")
+
+    def test_on_a_supernode_whose_hops_between_domains_cost_more(self):
+        from backend.inference import gpu_specs as gs
+        nic = replace(gs.get_gpu("Ascend-910C-A3"), rdma_gbps=25.0,
+                      rdma_hop_latency_us=4.4)
+        self._assert_rows_are_their_phases(nic, "vllm_ascend", 32)
+
+    def test_on_the_sheet_as_it_stands(self):
+        """The rows published today: the 910C inside its supernode, and a
+        group that leaves an H100 node over RDMA in three phases."""
+        from backend.inference import gpu_specs as gs
+        self._assert_rows_are_their_phases(
+            gs.get_gpu("Ascend-910C-A3"), "vllm_ascend", 32)
+        self._assert_rows_are_their_phases(gs.get_gpu("H100-SXM"), "vllm", 16)
 
 
 class AFabricTheCardDoesNotStateIsNotFree(unittest.TestCase):
